@@ -6,6 +6,7 @@ using ArisenEngine.Core.Memory;
 using ArisenEngine.Core.ECS;
 using ArisenEngine.Core.Math;
 using ArisenEngine.Core.Lifecycle;
+using ArisenEngine.ECS.Lifecycle;
 
 namespace ArisenEngine.Rendering;
 

@@ -13,9 +13,12 @@
   ],
   "engineVersion": "0.1.0",
   "dependencies": {
-      "com.arisen.core": "1.0.0",
-      "com.arisen.platform.desktop": "1.0.0",
-      "com.arisen.rhi.core": "1.0.0",
-      "com.arisen.shader-compiler": "1.0.0"
+      "com.arisen.core": "1.0.0"
+  },
+  "services": {
+      "requires": [
+          "ArisenKernel.Contracts.IWindowProvider",
+          "ArisenKernel.Contracts.IRHIDevice"
+      ]
   }
 }
