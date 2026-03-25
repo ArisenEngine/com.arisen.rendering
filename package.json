@@ -3,24 +3,26 @@
   "name": "Arisen Rendering Pipeline",
   "version": "1.0.0",
   "description": "RenderPipeline interfaces, RenderGraph, and low-level shading implementations",
-  "entryAssembly": "Com.Arisen.Rendering.dll",
-  "entryClass": "ArisenEngine.Rendering.RenderingPackage",
   "author": "Arisen Team",
   "tags": [
-      "rendering",
-      "graphics",
-      "rendergraph"
+    "rendering",
+    "graphics",
+    "rendergraph"
   ],
   "engineVersion": "0.1.0",
   "dependencies": {
-      "com.arisen.core": "1.0.0",
-      "com.arisen.ecs": "1.0.0",
-      "com.arisen.core.native": "1.0.0"
+    "com.arisen.core": "1.0.0",
+    "com.arisen.ecs": "1.0.0",
+    "com.arisen.core.native": "1.0.0"
   },
   "services": {
-      "requires": [
-          "ArisenKernel.Contracts.IWindowProvider",
-          "ArisenKernel.Contracts.IRHIDevice"
-      ]
+    "requires": [
+      "ArisenKernel.Contracts.IWindowProvider",
+      "ArisenKernel.Contracts.IRHIDevice"
+    ]
+  },
+  "entry": {
+    "assembly": "Com.Arisen.Rendering.dll",
+    "class": "ArisenEngine.Rendering.RenderingPackage"
   }
 }
