@@ -1,4 +1,4 @@
-﻿
+using ArisenKernel.Diagnostics;
 using ArisenKernel.Contracts;
 using ArisenEngine.Core.ECS;
 using ArisenEngine.Core.Automation;
@@ -40,9 +40,10 @@ public class RenderSurface : IRenderSurface
             m_Handle = NativeHAL.RenderWindowAPI.GetWindowHandle(m_SurfaceId);
             NativeHAL.RenderWindowAPI.SetWindowResizeCallback(m_SurfaceId, m_Processor.ResizeCallbackPtr);
 
-            // TODO: Per-surface device creation 锟?CreateLogicDevice and GetLogicalDevice
+            // TODO: Per-surface device creation 
+            // CreateLogicDevice and GetLogicalDevice
             // are pure virtual methods in C++ RHIInstance that CppSharp cannot bind.
-            // Device creation is handled by Graphics.Initialize() 锟?InitLogicDevices() instead.
+            // Device creation is handled by Graphics.Initialize()  InitLogicDevices() instead.
             // var instance = RHIGraphics.Instance;
             // if (instance != null)
             // {
@@ -89,11 +90,11 @@ public class RenderSurface : IRenderSurface
     {
     }
 
-    public void OnResizing() => Console.WriteLine($"RenderSurface : {m_Name} resizing.");
+    public void OnResizing() => KernelLog.InfoFormat("RenderSurface : {0} resizing.", m_Name);
 
     public void OnResized()
     {
-        Console.WriteLine($"RenderSurface : {m_Name} resized.");
+        KernelLog.InfoFormat("RenderSurface : {0} resized.", m_Name);
         Logger.Log($"RenderSurface : {m_Name} resized.");
     }
 
