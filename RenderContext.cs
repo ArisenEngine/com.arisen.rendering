@@ -14,13 +14,17 @@ public struct RenderContext
     public RHISwapChain SwapChain { get; }
     public uint FrameIndex { get; }
     public float DeltaTime { get; }
+    public uint Width { get; }
+    public uint Height { get; }
 
-    public RenderContext(FrameArena arena, RHIDevice device, RHISwapChain swapChain, uint frameIndex, float deltaTime)
+    public RenderContext(FrameArena arena, RHIDevice device, RHISwapChain swapChain, uint frameIndex, float deltaTime, uint width, uint height)
     {
         Arena = arena;
         Device = device;
         SwapChain = swapChain;
         FrameIndex = frameIndex;
         DeltaTime = deltaTime;
+        Width = width;
+        Height = height;
     }
 }

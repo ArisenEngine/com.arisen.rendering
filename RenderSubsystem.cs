@@ -65,7 +65,9 @@ public class RenderSubsystem : ITickableSubsystem
                 device,
                 swapChain,
                 EngineKernel.Instance.CurrentFrameIndex,
-                deltaTime
+                deltaTime,
+                NativeHAL.RenderWindowAPI.GetWindowWidth(surface.SurfaceId),
+                NativeHAL.RenderWindowAPI.GetWindowHeight(surface.SurfaceId)
             );
 
             // 3. Render
