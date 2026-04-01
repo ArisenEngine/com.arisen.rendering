@@ -1,4 +1,6 @@
 using ArisenEngine.Core.RHI;
+using ArisenEngine.Core.Math;
+using Arisen.Native.RHI;
 using System.Diagnostics;
 
 namespace ArisenEngine.Rendering;
@@ -23,15 +25,15 @@ public sealed class ClearPass : RenderPassNode
 
         // 2. Begin dynamic rendering (modern Vulkan/RHI path)
         // We use the SwapChain's current image view for clearing
-        var colorImageView = context.SwapChain.GetCurrentImage().GetView();
+        var colorImageView = context.SwapChain.GetImageView(context.FrameIndex);
         
         commandBuffer.BeginRendering(
             colorImageView, 
-            EImageLayout.COLOR_ATTACHMENT_OPTIMAL,
+            EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             EAttachmentLoadOp.ATTACHMENT_LOAD_OP_CLEAR,
             EAttachmentStoreOp.ATTACHMENT_STORE_OP_STORE,
-            m_ClearColor.R, m_ClearColor.G, m_ClearColor.B, m_ClearColor.A,
-            0, 0, context.SwapChain.Width, context.SwapChain.Height
+            m_ClearColor.r, m_ClearColor.g, m_ClearColor.b, m_ClearColor.a,
+            0, 0, context.Width, context.Height
         );
 
         // 3. End rendering and recording

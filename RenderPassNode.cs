@@ -13,6 +13,8 @@ public abstract class RenderPassNode : TaskNode
     private RenderContext m_Context;
     private RHICommandBuffer? m_CommandBuffer;
 
+    public RHICommandBuffer? CommandBuffer => m_CommandBuffer;
+
     // TODO: Add inputs/outputs for dependency tracking
 
     /// <summary>
@@ -33,7 +35,7 @@ public abstract class RenderPassNode : TaskNode
             throw new InvalidOperationException("RenderPassNode executed without a valid CommandBuffer.");
 
         // Record the pass logic
-        Record(m_Context, m_CommandBuffer);
+        Record(m_Context, m_CommandBuffer.Value);
     }
 
     /// <summary>

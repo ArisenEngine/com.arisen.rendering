@@ -4,6 +4,7 @@ using System.Threading;
 using Arisen.DAG;
 using ArisenEngine.Threading;
 using ArisenEngine.Core.RHI;
+using Arisen.Native.RHI;
 using ArisenKernel.Services;
 using System.Linq;
 
@@ -64,7 +65,7 @@ public sealed class RenderGraph : IDisposable
                     // Retrieve or Create a pool for this worker thread
                     if (!m_CommandPools.TryGetValue(threadId, out var pool))
                     {
-                        pool = factory.CreateCommandBufferPool(RHIQueueType.GRAPHICS);
+                        pool = factory.CreateCommandBufferPool(RHIQueueType.Graphics);
                         m_CommandPools.TryAdd(threadId, pool);
                     }
 
@@ -85,7 +86,7 @@ public sealed class RenderGraph : IDisposable
         // 2. Submit all recorded command buffers in topological order to the GPU
         foreach (var node in compiled.SortedNodes)
         {
-             context.Device.Submit(node.CommandBuffer);
+             context.Device.Submit(node.CommandBuffer.Value);
         }
     }
 
