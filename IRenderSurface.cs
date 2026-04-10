@@ -21,6 +21,9 @@ public interface IRenderSurface
 {
     public IntPtr GetHandle();
     public uint SurfaceId { get; }
+    public uint Width { get; }
+    public uint Height { get; }
+    public void Resize(uint width, uint height);
     public void DisposeSurface();
     public void OnCreate();
     public void OnResizing();
