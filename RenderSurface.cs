@@ -33,12 +33,30 @@ public class RenderSurface : IRenderSurface
         if (Initialize())
         {
             m_Host = host;
-            m_SurfaceId = isFullScreen
-                ? NativeHAL.RenderWindowAPI.CreateFullScreenRenderSurface(host, m_Processor.ProcPtr)
-                : NativeHAL.RenderWindowAPI.CreateRenderWindow(host, m_Processor.ProcPtr, width, height);
 
-            m_Handle = NativeHAL.RenderWindowAPI.GetWindowHandle(m_SurfaceId);
-            NativeHAL.RenderWindowAPI.SetWindowResizeCallback(m_SurfaceId, m_Processor.ResizeCallbackPtr);
+            // B101: If the host is a dummy handle (like 1001 from the Editor), 
+            // we bypass native window creation and use a virtual surface ID.
+            if (host == (IntPtr)1001)
+            {
+                m_SurfaceId = 0xFFFFFFFF;
+            }
+            else
+            {
+                m_SurfaceId = isFullScreen
+                    ? NativeHAL.RenderWindowAPI.CreateFullScreenRenderSurface(host, m_Processor.ProcPtr)
+                    : NativeHAL.RenderWindowAPI.CreateRenderWindow(host, m_Processor.ProcPtr, width, height);
+            }
+
+            if (m_SurfaceId != 0xFFFFFFFF)
+            {
+                m_Handle = NativeHAL.RenderWindowAPI.GetWindowHandle(m_SurfaceId);
+                NativeHAL.RenderWindowAPI.SetWindowResizeCallback(m_SurfaceId, m_Processor.ResizeCallbackPtr);
+            }
+            else
+            {
+                // Virtual/Headless surface has no native window handle
+                m_Handle = IntPtr.Zero;
+            }
 
             // TODO: Per-surface device creation 
             // CreateLogicDevice and GetLogicalDevice
