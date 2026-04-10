@@ -66,8 +66,8 @@ public class RenderSubsystem : ITickableSubsystem
                 swapChain,
                 EngineKernel.Instance.CurrentFrameIndex,
                 deltaTime,
-                NativeHAL.RenderWindowAPI.GetWindowWidth(surface.SurfaceId),
-                NativeHAL.RenderWindowAPI.GetWindowHeight(surface.SurfaceId)
+                surface.Width,
+                surface.Height
             );
 
             // 3. Render
@@ -144,7 +144,7 @@ public class RenderSubsystem : ITickableSubsystem
     {
         if (m_RenderSurfaces.TryGetValue(host, out var surface))
         {
-            NativeHAL.RenderWindowAPI.ResizeRenderSurface(surface.Surface.SurfaceId, (uint)width, (uint)height);
+            surface.Surface.Resize((uint)width, (uint)height);
         }
     }
 

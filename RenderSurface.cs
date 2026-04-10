@@ -17,6 +17,8 @@ public class RenderSurface : IRenderSurface
     private IntPtr m_Host;
     private uint m_SurfaceId;
     private IntPtr m_Handle;
+    private uint m_Width;
+    private uint m_Height;
     private string m_Name = "RenderSurface";
 
     private WindowProcessor m_Processor;
@@ -24,11 +26,15 @@ public class RenderSurface : IRenderSurface
 
     public IntPtr Handle => m_Handle;
     public uint SurfaceId => m_SurfaceId;
+    public uint Width => m_Width;
+    public uint Height => m_Height;
 
     public RenderSurface(IntPtr host, string name, int width = 0, int height = 0, bool hosted = true)
     {
         m_Name = name;
         m_Hosted = hosted;
+        m_Width = (uint)width;
+        m_Height = (uint)height;
         bool isFullScreen = (width == 0 || height == 0) && host == IntPtr.Zero;
         if (Initialize())
         {
@@ -92,9 +98,23 @@ public class RenderSurface : IRenderSurface
 
     public bool IsValid() => ((m_Hosted && m_Host != IntPtr.Zero) || !m_Hosted) && m_Handle != IntPtr.Zero;
 
+    public void Resize(uint width, uint height)
+    {
+        m_Width = width;
+        m_Height = height;
+
+        if (m_SurfaceId != 0xFFFFFFFF)
+        {
+            NativeHAL.RenderWindowAPI.ResizeRenderSurface(m_SurfaceId, width, height);
+        }
+    }
+
     public void DisposeSurface()
     {
-        NativeHAL.RenderWindowAPI.RemoveRenderSurface(m_SurfaceId);
+        if (m_SurfaceId != 0xFFFFFFFF)
+        {
+            NativeHAL.RenderWindowAPI.RemoveRenderSurface(m_SurfaceId);
+        }
         Surfaces.Remove(this);
         if (Surfaces.Count <= 0)
         {
