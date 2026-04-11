@@ -30,4 +30,5 @@ public interface IRenderSurface
     public void OnResized();
     public void OnDestroy();
     public bool IsValid();
+    public IntPtr GetSharedHandle();
 }

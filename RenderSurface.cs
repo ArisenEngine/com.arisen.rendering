@@ -6,6 +6,7 @@ using ArisenEngine.Rendering;
 using ArisenKernel.Lifecycle;
 using ArisenEngine.Core.Lifecycle;
 using ArisenEngine.Core.Diagnostics;
+using ArisenEngine.Core.RHI;
 
 namespace ArisenEngine.Rendering;
 
@@ -107,6 +108,12 @@ public class RenderSurface : IRenderSurface
         {
             NativeHAL.RenderWindowAPI.ResizeRenderSurface(m_SurfaceId, width, height);
         }
+        else
+        {
+            // For virtual surfaces, we must manually notify the RHI device to recreate the swapchain
+            var device = RHISystem.GetOrCreateDevice(m_SurfaceId);
+            if (device.IsValid) device.SetResolution(width, height);
+        }
     }
 
     public void DisposeSurface()
@@ -138,6 +145,18 @@ public class RenderSurface : IRenderSurface
 
     public void OnDestroy()
     {
+    }
+
+    public IntPtr GetSharedHandle()
+    {
+        var device = RHISystem.GetOrCreateDevice(m_SurfaceId);
+        var swapChain = device.GetSurface().GetSwapChain();
+        if (swapChain.IsValid)
+        {
+            // For cross-API interop, we consistently use the first index of the virtual swapchain
+            return swapChain.GetSharedWin32Handle(0);
+        }
+        return IntPtr.Zero;
     }
 }
 
