@@ -117,6 +117,13 @@ public class RenderSubsystem : ITickableSubsystem
                 : new ReadOnlySpan<Camera>(m_CameraBuffer, 0, m_CameraCount);
 
             m_CurrentPipeline.InternalRender(context, cameras);
+
+            // Phase 1 Synchronization: Stall the CPU to ensure the shared texture is ready for the Editor Viewport.
+            // This will be replaced by Shared Semaphores in Phase 2 for zero-overhead performance.
+            if (surface.SurfaceId == 0xFFFFFFFF)
+            {
+                device.WaitIdle();
+            }
         }
     }
 
