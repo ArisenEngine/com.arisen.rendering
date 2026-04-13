@@ -8,8 +8,9 @@ public abstract class RenderPipeline : IDisposable
 
     /// <summary>
     /// Entry point for the render pipeline to execute its drawing logic.
+    /// Returns the GPUTicket of the final submission.
     /// </summary>
-    protected abstract void Render(RenderContext context, ReadOnlySpan<Camera> cameras);
+    protected abstract ulong Render(RenderContext context, ReadOnlySpan<Camera> cameras);
 
     protected abstract void OnDisposed();
 
@@ -19,8 +20,8 @@ public abstract class RenderPipeline : IDisposable
         disposed = true;
     }
 
-    internal void InternalRender(RenderContext context, ReadOnlySpan<Camera> cameras)
+    internal ulong InternalRender(RenderContext context, ReadOnlySpan<Camera> cameras)
     {
-        Render(context, cameras);
+        return Render(context, cameras);
     }
-}
+}

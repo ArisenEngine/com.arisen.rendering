@@ -45,7 +45,7 @@ public sealed class RenderGraph : IDisposable
     /// Compiles and executes the RenderGraph.
     /// Uses the TaskGraph to record commands in parallel.
     /// </summary>
-    public void Execute(RenderContext context)
+    public ulong Execute(RenderContext context)
     {
         var factory = context.Device.GetFactory();
         var compiled = GraphCompiler.Compile(m_Graph);
@@ -83,12 +83,15 @@ public sealed class RenderGraph : IDisposable
             m_TaskSystem.Execute();
         }
 
+        ulong lastTicket = 0;
         // 2. Submit all recorded command buffers in topological order to the GPU
         foreach (var node in compiled.SortedNodes)
         {
-             context.Device.Submit(node.CommandBuffer.Value);
+             lastTicket = context.Device.Submit(node.CommandBuffer.Value);
         }
+        return lastTicket;
     }
+
 
     public void Dispose()
     {
