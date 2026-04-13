@@ -116,14 +116,16 @@ public class RenderSubsystem : ITickableSubsystem
                 ? ReadOnlySpan<Camera>.Empty 
                 : new ReadOnlySpan<Camera>(m_CameraBuffer, 0, m_CameraCount);
 
-            m_CurrentPipeline.InternalRender(context, cameras);
+            ulong ticket = m_CurrentPipeline.InternalRender(context, cameras);
 
-            // Phase 1 Synchronization: Stall the CPU to ensure the shared texture is ready for the Editor Viewport.
-            // This will be replaced by Shared Semaphores in Phase 2 for zero-overhead performance.
-            if (surface.SurfaceId == 0xFFFFFFFF)
+            // Phase 1.5 Synchronization: Precision stall using GPUTicket.
+            // This ensures the CPU only waits for the graphics queue to finish the specific work
+            // for this frame before the Avalonia Editor Viewport consumes the shared texture.
+            if (surface.SurfaceId == 0xFFFFFFFF && ticket > 0)
             {
-                device.WaitIdle();
+                device.WaitQueueTicket(ticket);
             }
+
         }
     }
 
