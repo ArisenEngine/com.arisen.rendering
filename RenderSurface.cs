@@ -4,6 +4,7 @@ using ArisenEngine.Core.ECS;
 using ArisenEngine.Core.Automation;
 using ArisenEngine.Core.Diagnostics;
 using ArisenEngine.Core.RHI;
+using System.Threading.Tasks;
 
 namespace ArisenEngine.Rendering;
 
@@ -16,6 +17,7 @@ public class RenderSurface : IRenderSurface
     private uint m_Width;
     private uint m_Height;
     private string m_Name = "RenderSurface";
+    private ulong m_LastTicket;
 
     private WindowProcessor m_Processor;
     private bool m_Hosted = true;
@@ -155,5 +157,24 @@ public class RenderSurface : IRenderSurface
         }
         return IntPtr.Zero;
     }
+
+    public ulong GetLastRenderTicket() => m_LastTicket;
+
+    public async Task WaitForRenderTicketAsync(ulong ticket)
+    {
+        if (ticket == 0) return;
+
+        var device = RHISystem.GetOrCreateDevice(m_SurfaceId);
+        if (!device.IsValid) return;
+
+        // Poll for completion to avoid blocking the caller (e.g. Avalonia UI thread)
+        // while allowing concurrent execution of the Engine and UI.
+        while (device.GetCompletedTicket() < ticket)
+        {
+            await Task.Delay(1);
+        }
+    }
+
+    internal void SetLastRenderTicket(ulong ticket) => m_LastTicket = ticket;
 }
 

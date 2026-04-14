@@ -117,15 +117,15 @@ public class RenderSubsystem : ITickableSubsystem
                 : new ReadOnlySpan<Camera>(m_CameraBuffer, 0, m_CameraCount);
 
             ulong ticket = m_CurrentPipeline.InternalRender(context, cameras);
-
-            // Phase 1.5 Synchronization: Precision stall using GPUTicket.
-            // This ensures the CPU only waits for the graphics queue to finish the specific work
-            // for this frame before the Avalonia Editor Viewport consumes the shared texture.
-            if (surface.SurfaceId == 0xFFFFFFFF && ticket > 0)
+            
+            // Phase 2 Optimization: Precision synchronization.
+            // Instead of stalling the CPU here (which slows down the simulation), 
+            // we pass the ticket to the surface so the consumer (Editor Viewport) 
+            // can perform a targeted asynchronous wait.
+            if (surface is RenderSurface concreteSurface)
             {
-                device.WaitQueueTicket(ticket);
+                concreteSurface.SetLastRenderTicket(ticket);
             }
-
         }
     }
 
