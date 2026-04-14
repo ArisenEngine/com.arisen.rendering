@@ -157,6 +157,15 @@ public class RenderSubsystem : ITickableSubsystem
         }
     }
 
+    public IntPtr GetSurfaceSharedHandle(IntPtr host)
+    {
+        if (m_RenderSurfaces.TryGetValue(host, out var surfaceInfo))
+        {
+            return surfaceInfo.Surface.GetSharedHandle();
+        }
+        return IntPtr.Zero;
+    }
+
     public void UnregisterSurface(IntPtr host)
     {
         if (m_RenderSurfaces.TryGetValue(host, out var surfaceInfo))
