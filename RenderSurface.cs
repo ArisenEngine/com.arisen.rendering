@@ -2,15 +2,10 @@ using ArisenKernel.Diagnostics;
 using ArisenKernel.Contracts;
 using ArisenEngine.Core.ECS;
 using ArisenEngine.Core.Automation;
-using ArisenEngine.Rendering;
-using ArisenKernel.Lifecycle;
-using ArisenEngine.Core.Lifecycle;
 using ArisenEngine.Core.Diagnostics;
 using ArisenEngine.Core.RHI;
 
 namespace ArisenEngine.Rendering;
-
-
 
 public class RenderSurface : IRenderSurface
 {
@@ -115,6 +110,8 @@ public class RenderSurface : IRenderSurface
             if (device.IsValid) device.SetResolution(width, height);
         }
     }
+
+    public void Dispose() => DisposeSurface();
 
     public void DisposeSurface()
     {
