@@ -1,6 +1,7 @@
 using Arisen.Native.RHI;
 using ArisenEngine.Core.RHI;
 using ArisenEngine.Core.Memory;
+using System.Numerics;
 
 namespace ArisenEngine.Rendering;
 
@@ -16,6 +17,13 @@ public struct RenderContext
     public float DeltaTime { get; }
     public uint Width { get; }
     public uint Height { get; }
+    
+    // The list of meshes to be drawn this frame. 
+    // We use a raw pointer to allow this struct to be captured by TaskGraph lambdas.
+    public unsafe MeshDrawCommand* DrawListPtr;
+    public int DrawListCount;
+
+    public unsafe readonly ReadOnlySpan<MeshDrawCommand> DrawList => new(DrawListPtr, DrawListCount);
 
     public RenderContext(FrameArena arena, RHIDevice device, RHISwapChain swapChain, uint frameIndex, float deltaTime, uint width, uint height)
     {

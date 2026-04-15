@@ -60,6 +60,11 @@ public class RenderSubsystem : ITickableSubsystem
             var swapChain = device.GetSurface().GetSwapChain();
             if (!swapChain.IsValid) continue;
 
+            // 3. Render
+            // Fetch cameras and processed draw list from ECS
+            var sceneSubsystem = EngineKernel.Instance.GetSubsystem<SceneSubsystem>();
+            var entityManager = sceneSubsystem?.ActiveEntityManager;
+            
             var context = new RenderContext(
                 FrameArena.Instance,
                 device,
@@ -70,9 +75,19 @@ public class RenderSubsystem : ITickableSubsystem
                 surface.Height
             );
 
-            // 3. Render
-            // Fetch cameras from ECS �?zero-allocation path using pre-allocated buffer
-            var entityManager = EngineKernel.Instance.GetSubsystem<SceneSubsystem>()?.ActiveEntityManager;
+            if (sceneSubsystem != null)
+            {
+                var drawList = sceneSubsystem.GetCurrentDrawList();
+                unsafe
+                {
+                    fixed (MeshDrawCommand* pDrawList = drawList)
+                    {
+                        context.DrawListPtr = pDrawList;
+                        context.DrawListCount = drawList.Length;
+                    }
+                }
+            }
+
             m_CameraCount = 0;
 
             if (entityManager != null)
