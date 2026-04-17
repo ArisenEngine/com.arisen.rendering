@@ -5,6 +5,7 @@ using ArisenEngine.Core.Automation;
 using ArisenEngine.Core.Diagnostics;
 using ArisenEngine.Core.RHI;
 using System.Threading.Tasks;
+using Arisen.Native.RHI;
 
 namespace ArisenEngine.Rendering;
 
@@ -18,6 +19,8 @@ public class RenderSurface : IRenderSurface
     private uint m_Height;
     private string m_Name = "RenderSurface";
     private ulong m_LastTicket;
+    private uint m_LastFrameIndex;
+    private Core.RHI.RHISurface m_NativeSurface;
 
     private WindowProcessor m_Processor;
     private bool m_Hosted = true;
@@ -38,11 +41,11 @@ public class RenderSurface : IRenderSurface
         {
             m_Host = host;
 
-            // B101: If the host is a dummy handle (like 1001 from the Editor), 
+            // B101: If the host is in the dedicated virtual window range (e.g. from the Editor), 
             // we bypass native window creation and use a virtual surface ID.
-            if (host == (IntPtr)1001)
+            if (host.ToInt64() >= 1000 && host.ToInt64() <= 65535)
             {
-                m_SurfaceId = 0xFFFFFFFF;
+                m_SurfaceId = RHISystem.VirtualSurfaceIDMask | (uint)host.ToInt64(); 
             }
             else
             {
@@ -51,7 +54,7 @@ public class RenderSurface : IRenderSurface
                     : NativeHAL.RenderWindowAPI.CreateRenderWindow(host, m_Processor.ProcPtr, width, height);
             }
 
-            if (m_SurfaceId != 0xFFFFFFFF)
+            if ((m_SurfaceId & RHISystem.VirtualSurfaceIDMask) == 0)
             {
                 m_Handle = NativeHAL.RenderWindowAPI.GetWindowHandle(m_SurfaceId);
                 NativeHAL.RenderWindowAPI.SetWindowResizeCallback(m_SurfaceId, m_Processor.ResizeCallbackPtr);
@@ -94,30 +97,47 @@ public class RenderSurface : IRenderSurface
         throw new System.Exception($"No IWindowProvider registered! Cannot create RenderSurface for {m_Name}");
     }
 
-    public bool IsValid() => ((m_Hosted && m_Host != IntPtr.Zero) || !m_Hosted) && m_Handle != IntPtr.Zero;
+    public bool IsValid() 
+    {
+        // B101: Virtual surfaces (Editor) don't have native window handles, 
+        // they are valid if their virtual surface ID is correctly assigned.
+        if ((m_SurfaceId & RHISystem.VirtualSurfaceIDMask) != 0)
+            return true;
+            
+        return ((m_Hosted && m_Host != IntPtr.Zero) || !m_Hosted) && m_Handle != IntPtr.Zero;
+    }
 
     public void Resize(uint width, uint height)
     {
         m_Width = width;
         m_Height = height;
 
-        if (m_SurfaceId != 0xFFFFFFFF)
+        // B101: Professional Virtual Surface Resizing.
+        // We cannot call ResizeRenderSurface in HAL because that assumes a Win32 HWND exists.
+        // Instead, we call the RHI-level SetResolution directly which handles swapchain recreation.
+        if ((m_SurfaceId & RHISystem.VirtualSurfaceIDMask) != 0)
         {
-            NativeHAL.RenderWindowAPI.ResizeRenderSurface(m_SurfaceId, width, height);
+            if (m_NativeSurface == null)
+            {
+                var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
+                if (device.IsValid) m_NativeSurface = device.GetSurface();
+            }
+
+            if (m_NativeSurface != null)
+            {
+                RHISurfaceAPI.RHISurface_SetResolution(m_NativeSurface.Handle, width, height);
+            }
+            return;
         }
-        else
-        {
-            // For virtual surfaces, we must manually notify the RHI device to recreate the swapchain
-            var device = RHISystem.GetOrCreateDevice(m_SurfaceId);
-            if (device.IsValid) device.SetResolution(width, height);
-        }
+
+        NativeHAL.RenderWindowAPI.ResizeRenderSurface(m_SurfaceId, width, height);
     }
 
     public void Dispose() => DisposeSurface();
 
     public void DisposeSurface()
     {
-        if (m_SurfaceId != 0xFFFFFFFF)
+        if ((m_SurfaceId & RHISystem.VirtualSurfaceIDMask) == 0)
         {
             NativeHAL.RenderWindowAPI.RemoveRenderSurface(m_SurfaceId);
         }
@@ -146,25 +166,42 @@ public class RenderSurface : IRenderSurface
     {
     }
 
-    public IntPtr GetSharedHandle()
+    private RHISwapChain? m_CachedSwapChain;
+
+    public IntPtr GetSharedHandle(uint frameIndex)
     {
-        var device = RHISystem.GetOrCreateDevice(m_SurfaceId);
-        var swapChain = device.GetSurface().GetSwapChain();
-        if (swapChain.IsValid)
+        if (m_NativeSurface == null)
         {
-            // For cross-API interop, we consistently use the first index of the virtual swapchain
-            return swapChain.GetSharedWin32Handle(0);
+            var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
+            if (device.IsValid) m_NativeSurface = device.GetSurface();
+        }
+
+        if (m_NativeSurface == null) return IntPtr.Zero;
+
+        if (m_CachedSwapChain == null || !m_CachedSwapChain.Value.IsValid)
+        {
+            m_CachedSwapChain = m_NativeSurface.GetSwapChain();
+        }
+
+        if (m_CachedSwapChain.Value.IsValid)
+        {
+            // For cross-API interop, we synchronize with the engine's frame rotation.
+            // RHIVkSwapChain consistently uses (frameIndex % imageCount) for virtual swapchains.
+            // Default image count for virtual surfaces is 3. 
+            uint imageCount = 3; 
+            return m_CachedSwapChain.Value.GetSharedWin32Handle(frameIndex % imageCount);
         }
         return IntPtr.Zero;
     }
 
     public ulong GetLastRenderTicket() => m_LastTicket;
+    public uint GetLastRenderFrameIndex() => m_LastFrameIndex;
 
     public async Task WaitForRenderTicketAsync(ulong ticket)
     {
         if (ticket == 0) return;
 
-        var device = RHISystem.GetOrCreateDevice(m_SurfaceId);
+        var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
         if (!device.IsValid) return;
 
         // Poll for completion to avoid blocking the caller (e.g. Avalonia UI thread)
@@ -175,6 +212,10 @@ public class RenderSurface : IRenderSurface
         }
     }
 
-    internal void SetLastRenderTicket(ulong ticket) => m_LastTicket = ticket;
+    internal void SetLastRenderTicket(ulong ticket, uint frameIndex) 
+    { 
+        m_LastTicket = ticket; 
+        m_LastFrameIndex = frameIndex;
+    }
 }
 

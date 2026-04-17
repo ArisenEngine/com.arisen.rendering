@@ -42,6 +42,16 @@ public sealed class RenderGraph : IDisposable
     }
 
     /// <summary>
+    /// Clears all nodes and edges from the graph.
+    /// Should be called between frames to prevent pass accumulation.
+    /// </summary>
+    public void Reset()
+    {
+        m_Graph.Clear();
+        m_Resources.Clear();
+    }
+
+    /// <summary>
     /// Compiles and executes the RenderGraph.
     /// Uses the TaskGraph to record commands in parallel.
     /// </summary>
@@ -89,6 +99,10 @@ public sealed class RenderGraph : IDisposable
         {
              lastTicket = context.Device.Submit(node.CommandBuffer.Value);
         }
+
+        // 3. Cleanup: Clear the graph for the next frame
+        Reset();
+
         return lastTicket;
     }
 

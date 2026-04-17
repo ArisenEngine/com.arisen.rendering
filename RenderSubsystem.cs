@@ -65,11 +65,21 @@ public class RenderSubsystem : ITickableSubsystem
             var sceneSubsystem = EngineKernel.Instance.GetSubsystem<SceneSubsystem>();
             var entityManager = sceneSubsystem?.ActiveEntityManager;
             
+            var frameIndex = EngineKernel.Instance.CurrentFrameIndex;
+            
+            // Acquire the current swapchain image.
+            // If this fails (e.g. window minimized or 0x0 size), we skip rendering for this surface.
+            var acquiredImage = swapChain.BeginFrame(frameIndex);
+            if (!acquiredImage.IsValid)
+            {
+                continue;
+            }
+
             var context = new RenderContext(
                 FrameArena.Instance,
                 device,
                 swapChain,
-                EngineKernel.Instance.CurrentFrameIndex,
+                frameIndex,
                 deltaTime,
                 surface.Width,
                 surface.Height
@@ -139,8 +149,11 @@ public class RenderSubsystem : ITickableSubsystem
             // can perform a targeted asynchronous wait.
             if (surface is RenderSurface concreteSurface)
             {
-                concreteSurface.SetLastRenderTicket(ticket);
+                concreteSurface.SetLastRenderTicket(ticket, (uint)context.FrameIndex);
             }
+
+            // Finalize work and signal presentation
+            swapChain.EndFrame(frameIndex);
         }
     }
 
@@ -172,13 +185,40 @@ public class RenderSubsystem : ITickableSubsystem
         }
     }
 
-    public IntPtr GetSurfaceSharedHandle(IntPtr host)
+    public IntPtr GetSurfaceSharedHandle(IntPtr host, uint frameIndex)
     {
         if (m_RenderSurfaces.TryGetValue(host, out var surfaceInfo))
         {
-            return surfaceInfo.Surface.GetSharedHandle();
+            return surfaceInfo.Surface.GetSharedHandle(frameIndex);
         }
         return IntPtr.Zero;
+    }
+
+    public ulong GetLastRenderTicket(IntPtr host)
+    {
+        if (m_RenderSurfaces.TryGetValue(host, out var surfaceInfo))
+        {
+            return surfaceInfo.Surface.GetLastRenderTicket();
+        }
+        return 0;
+    }
+
+    public uint GetLastRenderFrameIndex(IntPtr host)
+    {
+        if (m_RenderSurfaces.TryGetValue(host, out var surfaceInfo))
+        {
+            return surfaceInfo.Surface.GetLastRenderFrameIndex();
+        }
+        return 0;
+    }
+
+    public System.Threading.Tasks.Task WaitForRenderTicketAsync(IntPtr host, ulong ticket)
+    {
+        if (m_RenderSurfaces.TryGetValue(host, out var surfaceInfo))
+        {
+            return surfaceInfo.Surface.WaitForRenderTicketAsync(ticket);
+        }
+        return System.Threading.Tasks.Task.CompletedTask;
     }
 
     public void UnregisterSurface(IntPtr host)
