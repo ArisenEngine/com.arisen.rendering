@@ -5,6 +5,8 @@ namespace ArisenEngine.Rendering;
 
 public abstract class RenderPipelineAsset : ISerializationCallbackReceiver
 {
+    public bool IsDirty { get; set; } = true;
+
     internal RenderPipeline InternalCreatePipeline()
     {
         RenderPipeline pipeline = (RenderPipeline)null;

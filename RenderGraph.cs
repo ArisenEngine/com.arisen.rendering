@@ -16,9 +16,11 @@ public sealed class RenderGraph : IDisposable
     private readonly List<RenderResource> m_Resources = new();
     private readonly ITaskGraph m_TaskSystem;
     
-    // Key: ThreadId, Value: Command Pool for that thread
-    private readonly ConcurrentDictionary<int, RHICommandBufferPool> m_CommandPools = new();
+    // Key: (ThreadId, SurfaceId), Value: Command Pool for that thread/surface combination
+    private readonly ConcurrentDictionary<(int, uint), RHICommandBufferPool> m_CommandPools = new();
 
+    private RHIFactory? m_Factory;
+    
     public RenderGraph(ITaskGraph taskSystem)
     {
         m_TaskSystem = taskSystem;
@@ -58,7 +60,9 @@ public sealed class RenderGraph : IDisposable
     public ulong Execute(RenderContext context)
     {
         var factory = context.Device.GetFactory();
+        m_Factory = factory; // B1: Store factory for safe resource cleanup on Dispose
         var compiled = GraphCompiler.Compile(m_Graph);
+        uint surfaceId = context.SurfaceId;
 
         // 1. Dispatch passes to TaskGraph for parallel command recording
         foreach (var layer in compiled.ParallelLayers)
@@ -71,19 +75,26 @@ public sealed class RenderGraph : IDisposable
                 var recordTask = new ActionTask(() =>
                 {
                     int threadId = Thread.CurrentThread.ManagedThreadId;
+                    var key = (threadId, surfaceId);
                     
-                    // Retrieve or Create a pool for this worker thread
-                    if (!m_CommandPools.TryGetValue(threadId, out var pool))
+                    // Retrieve or Create a pool for this worker thread/surface
+                    if (!m_CommandPools.TryGetValue(key, out var pool))
                     {
                         pool = factory.CreateCommandBufferPool(RHIQueueType.Graphics);
-                        m_CommandPools.TryAdd(threadId, pool);
+                        m_CommandPools.TryAdd(key, pool);
                     }
 
                     // Request a unique command buffer for this frame
-                    var cmdToken = pool.GetCommandBuffer(context.FrameIndex);
+                    var cmdBuffer = pool.GetCommandBuffer(context.FrameIndex);
+
+                    // Ensure the command buffer is in the recording state
+                    cmdBuffer.Begin();
                     
-                    node.Setup(context, cmdToken);
+                    node.Setup(context, cmdBuffer);
                     node.Execute();
+
+                    // Finalize the command buffer to the Executable state
+                    cmdBuffer.End();
                 }, node.Name);
 
                 m_TaskSystem.AddTask(recordTask);
@@ -109,12 +120,17 @@ public sealed class RenderGraph : IDisposable
 
     public void Dispose()
     {
-        // Cleanup all allocated command pools
-        foreach (var pool in m_CommandPools.Values)
+        // B2: Cleanup all allocated command pools in the native RHI layer
+        if (m_Factory != null && m_Factory.Value.IsValid)
         {
-            // We need a reference to the factory to release these pools
-            // In a better design, the pool manager would handle this.
+            foreach (var pool in m_CommandPools.Values)
+            {
+                m_Factory.Value.ReleaseCommandBufferPool(pool.RHIHandle);
+            }
         }
+        
         m_CommandPools.Clear();
+        m_Graph.Clear();
+        m_Resources.Clear();
     }
 }

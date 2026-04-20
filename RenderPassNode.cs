@@ -15,7 +15,14 @@ public abstract class RenderPassNode : TaskNode
 
     public RHICommandBuffer? CommandBuffer => m_CommandBuffer;
 
-    // TODO: Add inputs/outputs for dependency tracking
+    // Phase 5: Dependency tracking ports. 
+    // RenderGraph.AddDependency connects port 0 of passes to force execution order.
+    protected RenderPassNode(string name = "RenderPass")
+    {
+        Name = name;
+        AddInputPort("In", typeof(void));
+        AddOutputPort("Out", typeof(void));
+    }
 
     /// <summary>
     /// Initialized by the RenderGraph before execution.
