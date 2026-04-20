@@ -14,6 +14,7 @@ public class RenderSubsystem : ITickableSubsystem
 {
     public static Action AllSurfacesDestroyed;
     private Dictionary<IntPtr, SurfaceInfo> m_RenderSurfaces = new Dictionary<IntPtr, SurfaceInfo>();
+    private readonly RHICommandQueue m_CommandQueue = new();
 
     private RenderPipeline? m_CurrentPipeline;
     private RenderPipelineAsset? m_CurrentAsset;
@@ -37,15 +38,22 @@ public class RenderSubsystem : ITickableSubsystem
     {
         using var _ = Profiler.Zone("RenderSubsystem.Tick");
 
+        // Execute all pending RHI commands (resize, registration) on the Render thread
+        // BEFORE starting the frame's rendering work.
+        m_CommandQueue.ExecutePending(this);
+
         var asset = Graphics.currentRenderPipelineAsset;
         if (asset == null) return;
 
         // 1. Manage pipeline lifecycle
-        if (!ReferenceEquals(m_CurrentAsset, asset))
+        // REFACTOR: We check for reference equality AND a dirty state to handle property changes in the same asset instance.
+        if (!ReferenceEquals(m_CurrentAsset, asset) || asset.IsDirty)
         {
             m_CurrentPipeline?.Dispose();
             m_CurrentAsset = asset;
             m_CurrentPipeline = asset.InternalCreatePipeline();
+            asset.IsDirty = false;
+            Logger.Log($"[RenderSubsystem] Pipeline recreated from asset: {asset.GetType().Name}");
         }
 
         if (m_CurrentPipeline == null) return;
@@ -54,7 +62,7 @@ public class RenderSubsystem : ITickableSubsystem
         foreach (var surfaceInfo in m_RenderSurfaces.Values)
         {
             var surface = surfaceInfo.Surface;
-            var device = RHISystem.GetOrCreateDevice(surface.SurfaceId);
+            var device = RHISystem.GetOrCreateDevice(surface.SurfaceId, surface.Width, surface.Height);
             
             // Get the swapchain associated with this surface
             var swapChain = device.GetSurface().GetSwapChain();
@@ -79,6 +87,7 @@ public class RenderSubsystem : ITickableSubsystem
                 FrameArena.Instance,
                 device,
                 swapChain,
+                surface.SurfaceId,
                 frameIndex,
                 deltaTime,
                 surface.Width,
@@ -88,12 +97,25 @@ public class RenderSubsystem : ITickableSubsystem
             if (sceneSubsystem != null)
             {
                 var drawList = sceneSubsystem.GetCurrentDrawList();
-                unsafe
+                if (drawList.Length > 0)
                 {
-                    fixed (MeshDrawCommand* pDrawList = drawList)
+                    var arenaSpan = FrameArena.Instance.Alloc<MeshDrawCommand>(drawList.Length);
+                    drawList.CopyTo(arenaSpan);
+                    unsafe
                     {
-                        context.DrawListPtr = pDrawList;
-                        context.DrawListCount = drawList.Length;
+                        fixed (MeshDrawCommand* pDrawList = arenaSpan)
+                        {
+                            context.DrawListPtr = pDrawList;
+                            context.DrawListCount = drawList.Length;
+                        }
+                    }
+                }
+                else
+                {
+                    unsafe
+                    {
+                        context.DrawListPtr = null;
+                        context.DrawListCount = 0;
                     }
                 }
             }
@@ -150,6 +172,10 @@ public class RenderSubsystem : ITickableSubsystem
             if (surface is RenderSurface concreteSurface)
             {
                 concreteSurface.SetLastRenderTicket(ticket, (uint)context.FrameIndex);
+                if (frameIndex % 60 == 0) // Log once per second approx
+                {
+                    Logger.Log($"[RenderSubsystem] Surface: {surface.Name}, Frame: {frameIndex}, Ticket: {ticket}");
+                }
             }
 
             // Finalize work and signal presentation
@@ -159,7 +185,12 @@ public class RenderSubsystem : ITickableSubsystem
 
     public void RegisterSurface(IntPtr host, string name, SurfaceType surfaceType, int width = 0, int height = 0)
     {
-        using var _ = Profiler.Zone("RenderSubsystem.RegisterSurface");
+        m_CommandQueue.Enqueue(new RegisterSurfaceCommand(host, name, surfaceType, width, height));
+    }
+
+    internal void InternalRegisterSurface(IntPtr host, string name, SurfaceType surfaceType, int width = 0, int height = 0)
+    {
+        using var _ = Profiler.Zone("RenderSubsystem.InternalRegisterSurface");
         if (!m_RenderSurfaces.ContainsKey(host))
         {
             var surface = new RenderSurface(host, name, width, height);
@@ -178,6 +209,11 @@ public class RenderSubsystem : ITickableSubsystem
     }
 
     public void ResizeSurface(IntPtr host, int width, int height)
+    {
+        m_CommandQueue.Enqueue(new ResizeSurfaceCommand(host, (uint)width, (uint)height));
+    }
+
+    internal void InternalResizeSurface(IntPtr host, int width, int height)
     {
         if (m_RenderSurfaces.TryGetValue(host, out var surface))
         {
@@ -222,6 +258,11 @@ public class RenderSubsystem : ITickableSubsystem
     }
 
     public void UnregisterSurface(IntPtr host)
+    {
+        m_CommandQueue.Enqueue(new UnregisterSurfaceCommand(host));
+    }
+
+    internal void InternalUnregisterSurface(IntPtr host)
     {
         if (m_RenderSurfaces.TryGetValue(host, out var surfaceInfo))
         {

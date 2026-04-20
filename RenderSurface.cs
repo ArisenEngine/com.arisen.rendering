@@ -29,6 +29,7 @@ public class RenderSurface : IRenderSurface
     public uint SurfaceId => m_SurfaceId;
     public uint Width => m_Width;
     public uint Height => m_Height;
+    public string Name => m_Name;
 
     public RenderSurface(IntPtr host, string name, int width = 0, int height = 0, bool hosted = true)
     {
@@ -140,6 +141,10 @@ public class RenderSurface : IRenderSurface
         if ((m_SurfaceId & RHISystem.VirtualSurfaceIDMask) == 0)
         {
             NativeHAL.RenderWindowAPI.RemoveRenderSurface(m_SurfaceId);
+        }
+        else
+        {
+            RHISystem.RemoveDevice(m_SurfaceId);
         }
         Surfaces.Remove(this);
         if (Surfaces.Count <= 0)
