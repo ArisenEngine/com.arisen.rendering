@@ -20,6 +20,9 @@ public class RenderSurface : IRenderSurface
     private string m_Name = "RenderSurface";
     private ulong m_LastTicket;
     private uint m_LastFrameIndex;
+    private uint m_LastRenderWidth;
+    private uint m_LastRenderHeight;
+    private RHISwapChain? m_LastRenderSwapChain;
     private Core.RHI.RHISurface m_NativeSurface;
 
     private WindowProcessor m_Processor;
@@ -110,6 +113,8 @@ public class RenderSurface : IRenderSurface
 
     public void Resize(uint width, uint height)
     {
+        if (m_Width == width && m_Height == height) return;
+
         m_Width = width;
         m_Height = height;
 
@@ -118,6 +123,9 @@ public class RenderSurface : IRenderSurface
         // Instead, we call the RHI-level SetResolution directly which handles swapchain recreation.
         if ((m_SurfaceId & RHISystem.VirtualSurfaceIDMask) != 0)
         {
+            // Reset cache to force re-fetch of swapchain images at the new resolution.
+            m_CachedSwapChain = null;
+
             if (m_NativeSurface == null)
             {
                 var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
@@ -183,24 +191,27 @@ public class RenderSurface : IRenderSurface
 
         if (m_NativeSurface == null) return IntPtr.Zero;
 
-        if (m_CachedSwapChain == null || !m_CachedSwapChain.Value.IsValid)
-        {
-            m_CachedSwapChain = m_NativeSurface.GetSwapChain();
-        }
+        // B101: Strict Synchronization.
+        // Always attempt to use the swapchain that was used for the last successful render.
+        // This ensures that the handle and dimensions match the reported ticket even during a resize.
+        var swapChainToUse = m_LastRenderSwapChain ?? (m_CachedSwapChain ?? m_NativeSurface.GetSwapChain());
+        if (m_CachedSwapChain == null) m_CachedSwapChain = swapChainToUse;
 
-        if (m_CachedSwapChain.Value.IsValid)
+        if (swapChainToUse.IsValid)
         {
             // For cross-API interop, we synchronize with the engine's frame rotation.
             // RHIVkSwapChain consistently uses (frameIndex % imageCount) for virtual swapchains.
             // Default image count for virtual surfaces is 3. 
             uint imageCount = 3; 
-            return m_CachedSwapChain.Value.GetSharedWin32Handle(frameIndex % imageCount);
+            return swapChainToUse.GetSharedWin32Handle(frameIndex % imageCount);
         }
         return IntPtr.Zero;
     }
 
     public ulong GetLastRenderTicket() => m_LastTicket;
     public uint GetLastRenderFrameIndex() => m_LastFrameIndex;
+    public uint GetLastRenderWidth() => m_LastRenderWidth;
+    public uint GetLastRenderHeight() => m_LastRenderHeight;
 
     public async Task WaitForRenderTicketAsync(ulong ticket)
     {
@@ -217,10 +228,13 @@ public class RenderSurface : IRenderSurface
         }
     }
 
-    internal void SetLastRenderTicket(ulong ticket, uint frameIndex) 
+    internal void SetLastRenderTicket(ulong ticket, uint frameIndex, uint width, uint height, RHISwapChain swapChain) 
     { 
         m_LastTicket = ticket; 
         m_LastFrameIndex = frameIndex;
+        m_LastRenderWidth = width;
+        m_LastRenderHeight = height;
+        m_LastRenderSwapChain = swapChain;
     }
 }
 

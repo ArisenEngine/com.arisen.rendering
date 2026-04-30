@@ -18,6 +18,7 @@ public struct RenderContext
     public uint Width { get; }
     public uint Height { get; }
     public uint SurfaceId { get; }
+    public RHIImageHandle TargetImage { get; }
     
     // The list of meshes to be drawn this frame. 
     // We use a raw pointer to allow this struct to be captured by TaskGraph lambdas.
@@ -26,11 +27,12 @@ public struct RenderContext
 
     public unsafe readonly ReadOnlySpan<MeshDrawCommand> DrawList => new(DrawListPtr, DrawListCount);
 
-    public RenderContext(FrameArena arena, RHIDevice device, RHISwapChain swapChain, uint surfaceId, uint frameIndex, float deltaTime, uint width, uint height)
+    public RenderContext(FrameArena arena, RHIDevice device, RHISwapChain swapChain, RHIImageHandle targetImage, uint surfaceId, uint frameIndex, float deltaTime, uint width, uint height)
     {
         Arena = arena;
         Device = device;
         SwapChain = swapChain;
+        TargetImage = targetImage;
         SurfaceId = surfaceId;
         FrameIndex = frameIndex;
         DeltaTime = deltaTime;

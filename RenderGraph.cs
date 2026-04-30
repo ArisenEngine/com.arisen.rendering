@@ -106,9 +106,15 @@ public sealed class RenderGraph : IDisposable
 
         ulong lastTicket = 0;
         // 2. Submit all recorded command buffers in topological order to the GPU
-        foreach (var node in compiled.SortedNodes)
+        var sorted = compiled.SortedNodes;
+        foreach (var node in sorted)
         {
              lastTicket = context.Device.Submit(node.CommandBuffer.Value);
+        }
+
+        if (context.FrameIndex % 60 == 0)
+        {
+            ArisenEngine.Core.Diagnostics.Logger.Log($"[RenderGraph] Execute - Submitted {sorted.Count} nodes. Last Ticket: {lastTicket}");
         }
 
         // 3. Cleanup: Clear the graph for the next frame
