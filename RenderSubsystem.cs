@@ -200,7 +200,14 @@ public class RenderSubsystem : ITickableSubsystem
             var rd = ArisenKernel.Lifecycle.EngineKernel.Instance.Services.GetService<RenderDocService>();
             bool requestCapture = rd?.IsCaptureRequested ?? false;
 
-            IntPtr deviceHandle = IntPtr.Zero; // TODO: Get actual device handle if needed by RenderDoc
+            IntPtr deviceHandle = IntPtr.Zero;
+            var rhiInst = ArisenEngine.Core.RHI.RHISystem.Instance;
+            if (rhiInst.HasValue && rhiInst.Value.IsValid)
+            {
+                // For Vulkan, RenderDoc needs the dispatch table pointer (the first pointer inside the instance)
+                // This is equivalent to *(void**)vkInstance
+                deviceHandle = System.Runtime.InteropServices.Marshal.ReadIntPtr(rhiInst.Value.Handle);
+            }
             IntPtr windowHandle = IntPtr.Zero; // Virtual surfaces don't have a Win32 HWND
 
             if (requestCapture)

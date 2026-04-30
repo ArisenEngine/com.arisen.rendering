@@ -56,31 +56,45 @@ public class RenderDocService : IDisposable
     [StructLayout(LayoutKind.Sequential)]
     private struct RenderDocVTable
     {
-        public IntPtr GetCaptureOptionU32;
+        public IntPtr GetAPIVersion;
         public IntPtr SetCaptureOptionU32;
-        public IntPtr GetCaptureOptionF32;
         public IntPtr SetCaptureOptionF32;
-        public IntPtr SetCaptureFilePathTemplate;
-        public IntPtr GetCaptureFilePathTemplate;
+        public IntPtr GetCaptureOptionU32;
+        public IntPtr GetCaptureOptionF32;
+
+        public IntPtr SetFocusToggleKeys;
+        public IntPtr SetCaptureKeys;
+
+        public IntPtr GetOverlayBits;
+        public IntPtr MaskOverlayBits;
+
+        public IntPtr Shutdown; // union with RemoveHooks
+        public IntPtr UnloadCrashHandler;
+
+        public IntPtr SetCaptureFilePathTemplate; // union with SetLogFilePathTemplate
+        public IntPtr GetCaptureFilePathTemplate; // union with GetLogFilePathTemplate
+
         public IntPtr GetNumCaptures;
         public IntPtr GetCapture;
+
         public IntPtr TriggerCapture;
-        public IntPtr IsTargetControlConnected;
+
+        public IntPtr IsTargetControlConnected; // union with IsRemoteAccessConnected
+
         public IntPtr LaunchReplayUI;
+
         public IntPtr SetActiveWindow;
+
         public IntPtr StartFrameCapture;
         public IntPtr IsFrameCapturing;
         public IntPtr EndFrameCapture;
+
         public IntPtr TriggerMultiFrameCapture;
-        public IntPtr SetFocusWindow;
-        public IntPtr GetOverlayBits;
-        public IntPtr SetOverlayBits;
-        public IntPtr Shutdown;
-        public IntPtr UnloadScene;
-        public IntPtr SetCaptureTitle;
+
+        public IntPtr SetCaptureFileComments;
         public IntPtr DiscardFrameCapture;
-        public IntPtr IsRemoteAccessConnected;
-        public IntPtr GetAPIVersion;
+        public IntPtr ShowReplayUI;
+        public IntPtr SetCaptureTitle;
     }
 
     private IntPtr m_Library;
@@ -91,6 +105,7 @@ public class RenderDocService : IDisposable
     private pfnLaunchReplayUI? m_LaunchReplayUI;
     private pfnStartFrameCapture? m_StartFrameCapture;
     private pfnEndFrameCapture? m_EndFrameCapture;
+    private pfnIsFrameCapturing? m_IsFrameCapturing;
     private pfnGetNumCaptures? m_GetNumCaptures;
     private pfnGetCapture? m_GetCapture;
     private pfnTriggerMultiFrameCapture? m_TriggerMultiFrameCapture;
@@ -184,6 +199,7 @@ public class RenderDocService : IDisposable
             m_TriggerCapture = Marshal.GetDelegateForFunctionPointer<pfnTriggerCapture>(m_VTable.TriggerCapture);
             m_LaunchReplayUI = Marshal.GetDelegateForFunctionPointer<pfnLaunchReplayUI>(m_VTable.LaunchReplayUI);
             m_StartFrameCapture = Marshal.GetDelegateForFunctionPointer<pfnStartFrameCapture>(m_VTable.StartFrameCapture);
+            m_IsFrameCapturing = Marshal.GetDelegateForFunctionPointer<pfnIsFrameCapturing>(m_VTable.IsFrameCapturing);
             m_EndFrameCapture = Marshal.GetDelegateForFunctionPointer<pfnEndFrameCapture>(m_VTable.EndFrameCapture);
             m_GetNumCaptures = Marshal.GetDelegateForFunctionPointer<pfnGetNumCaptures>(m_VTable.GetNumCaptures);
             m_GetCapture = Marshal.GetDelegateForFunctionPointer<pfnGetCapture>(m_VTable.GetCapture);
@@ -203,36 +219,51 @@ public class RenderDocService : IDisposable
     /// </summary>
     public void TriggerCapture()
     {
-        System.Threading.Tasks.Task.Run(() => {
-            EnsureInitialized();
-            
-            // Wait for the initialization task to complete before calling any API functions.
-            m_InitTask?.Wait();
-
-            if (!IsAvailable) return;
-            
-            IsCaptureRequested = true;
-            KernelLog.Info("[RenderDocService] Capture requested for next frame via TriggerMultiFrameCapture.");
-            
-            m_TriggerMultiFrameCapture?.Invoke(1);
-        });
+        EnsureInitialized();
+        
+        // We set the flag to true. The next call to StartCapture in the render loop will begin the capture.
+        // This is necessary because for virtual surfaces, RenderDoc doesn't see a 'Present' call.
+        IsCaptureRequested = true;
+        KernelLog.Info("[RenderDocService] Capture requested for next frame via manual markers.");
     }
 
     public void ClearCaptureRequest() => IsCaptureRequested = false;
 
     public void StartCapture(IntPtr device, IntPtr window)
     {
-        // We use TriggerMultiFrameCapture now, which handles Start/End automatically.
-        // This avoids the 0xC0000005 crashes seen when manually markers are used with null handles.
+        if (!m_Initialized || !IsAvailable) return;
+        
+        m_StartFrameCapture?.Invoke(device, window);
+        
+        if (IsFrameCapturing())
+        {
+            KernelLog.Info("[RenderDocService] RenderDoc started capturing frame.");
+        }
+        else
+        {
+            KernelLog.Warning("[RenderDocService] RenderDoc failed to start capturing. (Device/Window wildcard mismatch?)");
+        }
     }
+
+    public bool IsFrameCapturing() => (m_IsFrameCapturing?.Invoke() ?? 0) != 0;
 
     public void EndCapture(IntPtr device, IntPtr window)
     {
-        if (!m_Initialized) return;
-        if (!IsAvailable) return;
+        if (!m_Initialized || !IsAvailable) return;
+
+        uint result = m_EndFrameCapture?.Invoke(device, window) ?? 0;
+        if (result == 0)
+        {
+            KernelLog.Warning("[RenderDocService] EndFrameCapture returned 0 (failure).");
+        }
+        else 
+        {
+            KernelLog.Info("[RenderDocService] EndFrameCapture succeeded.");
+        }
 
         // Path retrieval logic remains below
         uint numCaptures = m_GetNumCaptures?.Invoke() ?? 0;
+        KernelLog.Info($"[RenderDocService] Total captures reported by API: {numCaptures}");
         if (numCaptures > 0)
         {
             // Get the latest capture (index is 0-based)
@@ -240,24 +271,27 @@ public class RenderDocService : IDisposable
             uint pathLen = 0;
             ulong timestamp = 0;
             
-            // First call to get length
+            // First call to get length (filename=NULL)
             m_GetCapture?.Invoke(lastIdx, IntPtr.Zero, out pathLen, out timestamp);
             if (pathLen > 0)
             {
                 IntPtr pathPtr = Marshal.AllocHGlobal((int)pathLen);
                 try 
                 {
+                    // Second call to get path
                     m_GetCapture?.Invoke(lastIdx, pathPtr, out pathLen, out timestamp);
                     string? path = Marshal.PtrToStringAnsi(pathPtr);
                     if (!string.IsNullOrEmpty(path))
                     {
-                        KernelLog.Info($"[RenderDocService] Capture saved to: {path}. Launching UI via Process.Start...");
+                        KernelLog.Info($"[RenderDocService] Capture saved to: {path}. Launching UI...");
                         
-                        // Try to find qrenderdoc.exe in the same folder as the dll
-                        string dllPath = Marshal.PtrToStringAnsi(m_Library) ?? ""; // This doesn't work for handles, need another way
-                        
-                        // Hardcoded for now based on common installation
+                        // Try to find qrenderdoc.exe in common installation paths
                         string exePath = "C:\\Program Files\\RenderDoc\\qrenderdoc.exe";
+                        if (!System.IO.File.Exists(exePath))
+                        {
+                            exePath = "C:\\renderdoc\\qrenderdoc.exe"; // Fallback
+                        }
+
                         if (System.IO.File.Exists(exePath))
                         {
                             System.Diagnostics.Process.Start(exePath, $"\"{path}\"");
