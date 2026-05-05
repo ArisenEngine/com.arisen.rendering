@@ -6,6 +6,9 @@ namespace ArisenEngine.Rendering;
 
 /// <summary>
 /// Provides integration with the RenderDoc API for frame captures.
+/// RenderDoc must be preloaded (via NativeRuntime.PreloadRenderDoc) BEFORE
+/// vkCreateInstance for captures to work. This service binds to the already-loaded
+/// renderdoc.dll and exposes capture control.
 /// </summary>
 public class RenderDocService : IDisposable
 {
@@ -114,52 +117,45 @@ public class RenderDocService : IDisposable
 
     public bool IsAvailable => m_ApiPtr != IntPtr.Zero;
 
-    private readonly object m_InitLock = new object();
-    private volatile bool m_Initialized;
-    private System.Threading.Tasks.Task? m_InitTask;
+    private bool m_Initialized;
 
     private RenderDocService()
     {
     }
 
     /// <summary>
-    /// Kicks off the background initialization of the RenderDoc API.
-    /// Uses a Task to avoid blocking the main thread during library search and LoadLibrary calls.
+    /// Synchronous initialization. Called when the service is first needed.
+    /// By this point, NativeRuntime has already preloaded renderdoc.dll via LoadLibrary
+    /// BEFORE vkCreateInstance, so GetModuleHandle will find it and RenderDoc's Vulkan
+    /// hooks are already active.
     /// </summary>
-    private void EnsureInitialized()
+    public void EnsureInitialized()
     {
         if (m_Initialized) return;
-        lock (m_InitLock)
-        {
-            if (m_Initialized) return;
-            if (m_InitTask == null)
-            {
-                m_InitTask = System.Threading.Tasks.Task.Run(() => {
-                    Initialize();
-                    m_Initialized = true;
-                });
-            }
-        }
+        m_Initialized = true;
+        Initialize();
     }
 
     private void Initialize()
     {
         try 
         {
-            KernelLog.Info("[RenderDocService] Starting background initialization...");
+            KernelLog.Info("[RenderDocService] Initializing...");
 
-            // RenderDoc usually injects itself. We try to find it first.
+            // RenderDoc should already be loaded by NativeRuntime.PreloadRenderDoc().
+            // GetModuleHandle just gets the handle to the already-loaded DLL.
             m_Library = GetModuleHandle("renderdoc.dll");
             if (m_Library == IntPtr.Zero)
             {
-                // If not injected, we try to load it from common installation paths
+                // If not preloaded, we try to load it now (fallback, but captures may not work
+                // if Vulkan was already initialized without RenderDoc hooks).
                 string[] paths = {
                     "C:\\Program Files\\RenderDoc\\renderdoc.dll",
                     "C:\\renderdoc.dll"
                 };
                 foreach(var p in paths) {
                     if (System.IO.File.Exists(p)) {
-                        KernelLog.Info($"[RenderDocService] Loading library from: {p}");
+                        KernelLog.Warning($"[RenderDocService] Loading library late (after Vulkan init) from: {p}. Captures may not work!");
                         m_Library = LoadLibrary(p);
                         break;
                     }
@@ -215,25 +211,37 @@ public class RenderDocService : IDisposable
 
     /// <summary>
     /// Requests a frame capture on the next frame.
-    /// Runs in a Task so it can wait for background initialization without blocking the caller (UI/Main thread).
+    /// The render loop checks IsCaptureRequested and wraps the frame with Start/EndCapture.
     /// </summary>
     public void TriggerCapture()
     {
         EnsureInitialized();
         
-        // We set the flag to true. The next call to StartCapture in the render loop will begin the capture.
-        // This is necessary because for virtual surfaces, RenderDoc doesn't see a 'Present' call.
+        if (!IsAvailable)
+        {
+            KernelLog.Warning("[RenderDocService] Cannot capture: RenderDoc API not available. Was renderdoc.dll loaded before Vulkan init?");
+            return;
+        }
+
         IsCaptureRequested = true;
         KernelLog.Info("[RenderDocService] Capture requested for next frame via manual markers.");
     }
 
     public void ClearCaptureRequest() => IsCaptureRequested = false;
 
-    public void StartCapture(IntPtr device, IntPtr window)
+    /// <summary>
+    /// Begins a frame capture. Uses NULL/NULL wildcards per RenderDoc docs:
+    /// "If both are set to NULL, RenderDoc will simply choose one at random
+    /// so is only recommended for the case where only one is present."
+    /// This is correct for Arisen Engine which has a single Vulkan instance.
+    /// </summary>
+    public void StartCapture()
     {
         if (!m_Initialized || !IsAvailable) return;
         
-        m_StartFrameCapture?.Invoke(device, window);
+        // Pass NULL, NULL to wildcard match the single Vulkan device.
+        // Virtual surfaces have no HWND, so we cannot pass a window handle.
+        m_StartFrameCapture?.Invoke(IntPtr.Zero, IntPtr.Zero);
         
         if (IsFrameCapturing())
         {
@@ -241,17 +249,22 @@ public class RenderDocService : IDisposable
         }
         else
         {
-            KernelLog.Warning("[RenderDocService] RenderDoc failed to start capturing. (Device/Window wildcard mismatch?)");
+            KernelLog.Warning("[RenderDocService] RenderDoc failed to start capturing. Was renderdoc.dll loaded before vkCreateInstance?");
         }
     }
 
     public bool IsFrameCapturing() => (m_IsFrameCapturing?.Invoke() ?? 0) != 0;
 
-    public void EndCapture(IntPtr device, IntPtr window)
+    /// <summary>
+    /// Ends a frame capture and retrieves the capture file path.
+    /// Uses NULL/NULL wildcards matching StartCapture.
+    /// </summary>
+    public void EndCapture()
     {
         if (!m_Initialized || !IsAvailable) return;
 
-        uint result = m_EndFrameCapture?.Invoke(device, window) ?? 0;
+        // Must match the device/window used in StartCapture (NULL, NULL)
+        uint result = m_EndFrameCapture?.Invoke(IntPtr.Zero, IntPtr.Zero) ?? 0;
         if (result == 0)
         {
             KernelLog.Warning("[RenderDocService] EndFrameCapture returned 0 (failure).");
