@@ -195,24 +195,14 @@ public class RenderSubsystem : ITickableSubsystem
 
             // B11: RenderDoc Integration
             // If a capture was requested (e.g. from the Editor UI), we wrap the engine work 
-            // with Start/End capture calls. This is essential for virtual swapchains
-            // which do not have a traditional native Present call.
+            // with Start/End capture calls. RenderDocService uses NULL/NULL wildcards
+            // to match the single Vulkan device (virtual surfaces have no HWND).
             var rd = ArisenKernel.Lifecycle.EngineKernel.Instance.Services.GetService<RenderDocService>();
             bool requestCapture = rd?.IsCaptureRequested ?? false;
 
-            IntPtr deviceHandle = IntPtr.Zero;
-            var rhiInst = ArisenEngine.Core.RHI.RHISystem.Instance;
-            if (rhiInst.HasValue && rhiInst.Value.IsValid)
-            {
-                // For Vulkan, RenderDoc needs the dispatch table pointer (the first pointer inside the instance)
-                // This is equivalent to *(void**)vkInstance
-                deviceHandle = System.Runtime.InteropServices.Marshal.ReadIntPtr(rhiInst.Value.Handle);
-            }
-            IntPtr windowHandle = IntPtr.Zero; // Virtual surfaces don't have a Win32 HWND
-
             if (requestCapture)
             {
-                rd?.StartCapture(deviceHandle, windowHandle);
+                rd?.StartCapture();
             }
 
             ulong ticket = 0;
@@ -224,7 +214,7 @@ public class RenderSubsystem : ITickableSubsystem
             {
                 if (requestCapture)
                 {
-                    rd?.EndCapture(deviceHandle, windowHandle);
+                    rd?.EndCapture();
                     rd?.ClearCaptureRequest();
                     Logger.Log("[RenderSubsystem] RenderDoc capture completed.");
                 }
