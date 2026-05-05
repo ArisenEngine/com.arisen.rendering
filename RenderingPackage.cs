@@ -25,11 +25,11 @@ public class RenderingPackage : IPackageEntry
         // 3. Register it as a tickable heart of the engine
         EngineKernel.Instance.RegisterSubsystem(m_RenderSubsystem);
 
-        // Ensure services are resolved topologically rather than statically
-        var windowProvider = registry.GetService<ArisenKernel.Contracts.IWindowProvider>();
-        var rhiDevice = registry.GetService<ArisenKernel.Contracts.IRHIDevice>();
-        
-        KernelLog.Info("[RenderingPackage] Loaded: RenderSubsystem successfully bound to RHI and Windowing providers.");
+        // IRHIDevice and IWindowProvider are resolved lazily by RenderSubsystem/RenderSurface on
+        // first use — not here. Graphics init (Vulkan + RenderDoc) is deferred to
+        // HardwareWarmupStep so it runs after Avalonia's WinUI compositor is up, which means
+        // IRHIDevice isn't registered yet at OnLoad time.
+        KernelLog.Info("[RenderingPackage] Loaded: RenderSubsystem registered.");
     }
 
     public void OnUnload(IServiceRegistry registry)
