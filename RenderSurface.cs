@@ -20,6 +20,7 @@ public class RenderSurface : IRenderSurface
     private string m_Name = "RenderSurface";
     private ulong m_LastTicket;
     private uint m_LastFrameIndex;
+    private uint m_LastConsumedFrameIndex;
     private uint m_LastRenderWidth;
     private uint m_LastRenderHeight;
     private RHISwapChain? m_LastRenderSwapChain;
@@ -227,6 +228,28 @@ public class RenderSurface : IRenderSurface
             await Task.Delay(1);
         }
     }
+
+    public RenderOutputInfo GetOutputInfo()
+    {
+        lock (this)
+        {
+            return new RenderOutputInfo
+            {
+                Ticket = m_LastTicket,
+                FrameIndex = m_LastFrameIndex,
+                SharedHandle = GetSharedHandle(m_LastFrameIndex),
+                Width = m_LastRenderWidth,
+                Height = m_LastRenderHeight
+            };
+        }
+    }
+
+    public void ReportConsumedFrameIndex(uint frameIndex)
+    {
+        m_LastConsumedFrameIndex = frameIndex;
+    }
+
+    public uint GetLastConsumedFrameIndex() => m_LastConsumedFrameIndex;
 
     internal void SetLastRenderTicket(ulong ticket, uint frameIndex, uint width, uint height, RHISwapChain swapChain) 
     { 
