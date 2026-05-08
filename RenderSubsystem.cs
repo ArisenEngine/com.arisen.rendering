@@ -316,6 +316,26 @@ public class RenderSubsystem : ITickableSubsystem
         return 0;
     }
 
+    public bool GetOutputInfo(IntPtr host, out RenderOutputInfo info)
+    {
+        if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
+        {
+            info = surfaceInfo.Surface.GetOutputInfo();
+            return true;
+        }
+
+        info = default;
+        return false;
+    }
+
+    public void ReportConsumedFrameIndex(IntPtr host, uint frameIndex)
+    {
+        if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
+        {
+            surfaceInfo.Surface.ReportConsumedFrameIndex(frameIndex);
+        }
+    }
+
     public uint GetLastRenderWidth(IntPtr host)
     {
         if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo) && surfaceInfo.Surface is RenderSurface concrete)
