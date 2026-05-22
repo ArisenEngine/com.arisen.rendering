@@ -1,7 +1,6 @@
 using Arisen.Native.RHI;
 using ArisenEngine.Core.RHI;
 using ArisenEngine.Core.Memory;
-using System.Numerics;
 
 namespace ArisenEngine.Rendering;
 
@@ -18,6 +17,7 @@ public struct RenderContext
     public uint Width { get; }
     public uint Height { get; }
     public uint SurfaceId { get; }
+    public RenderOutputKind OutputKind { get; }
     public RHIImageHandle TargetImage { get; }
     
     // The list of meshes to be drawn this frame. 
@@ -27,13 +27,14 @@ public struct RenderContext
 
     public unsafe readonly ReadOnlySpan<MeshDrawCommand> DrawList => new(DrawListPtr, DrawListCount);
 
-    public RenderContext(FrameArena arena, RHIDevice device, RHISwapChain swapChain, RHIImageHandle targetImage, uint surfaceId, uint frameIndex, float deltaTime, uint width, uint height)
+    public RenderContext(FrameArena arena, RHIDevice device, RHISwapChain swapChain, RHIImageHandle targetImage, uint surfaceId, RenderOutputKind outputKind, uint frameIndex, float deltaTime, uint width, uint height)
     {
         Arena = arena;
         Device = device;
         SwapChain = swapChain;
         TargetImage = targetImage;
         SurfaceId = surfaceId;
+        OutputKind = outputKind;
         FrameIndex = frameIndex;
         DeltaTime = deltaTime;
         Width = width;

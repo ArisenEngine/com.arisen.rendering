@@ -23,10 +23,16 @@ public abstract class RenderPipeline : IDisposable
             m_RenderGraph = new RenderGraph(taskGraph);
         }
 
-        // 1. Setup Phase: Derived pipelines register their passes
+                // 1. Setup Phase: Derived pipelines register their content passes.
         SetupGraph(m_RenderGraph, context, cameras);
 
-        // 2. Execution Phase: Record parallel commands and submit to GPU
+        // 2. Engine-owned frame target boundaries wrap the user graph so output
+        // acquire/layout/finalization policy is consistent across all pipelines.
+        m_RenderGraph.AddFrameOutputBoundary(
+            new PrepareFrameTargetPass("PrepareFrameTarget"),
+            new FinalOutputPass("FinalOutputPass"));
+
+        // 3. Execution Phase: Record parallel commands and submit to GPU.
         return m_RenderGraph.Execute(context);
     }
 
@@ -48,4 +54,4 @@ public abstract class RenderPipeline : IDisposable
     {
         return Render(context, cameras);
     }
-}
+}
