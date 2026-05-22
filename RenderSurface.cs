@@ -209,23 +209,102 @@ public class RenderSurface : IRenderSurface
         return IntPtr.Zero;
     }
 
+                public ulong GetSharedMemorySize(uint frameIndex)
+    {
+        if (m_NativeSurface == null)
+
+        {
+            var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
+            if (device.IsValid) m_NativeSurface = device.GetSurface();
+        }
+
+        if (m_NativeSurface == null) return 0;
+
+        var swapChainToUse = m_LastRenderSwapChain ?? (m_CachedSwapChain ?? m_NativeSurface.GetSwapChain());
+        if (m_CachedSwapChain == null) m_CachedSwapChain = swapChainToUse;
+
+        if (swapChainToUse.IsValid)
+        {
+            const uint imageCount = 3;
+            return swapChainToUse.GetSharedMemorySize(frameIndex % imageCount);
+        }
+
+        return 0;
+    }
+
+        public IntPtr GetRenderFinishedSemaphoreHandle(uint frameIndex)
+
+    {
+        if (m_NativeSurface == null)
+        {
+            var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
+            if (device.IsValid) m_NativeSurface = device.GetSurface();
+        }
+
+        if (m_NativeSurface == null) return IntPtr.Zero;
+
+        var swapChainToUse = m_LastRenderSwapChain ?? (m_CachedSwapChain ?? m_NativeSurface.GetSwapChain());
+        if (m_CachedSwapChain == null) m_CachedSwapChain = swapChainToUse;
+
+        return swapChainToUse.IsValid ? swapChainToUse.GetRenderFinishedSemaphoreWin32Handle(frameIndex) : IntPtr.Zero;
+    }
+
+    public IntPtr CreateConsumedSemaphoreHandle(uint frameIndex)
+    {
+        if (m_NativeSurface == null)
+        {
+            var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
+            if (device.IsValid) m_NativeSurface = device.GetSurface();
+        }
+
+        if (m_NativeSurface == null) return IntPtr.Zero;
+
+        var swapChainToUse = m_LastRenderSwapChain ?? (m_CachedSwapChain ?? m_NativeSurface.GetSwapChain());
+        if (m_CachedSwapChain == null) m_CachedSwapChain = swapChainToUse;
+
+        return swapChainToUse.IsValid ? swapChainToUse.CreateConsumedSemaphoreWin32Handle(frameIndex) : IntPtr.Zero;
+    }
+
+    public void ReleaseConsumedSemaphoreHandle(IntPtr handle)
+    {
+        if (handle == IntPtr.Zero) return;
+
+        var swapChainToUse = m_LastRenderSwapChain ?? m_CachedSwapChain;
+        if (swapChainToUse.HasValue && swapChainToUse.Value.IsValid)
+        {
+            swapChainToUse.Value.ReleaseConsumedSemaphoreWin32Handle(handle);
+        }
+    }
+
     public ulong GetLastRenderTicket() => m_LastTicket;
+
     public uint GetLastRenderFrameIndex() => m_LastFrameIndex;
+
     public uint GetLastRenderWidth() => m_LastRenderWidth;
     public uint GetLastRenderHeight() => m_LastRenderHeight;
 
-    public async Task WaitForRenderTicketAsync(ulong ticket)
+                public async Task WaitForRenderTicketAsync(ulong ticket)
     {
         if (ticket == 0) return;
+
 
         var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
         if (!device.IsValid) return;
 
-        // Poll for completion to avoid blocking the caller (e.g. Avalonia UI thread)
-        // while allowing concurrent execution of the Engine and UI.
-        while (device.GetCompletedTicket() < ticket)
+        var completedBefore = device.GetCompletedTicket();
+        if (completedBefore >= ticket) return;
+
+        // GetCompletedTicket() is only a cached value. In the Vulkan backend that cache is
+        // refreshed by RHIVkQueue::Update(), or by the native WaitForTicket path after waiting
+        // on the timeline semaphore. A pure managed poll here can therefore spin forever even
+        // while the GPU has already completed the work, leaving the editor viewport black before
+        // the first ImportImage/UpdateAsync call.
+        await Task.Run(() => device.WaitQueueTicket(ticket));
+
+        var completedAfter = device.GetCompletedTicket();
+        if (completedAfter < ticket)
         {
-            await Task.Delay(1);
+            KernelLog.Warning($"[RenderSurface] WaitForRenderTicketAsync returned before ticket completion. Surface=0x{m_SurfaceId:X}, Ticket={ticket}, CompletedBefore={completedBefore}, CompletedAfter={completedAfter}");
         }
     }
 
@@ -235,12 +314,17 @@ public class RenderSurface : IRenderSurface
         {
             return new RenderOutputInfo
             {
-                Ticket = m_LastTicket,
+                                Ticket = m_LastTicket,
                 FrameIndex = m_LastFrameIndex,
+
                 SharedHandle = GetSharedHandle(m_LastFrameIndex),
+                MemorySize = GetSharedMemorySize(m_LastFrameIndex),
+                WaitSemaphoreHandle = GetRenderFinishedSemaphoreHandle(m_LastFrameIndex),
+                                SignalSemaphoreHandle = CreateConsumedSemaphoreHandle(m_LastFrameIndex),
                 Width = m_LastRenderWidth,
                 Height = m_LastRenderHeight
             };
+
         }
     }
 
