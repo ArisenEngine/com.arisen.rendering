@@ -316,7 +316,8 @@ public class RenderSubsystem : ITickableSubsystem
         return 0;
     }
 
-    public bool GetOutputInfo(IntPtr host, out RenderOutputInfo info)
+        public bool GetOutputInfo(IntPtr host, out RenderOutputInfo info)
+
     {
         if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
         {
@@ -328,7 +329,18 @@ public class RenderSubsystem : ITickableSubsystem
         return false;
     }
 
+    public void ReleaseConsumedSemaphoreHandle(IntPtr host, IntPtr handle)
+    {
+        if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
+        {
+            surfaceInfo.Surface.ReleaseConsumedSemaphoreHandle(handle);
+        }
+    }
+
+
+
     public void ReportConsumedFrameIndex(IntPtr host, uint frameIndex)
+
     {
         if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
         {
