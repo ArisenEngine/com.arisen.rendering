@@ -1,0 +1,6 @@
+{
+  "entry": {
+    "assembly": "Com.Arisen.Rendering.dll",
+    "class": "ArisenEngine.Rendering.RenderingPackage"
+  }
+}
