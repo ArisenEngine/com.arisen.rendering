@@ -15,6 +15,11 @@ namespace ArisenEngine.Rendering;
 
 public class RenderSubsystem : ITickableSubsystem
 {
+    public RenderSubsystem()
+    {
+        Instance = this;
+    }
+
     public static RenderSubsystem? Instance;
     public static Action? AllSurfacesDestroyed;
     private static ConcurrentDictionary<IntPtr, SurfaceInfo> s_GlobalSurfaces

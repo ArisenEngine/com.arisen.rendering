@@ -11,9 +11,19 @@
   "services": {
     "requires": [
       "ArisenKernel.Contracts.IWindowProvider",
-      "ArisenKernel.Contracts.IRHIDevice"
+      {
+        "interface": "ArisenKernel.Contracts.IRHIDevice",
+        "deferred": true
+      }
     ]
   },
+  "subsystems": [
+    {
+      "class": "ArisenEngine.Rendering.RenderSubsystem",
+      "phase": "Running",
+      "priority": 100
+    }
+  ],
   "dependencies": {
     "com.arisen.core": "1.0.0",
     "com.arisen.ecs": "1.0.0",
