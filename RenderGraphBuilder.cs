@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 
 namespace ArisenEngine.Rendering;
 
@@ -23,7 +22,8 @@ public sealed class RenderGraphBuilder
     /// </summary>
     public RenderGraphBuilder Read(RenderResource resource)
     {
-        // TODO: Resource dependency resolution logic
+        ArgumentNullException.ThrowIfNull(resource);
+        m_Graph.RegisterRead(m_Pass, resource);
         return this;
     }
 
@@ -32,7 +32,8 @@ public sealed class RenderGraphBuilder
     /// </summary>
     public RenderGraphBuilder Write(RenderResource resource)
     {
-        // TODO: Resource dependency resolution logic
+        ArgumentNullException.ThrowIfNull(resource);
+        m_Graph.RegisterWrite(m_Pass, resource);
         return this;
     }
 

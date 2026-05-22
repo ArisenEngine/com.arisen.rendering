@@ -112,12 +112,17 @@ public class RenderSubsystem : ITickableSubsystem
                 continue;
             }
 
+            var outputKind = ((surface.SurfaceId & RHISystem.VirtualSurfaceIDMask) != 0)
+                ? RenderOutputKind.EditorSharedTexture
+                : RenderOutputKind.NativeSwapchain;
+
             var context = new RenderContext(
                 FrameArena.Instance,
                 device,
                 swapChain,
                 acquiredImage,
                 surface.SurfaceId,
+                outputKind,
                 frameIndex,
                 deltaTime,
                 surface.Width,
@@ -316,8 +321,7 @@ public class RenderSubsystem : ITickableSubsystem
         return 0;
     }
 
-        public bool GetOutputInfo(IntPtr host, out RenderOutputInfo info)
-
+    public bool GetOutputInfo(IntPtr host, out RenderOutputInfo info)
     {
         if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
         {
@@ -337,10 +341,7 @@ public class RenderSubsystem : ITickableSubsystem
         }
     }
 
-
-
     public void ReportConsumedFrameIndex(IntPtr host, uint frameIndex)
-
     {
         if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
         {
