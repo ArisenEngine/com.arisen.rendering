@@ -1,6 +1,6 @@
+using ArisenKernel.Diagnostics;
 using ArisenKernel.Packages;
 using ArisenKernel.Services;
-using ArisenKernel.Diagnostics;
 
 namespace ArisenEngine.Rendering;
 
@@ -12,12 +12,11 @@ public class RenderingPackage : IPackageEntry
 
         registry.RegisterService<RenderDocService>(RenderDocService.Instance);
 
-        // RenderSubsystem is declared in package metadata and registered by PackageSubsystem.
-        // IRHIDevice and IWindowProvider are resolved lazily by RenderSubsystem/RenderSurface on
-        // first use — not here. Graphics init (Vulkan + RenderDoc) is deferred to
-        // HardwareWarmupStep so it runs after Avalonia's WinUI compositor is up, which means
-        // IRHIDevice isn't registered yet at OnLoad time.
-        KernelLog.Info("[RenderingPackage] Loaded: RenderSubsystem is metadata-driven.");
+        // Rendering subsystems are declared in package metadata and registered by PackageSubsystem.
+        // Runtime builds warm up the selected RHI backend in RuntimeRHIWarmupSubsystem. Editor
+        // builds keep hardware warmup in HardwareWarmupStep so it runs after Avalonia's WinUI
+        // compositor is up.
+        KernelLog.Info("[RenderingPackage] Loaded: rendering subsystems are metadata-driven.");
     }
 
     public void OnUnload(IServiceRegistry registry)

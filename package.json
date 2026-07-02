@@ -12,6 +12,7 @@
   "services": {
     "requires": [
       "ArisenKernel.Contracts.IWindowProvider",
+      "ArisenKernel.Contracts.IRHIBackend",
       {
         "interface": "ArisenKernel.Contracts.IRHIDevice",
         "deferred": true
@@ -19,6 +20,11 @@
     ]
   },
   "subsystems": [
+    {
+      "class": "ArisenEngine.Rendering.RuntimeRHIWarmupSubsystem",
+      "phase": "PostInit",
+      "priority": 0
+    },
     {
       "class": "ArisenEngine.Rendering.RenderSubsystem",
       "phase": "Running",

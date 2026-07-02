@@ -10,6 +10,8 @@ using ArisenEngine.Core.ECS;
 using ArisenEngine.Core.Math;
 using ArisenEngine.Core.Lifecycle;
 using ArisenEngine.ECS.Lifecycle;
+using ArisenKernel.Contracts;
+using ArisenKernel.Diagnostics;
 
 namespace ArisenEngine.Rendering;
 
@@ -47,6 +49,8 @@ public class RenderSubsystem : ITickableSubsystem
 
     private RenderPipeline? m_CurrentPipeline;
     private RenderPipelineAsset? m_CurrentAsset;
+    private IWindowProvider? m_WindowProvider;
+    private IntPtr m_RuntimeWindowHost;
 
     // Pre-allocated camera buffer to avoid per-frame allocations.
     // Only reallocated when the number of cameras grows beyond capacity.
@@ -61,6 +65,43 @@ public class RenderSubsystem : ITickableSubsystem
     {
         using var _ = Profiler.Zone("RenderSubsystem.Initialize");
         Logger.Log("[RenderSubsystem] Initializing...");
+
+#if !ARISEN_ENGINE_EDITOR
+        var services = EngineKernel.Instance.Services;
+        if (services.TryGetService<IWindowProvider>(out m_WindowProvider) && m_WindowProvider != null)
+        {
+            var windowInfo = m_WindowProvider.GetWindowInfo();
+            if (windowInfo.SurfaceKind == WindowSurfaceKind.Win32 &&
+                windowInfo.NativeHandle != IntPtr.Zero)
+            {
+                m_RuntimeWindowHost = windowInfo.NativeHandle;
+                InternalRegisterExistingSurface(
+                    m_RuntimeWindowHost,
+                    "RuntimeMainWindow",
+                    SurfaceType.Window,
+                    new RuntimeWindowRenderSurface(windowInfo));
+
+                m_WindowProvider.WindowResized += OnRuntimeWindowResized;
+                KernelLog.InfoFormat(
+                    "[RenderSubsystem] Registered runtime main window surface. Handle=0x{0:X}, Surface=0x{1:X}, Size={2}x{3}",
+                    windowInfo.NativeHandle.ToInt64(),
+                    windowInfo.NativeSurfaceId,
+                    windowInfo.Width,
+                    windowInfo.Height);
+            }
+            else
+            {
+                KernelLog.WarningFormat(
+                    "[RenderSubsystem] Runtime main window surface not registered. SurfaceKind={0}, Handle=0x{1:X}",
+                    windowInfo.SurfaceKind,
+                    windowInfo.NativeHandle.ToInt64());
+            }
+        }
+        else
+        {
+            KernelLog.Warning("[RenderSubsystem] Runtime rendering has no IWindowProvider; no native swapchain surface was registered.");
+        }
+#endif
     }
 
     public void Tick(float deltaTime)
@@ -280,6 +321,25 @@ public class RenderSubsystem : ITickableSubsystem
         throw new Exception($"Same host : {host} already added");
     }
 
+    internal void InternalRegisterExistingSurface(IntPtr host, string name, SurfaceType surfaceType, IRenderSurface surface)
+    {
+        using var _ = Profiler.Zone("RenderSubsystem.InternalRegisterExistingSurface");
+        if (!s_GlobalSurfaces.ContainsKey(host))
+        {
+            s_GlobalSurfaces.TryAdd(host, new SurfaceInfo()
+            {
+                Name = name,
+                Parent = host,
+                Surface = surface,
+                SurfaceType = surfaceType
+            });
+
+            return;
+        }
+
+        throw new Exception($"Same host : {host} already added");
+    }
+
     public void ResizeSurface(IntPtr host, int width, int height)
     {
         m_CommandQueue.Enqueue(new ResizeSurfaceCommand(host, (uint)width, (uint)height));
@@ -405,6 +465,16 @@ public class RenderSubsystem : ITickableSubsystem
 
     public void Shutdown()
     {
+#if !ARISEN_ENGINE_EDITOR
+        if (m_WindowProvider != null)
+        {
+            m_WindowProvider.WindowResized -= OnRuntimeWindowResized;
+            m_WindowProvider = null;
+        }
+
+        m_RuntimeWindowHost = IntPtr.Zero;
+#endif
+
         foreach (var surface in s_GlobalSurfaces.Values)
         {
             surface.Surface.DisposeSurface();
@@ -420,6 +490,17 @@ public class RenderSubsystem : ITickableSubsystem
     {
         Shutdown();
     }
+
+#if !ARISEN_ENGINE_EDITOR
+    private void OnRuntimeWindowResized(WindowResizeInfo resizeInfo)
+    {
+        if (m_RuntimeWindowHost == IntPtr.Zero) return;
+        ResizeSurface(
+            m_RuntimeWindowHost,
+            Math.Max(1, resizeInfo.Width),
+            Math.Max(1, resizeInfo.Height));
+    }
+#endif
 
     private struct SurfaceInfo
     {
