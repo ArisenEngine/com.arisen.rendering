@@ -14,13 +14,13 @@ public sealed class FinalOutputPass : RenderPassNode
     {
     }
 
-    protected override void Record(RenderContext context, RHICommandBuffer commandBuffer)
+    protected override void Record(RenderContext context, RenderCommandList commandList)
     {
         // The Avalonia Vulkan interop path consumes imported Vulkan images from
         // TRANSFER_SRC_OPTIMAL and requires ownership release to the external compositor.
         if (context.OutputKind == RenderOutputKind.EditorSharedTexture)
         {
-            commandBuffer.TransitionImageLayout(
+            commandList.TransitionImageLayout(
                 context.TargetImage,
                 EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 EImageLayout.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -32,7 +32,7 @@ public sealed class FinalOutputPass : RenderPassNode
         // Native and offscreen outputs currently share the same final readable/transfer layout.
         // A future SwapchainOutputBackend can specialize this to PRESENT_SRC when native
         // presentation is fully graph-owned.
-        commandBuffer.TransitionImageLayout(
+        commandList.TransitionImageLayout(
             context.TargetImage,
             EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             EImageLayout.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);

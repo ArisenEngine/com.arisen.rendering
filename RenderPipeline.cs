@@ -1,4 +1,5 @@
 using System;
+using ArisenEngine.Core.Diagnostics;
 using ArisenEngine.Threading;
 using ArisenKernel.Lifecycle;
 
@@ -14,7 +15,7 @@ public abstract class RenderPipeline : IDisposable
     /// Implements the graph-based rendering flow.
     /// This replaces the monolithic Render method.
     /// </summary>
-    protected virtual ulong Render(RenderContext context, ReadOnlySpan<Camera> cameras)
+    protected virtual ulong Render(RenderContext context)
     {
         if (m_RenderGraph == null)
         {
@@ -23,14 +24,20 @@ public abstract class RenderPipeline : IDisposable
             m_RenderGraph = new RenderGraph(taskGraph);
         }
 
-                // 1. Setup Phase: Derived pipelines register their content passes.
-        SetupGraph(m_RenderGraph, context, cameras);
+        // 1. Setup Phase: Derived pipelines register their content passes.
+        using (Profiler.Zone("RenderPipeline.SetupGraph"))
+        {
+            SetupGraph(m_RenderGraph, context);
+        }
 
         // 2. Engine-owned frame target boundaries wrap the user graph so output
         // acquire/layout/finalization policy is consistent across all pipelines.
-        m_RenderGraph.AddFrameOutputBoundary(
-            new PrepareFrameTargetPass("PrepareFrameTarget"),
-            new FinalOutputPass("FinalOutputPass"));
+        using (Profiler.Zone("RenderPipeline.FrameOutputBoundary"))
+        {
+            m_RenderGraph.AddFrameOutputBoundary(
+                new PrepareFrameTargetPass("PrepareFrameTarget"),
+                new FinalOutputPass("FinalOutputPass"));
+        }
 
         // 3. Execution Phase: Record parallel commands and submit to GPU.
         return m_RenderGraph.Execute(context);
@@ -39,7 +46,7 @@ public abstract class RenderPipeline : IDisposable
     /// <summary>
     /// Hook for derived pipelines to define their frame structure by adding passes to the graph.
     /// </summary>
-    protected abstract void SetupGraph(RenderGraph graph, RenderContext context, ReadOnlySpan<Camera> cameras);
+    protected abstract void SetupGraph(RenderGraph graph, RenderContext context);
 
     protected abstract void OnDisposed();
 
@@ -50,8 +57,8 @@ public abstract class RenderPipeline : IDisposable
         disposed = true;
     }
 
-    internal ulong InternalRender(RenderContext context, ReadOnlySpan<Camera> cameras)
+    internal ulong InternalRender(RenderContext context)
     {
-        return Render(context, cameras);
+        return Render(context);
     }
 }

@@ -52,11 +52,6 @@ public class RenderSubsystem : ITickableSubsystem
     private IWindowProvider? m_WindowProvider;
     private IntPtr m_RuntimeWindowHost;
 
-    // Pre-allocated camera buffer to avoid per-frame allocations.
-    // Only reallocated when the number of cameras grows beyond capacity.
-    private Camera[] m_CameraBuffer = new Camera[4];
-    private int m_CameraCount;
-
     // Rendering should typically happen last in the frame
     public int Priority => 100;
     public EnginePhase InitPhase => EnginePhase.Init;
@@ -108,34 +103,36 @@ public class RenderSubsystem : ITickableSubsystem
     {
         using var _ = Profiler.Zone("RenderSubsystem.Tick");
 
-        // Execute all pending RHI commands (resize, registration) on the Render thread
-        // BEFORE starting the frame's rendering work.
-        m_CommandQueue.ExecutePending(this);
+        try
+        {
+            // Execute all pending RHI commands (resize, registration) on the Render thread
+            // BEFORE starting the frame's rendering work.
+            m_CommandQueue.ExecutePending(this);
 
-        var asset = Graphics.currentRenderPipelineAsset;
+            var asset = Graphics.currentRenderPipelineAsset;
         
-        Logger.Log($"[RenderSubsystem] Tick [Hash:{GetHashCode()}] - Frame {EngineKernel.Instance.CurrentFrameIndex}, Pipeline Asset: {(asset == null ? "NULL" : asset.GetType().Name)}");
-        if (asset == null)
-        {
-            return;
-        }
+            Logger.Log($"[RenderSubsystem] Tick [Hash:{GetHashCode()}] - Frame {EngineKernel.Instance.CurrentFrameIndex}, Pipeline Asset: {(asset == null ? "NULL" : asset.GetType().Name)}");
+            if (asset == null)
+            {
+                return;
+            }
 
-        // 1. Manage pipeline lifecycle
-        // REFACTOR: We check for reference equality AND a dirty state to handle property changes in the same asset instance.
-        if (!ReferenceEquals(m_CurrentAsset, asset) || asset.IsDirty)
-        {
-            m_CurrentPipeline?.Dispose();
-            m_CurrentAsset = asset;
-            m_CurrentPipeline = asset.InternalCreatePipeline();
-            asset.IsDirty = false;
-            Logger.Log($"[RenderSubsystem] Pipeline recreated from asset: {asset.GetType().Name}");
-        }
+            // 1. Manage pipeline lifecycle
+            // REFACTOR: We check for reference equality AND a dirty state to handle property changes in the same asset instance.
+            if (!ReferenceEquals(m_CurrentAsset, asset) || asset.IsDirty)
+            {
+                m_CurrentPipeline?.Dispose();
+                m_CurrentAsset = asset;
+                m_CurrentPipeline = asset.InternalCreatePipeline();
+                asset.IsDirty = false;
+                Logger.Log($"[RenderSubsystem] Pipeline recreated from asset: {asset.GetType().Name}");
+            }
 
-        if (m_CurrentPipeline == null) return;
+            if (m_CurrentPipeline == null) return;
 
-        // 2. Prepare Context and Render per Surface
-        foreach (var surfaceInfo in s_GlobalSurfaces.Values)
-        {
+            // 2. Prepare Context and Render per Surface
+            foreach (var surfaceInfo in s_GlobalSurfaces.Values)
+            {
             var surface = surfaceInfo.Surface;
             var device = RHISystem.GetOrCreateDevice(surface.SurfaceId, surface.Width, surface.Height);
             
@@ -162,46 +159,21 @@ public class RenderSubsystem : ITickableSubsystem
                 ? RenderOutputKind.EditorSharedTexture
                 : RenderOutputKind.NativeSwapchain;
 
-            var context = new RenderContext(
-                FrameArena.Instance,
-                device,
-                swapChain,
-                acquiredImage,
-                surface.SurfaceId,
-                outputKind,
-                frameIndex,
-                deltaTime,
-                surface.Width,
-                surface.Height
-            );
+            var arena = FrameArena.Instance;
+            Span<MeshDrawCommand> frameDrawList = Span<MeshDrawCommand>.Empty;
 
             if (sceneSubsystem != null)
             {
                 var drawList = sceneSubsystem.GetCurrentDrawList();
                 if (drawList.Length > 0)
                 {
-                    var arenaSpan = FrameArena.Instance.Alloc<MeshDrawCommand>(drawList.Length);
-                    drawList.CopyTo(arenaSpan);
-                    unsafe
-                    {
-                        fixed (MeshDrawCommand* pDrawList = arenaSpan)
-                        {
-                            context.DrawListPtr = pDrawList;
-                            context.DrawListCount = drawList.Length;
-                        }
-                    }
-                }
-                else
-                {
-                    unsafe
-                    {
-                        context.DrawListPtr = null;
-                        context.DrawListCount = 0;
-                    }
+                    frameDrawList = arena.Alloc<MeshDrawCommand>(drawList.Length);
+                    drawList.CopyTo(frameDrawList);
                 }
             }
 
-            m_CameraCount = 0;
+            Span<Camera> frameCameras = Span<Camera>.Empty;
+            var cameraCount = 0;
 
             if (entityManager != null)
             {
@@ -212,87 +184,123 @@ public class RenderSubsystem : ITickableSubsystem
                 var cameraEntities = cameraPool.GetRawEntityArray();
                 int camCount = cameraPool.Count;
 
-                // Ensure buffer capacity (only reallocates when cameras grow)
-                if (camCount > m_CameraBuffer.Length)
+                if (camCount > 0)
                 {
-                    m_CameraBuffer = new Camera[camCount * 2];
-                }
+                    frameCameras = arena.Alloc<Camera>(camCount);
+                    var aspectRatio = surface.Height == 0 ? 1.0f : (float)surface.Width / surface.Height;
 
-                for (int i = 0; i < camCount; i++)
-                {
-                    Entity entity = cameraEntities[i];
-                    if (transformPool.Has(entity))
+                    for (int i = 0; i < camCount; i++)
                     {
-                        ref var camComp = ref cameraComponents[i];
-                        ref var transComp = ref transformPool.GetRef(entity);
+                        Entity entity = cameraEntities[i];
+                        if (transformPool.Has(entity))
+                        {
+                            ref var camComp = ref cameraComponents[i];
+                            ref var transComp = ref transformPool.GetRef(entity);
 
-                        // Directly modify the struct in the array
-                        ref Camera cam = ref m_CameraBuffer[m_CameraCount];
-                        cam.FieldOfView = camComp.VerticalFov;
-                        cam.NearClip = camComp.NearPlane;
-                        cam.FarClip = camComp.FarPlane;
-                        cam.ProjectionType = camComp.IsPerspective != 0 ? CameraProjectionType.Perspective : CameraProjectionType.Orthographic;
-                        cam.Position = transComp.Position;
-                        cam.Rotation = transComp.Rotation.QuaternionToEulerDegrees();
-                        m_CameraCount++;
+                            ref Camera cam = ref frameCameras[cameraCount];
+                            cam.FieldOfView = camComp.VerticalFov;
+                            cam.NearClip = camComp.NearPlane;
+                            cam.FarClip = camComp.FarPlane;
+                            cam.AspectRatio = aspectRatio;
+                            cam.ProjectionType = camComp.IsPerspective != 0 ? CameraProjectionType.Perspective : CameraProjectionType.Orthographic;
+                            cam.Position = transComp.Position;
+                            cam.Rotation = transComp.Rotation.QuaternionToEulerDegrees();
+                            cameraCount++;
+                        }
+                    }
+
+                    frameCameras = frameCameras.Slice(0, cameraCount);
+                }
+            }
+
+            ulong ticket = 0;
+
+            unsafe
+            {
+                fixed (Camera* pCameras = frameCameras)
+                fixed (MeshDrawCommand* pDrawList = frameDrawList)
+                {
+                    var snapshot = new RenderFrameSnapshot(
+                        device,
+                        swapChain,
+                        acquiredImage,
+                        surface.SurfaceId,
+                        outputKind,
+                        frameIndex,
+                        deltaTime,
+                        surface.Width,
+                        surface.Height,
+                        pCameras,
+                        cameraCount,
+                        pDrawList,
+                        frameDrawList.Length);
+
+                    var context = new RenderContext(arena, snapshot);
+                    Profiler.PlotValue("Render.DrawCount", snapshot.DrawListCount);
+                    Profiler.PlotValue("Render.CameraCount", snapshot.CameraCount);
+                    Profiler.PlotValue("Render.OutputWidth", snapshot.Width);
+                    Profiler.PlotValue("Render.OutputHeight", snapshot.Height);
+
+                    if (frameIndex % 60 == 0)
+                    {
+                        Logger.Log($"[RenderSubsystem] FrameSnapshot | Frame: {snapshot.FrameIndex} | Surface: 0x{snapshot.SurfaceId:X} | Size: {snapshot.Width}x{snapshot.Height} | Cameras: {snapshot.CameraCount} | Draws: {snapshot.DrawListCount} | Output: {snapshot.OutputKind}");
+                    }
+
+                    // B11: RenderDoc Integration
+                    // If a capture was requested (e.g. from the Editor UI), we wrap the engine work
+                    // with Start/End capture calls. RenderDocService uses NULL/NULL wildcards
+                    // to match the single Vulkan device (virtual surfaces have no HWND).
+                    var rd = ArisenKernel.Lifecycle.EngineKernel.Instance.Services.GetService<RenderDocService>();
+                    bool requestCapture = rd?.IsCaptureRequested ?? false;
+
+                    if (requestCapture)
+                    {
+                        rd?.StartCapture();
+                    }
+
+                    try
+                    {
+                        ticket = m_CurrentPipeline.InternalRender(context);
+                    }
+                    finally
+                    {
+                        if (requestCapture)
+                        {
+                            rd?.EndCapture();
+                            rd?.ClearCaptureRequest();
+                            Logger.Log("[RenderSubsystem] RenderDoc capture completed.");
+                        }
+                    }
+
+                    // Phase 2 Optimization: Precision synchronization.
+                    // Instead of stalling the CPU here (which slows down the simulation),
+                    // we pass the ticket to the surface so the consumer (Editor Viewport)
+                    // can perform a targeted asynchronous wait.
+                    if (surface is RenderSurface concreteSurface)
+                    {
+                        var pid = System.Diagnostics.Process.GetCurrentProcess().Id;
+                        var sharedHandle = surface.GetSharedHandle(context.FrameIndex);
+                        if (frameIndex % 60 == 0 || ticket > 0)
+                            Logger.Info($"[ArisenViewportControl] PID: {pid}, Frame {frameIndex} Status: Ticket {ticket}, Handle 0x{sharedHandle.ToInt64():X}, SubsystemHash: {GetHashCode()}, IsGlobalInstance: {this == Instance}");
+
+                        // B11: Ticket update must be atomic for the UI thread's polling loop
+                        lock (concreteSurface)
+                        {
+                            concreteSurface.SetLastRenderTicket(ticket, context.FrameIndex, context.Width, context.Height, swapChain);
+                            if (frameIndex % 60 == 0)
+                                Logger.Log($"[RenderSubsystem] SetLastRenderTicket for Host {surfaceInfo.Parent}: {ticket}");
+                        }
                     }
                 }
             }
 
-            // Pass a lightweight ReadOnlySpan to avoid intermediate array allocations
-            ReadOnlySpan<Camera> cameras = m_CameraCount == 0 
-                ? ReadOnlySpan<Camera>.Empty 
-                : new ReadOnlySpan<Camera>(m_CameraBuffer, 0, m_CameraCount);
-
-            // B11: RenderDoc Integration
-            // If a capture was requested (e.g. from the Editor UI), we wrap the engine work 
-            // with Start/End capture calls. RenderDocService uses NULL/NULL wildcards
-            // to match the single Vulkan device (virtual surfaces have no HWND).
-            var rd = ArisenKernel.Lifecycle.EngineKernel.Instance.Services.GetService<RenderDocService>();
-            bool requestCapture = rd?.IsCaptureRequested ?? false;
-
-            if (requestCapture)
-            {
-                rd?.StartCapture();
+                // Finalize work and signal presentation
+                swapChain.EndFrame(frameIndex);
             }
-
-            ulong ticket = 0;
-            try
-            {
-                ticket = m_CurrentPipeline.InternalRender(context, cameras);
-            }
-            finally
-            {
-                if (requestCapture)
-                {
-                    rd?.EndCapture();
-                    rd?.ClearCaptureRequest();
-                    Logger.Log("[RenderSubsystem] RenderDoc capture completed.");
-                }
-            }
-            
-            // Phase 2 Optimization: Precision synchronization.
-            // Instead of stalling the CPU here (which slows down the simulation), 
-            // we pass the ticket to the surface so the consumer (Editor Viewport) 
-            // can perform a targeted asynchronous wait.
-            if (surface is RenderSurface concreteSurface)
-            {
-                var pid = System.Diagnostics.Process.GetCurrentProcess().Id;
-                var sharedHandle = surface.GetSharedHandle((uint)context.FrameIndex);
-                if (frameIndex % 60 == 0 || ticket > 0)
-                    Logger.Info($"[ArisenViewportControl] PID: {pid}, Frame {frameIndex} Status: Ticket {ticket}, Handle 0x{sharedHandle.ToInt64():X}, SubsystemHash: {GetHashCode()}, IsGlobalInstance: {this == Instance}");
-                
-                // B11: Ticket update must be atomic for the UI thread's polling loop
-                lock (concreteSurface)
-                {
-                    concreteSurface.SetLastRenderTicket(ticket, (uint)context.FrameIndex, context.Width, context.Height, swapChain);
-                    if (frameIndex % 60 == 0)
-                        Logger.Log($"[RenderSubsystem] SetLastRenderTicket for Host {surfaceInfo.Parent}: {ticket}");
-                }
-            }
-
-            // Finalize work and signal presentation
-            swapChain.EndFrame(frameIndex);
+        }
+        finally
+        {
+            Profiler.FrameMarkNamed("RuntimeFrame");
         }
     }
 

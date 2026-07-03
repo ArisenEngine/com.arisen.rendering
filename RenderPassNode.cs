@@ -10,12 +10,7 @@ namespace ArisenEngine.Rendering;
 /// </summary>
 public abstract class RenderPassNode : TaskNode
 {
-    private RenderContext m_Context;
-    private RHICommandBuffer? m_CommandBuffer;
-
-    public RHICommandBuffer? CommandBuffer => m_CommandBuffer;
-
-    // Phase 5: Dependency tracking ports. 
+    // Phase 5: Dependency tracking ports.
     // RenderGraph.AddDependency connects port 0 of passes to force execution order.
     protected RenderPassNode(string name = "RenderPass")
     {
@@ -25,29 +20,56 @@ public abstract class RenderPassNode : TaskNode
     }
 
     /// <summary>
-    /// Initialized by the RenderGraph before execution.
+    /// Returns the number of independent CPU recording tasks this pass wants for the frame.
+    /// Small passes should keep the default single work item.
     /// </summary>
-    public void Setup(RenderContext context, RHICommandBuffer commandBuffer)
+    internal int GetRenderGraphWorkItemCount(RenderContext context)
     {
-        m_Context = context;
-        m_CommandBuffer = commandBuffer;
+        return GetWorkItemCount(context);
+    }
+
+    internal RenderPassWorkItem GetRenderGraphWorkItem(RenderContext context, int workItemIndex)
+    {
+        return GetWorkItem(context, workItemIndex);
+    }
+
+    protected virtual int GetWorkItemCount(RenderContext context)
+    {
+        return 1;
+    }
+
+    protected virtual RenderPassWorkItem GetWorkItem(RenderContext context, int workItemIndex)
+    {
+        return RenderPassWorkItem.Pass(workItemIndex);
+    }
+
+    internal void RecordWorkItem(RenderContext context, RHICommandBuffer commandBuffer, RenderPassWorkItem workItem)
+    {
+        if (!commandBuffer.IsValid)
+        {
+            throw new InvalidOperationException($"Render pass '{Name}' received an invalid command buffer.");
+        }
+
+        var commandList = new RenderCommandList(commandBuffer);
+        Record(context, commandList, workItem);
     }
 
     /// <summary>
-    /// Implements the execution by calling the specific RenderPass recording logic.
+    /// RenderPassNode is compiled by RenderGraph and recorded through RecordWorkItem.
     /// </summary>
     public override void Execute()
     {
-        if (m_CommandBuffer == null)
-            throw new InvalidOperationException("RenderPassNode executed without a valid CommandBuffer.");
-
-        // Record the pass logic
-        Record(m_Context, m_CommandBuffer.Value);
+        throw new InvalidOperationException("RenderPassNode must be executed by RenderGraph.");
     }
 
     /// <summary>
     /// Specific recording logic for this pass.
     /// Override this to addDrawCalls, bindResources, etc.
     /// </summary>
-    protected abstract void Record(RenderContext context, RHICommandBuffer commandBuffer);
+    protected abstract void Record(RenderContext context, RenderCommandList commandList);
+
+    protected virtual void Record(RenderContext context, RenderCommandList commandList, RenderPassWorkItem workItem)
+    {
+        Record(context, commandList);
+    }
 }

@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using Arisen.DAG;
 using ArisenEngine.Threading;
+using ArisenEngine.Core.Diagnostics;
 using ArisenEngine.Core.RHI;
 using Arisen.Native.RHI;
 using ArisenKernel.Services;
@@ -203,7 +204,14 @@ public sealed class RenderGraph : IDisposable
     {
         var factory = context.Device.GetFactory();
         m_Factory = factory; // B1: Store factory for safe resource cleanup on Dispose
-        var compiled = GraphCompiler.Compile(m_Graph);
+        CompiledGraph<RenderPassNode> compiled;
+        using (Profiler.Zone("RenderGraph.Compile"))
+        {
+            compiled = GraphCompiler.Compile(m_Graph);
+        }
+
+        Profiler.PlotValue("RenderGraph.PassCount", compiled.SortedNodes.Count);
+        Profiler.PlotValue("RenderGraph.LayerCount", compiled.ParallelLayers.Count);
         uint surfaceId = context.SurfaceId;
 
         try
@@ -219,62 +227,123 @@ public sealed class RenderGraph : IDisposable
 
     private ulong ExecuteCompiled(RenderContext context, RHIFactory factory, CompiledGraph<RenderPassNode> compiled, uint surfaceId)
     {
+        var commandBuffers = new Dictionary<RenderPassNode, RHICommandBuffer[]>();
+        var recordingErrors = new ConcurrentQueue<Exception>();
+        var scheduledWorkItems = 0;
+
         // 1. Dispatch passes to TaskGraph for parallel command recording
         foreach (var layer in compiled.ParallelLayers)
         {
             if (layer.Count == 0) continue;
 
+            using var recordLayerZone = Profiler.Zone("RenderGraph.RecordLayer");
+            Profiler.PlotValue("RenderGraph.RecordLayerPassCount", layer.Count);
+
             foreach (var node in layer)
             {
-                // Wrap execution to handle per-thread pool acquisition
-                var recordTask = new ActionTask(() =>
+                var workItemCount = node.GetRenderGraphWorkItemCount(context);
+                if (workItemCount <= 0)
                 {
-                    int threadId = Thread.CurrentThread.ManagedThreadId;
-                    var key = (threadId, surfaceId);
-                    
-                    // Retrieve or Create a pool for this worker thread/surface
-                    if (!m_CommandPools.TryGetValue(key, out var pool))
+                    commandBuffers[node] = Array.Empty<RHICommandBuffer>();
+                    continue;
+                }
+
+                var nodeCommandBuffers = new RHICommandBuffer[workItemCount];
+                commandBuffers[node] = nodeCommandBuffers;
+                scheduledWorkItems += workItemCount;
+
+                for (int workItemIndex = 0; workItemIndex < workItemCount; workItemIndex++)
+                {
+                    var capturedWorkItemIndex = workItemIndex;
+                    var workItem = node.GetRenderGraphWorkItem(context, capturedWorkItemIndex);
+
+                    // Wrap execution to handle per-thread pool acquisition
+                    var recordTask = new ActionTask(() =>
                     {
-                        pool = factory.CreateCommandBufferPool(RHIQueueType.Graphics);
-                        m_CommandPools.TryAdd(key, pool);
-                    }
+                        try
+                        {
+                            using var workItemZone = Profiler.Zone("RenderGraph.RecordWorkItem");
 
-                    // Request a unique command buffer for this frame
-                    var cmdBuffer = pool.GetCommandBuffer(context.FrameIndex);
+                            int threadId = Thread.CurrentThread.ManagedThreadId;
+                            var key = (threadId, surfaceId);
 
-                    // Ensure the command buffer is in the recording state
-                    cmdBuffer.Begin();
-                    
-                    node.Setup(context, cmdBuffer);
-                    node.Execute();
+                            // Retrieve or Create a pool for this worker thread/surface
+                            if (!m_CommandPools.TryGetValue(key, out var pool))
+                            {
+                                pool = factory.CreateCommandBufferPool(RHIQueueType.Graphics);
+                                if (!m_CommandPools.TryAdd(key, pool))
+                                {
+                                    factory.ReleaseCommandBufferPool(pool.RHIHandle);
+                                    pool = m_CommandPools[key];
+                                }
+                            }
 
-                    // Finalize the command buffer to the Executable state
-                    cmdBuffer.End();
-                }, node.Name);
+                            // Request a unique command buffer for this frame
+                            var cmdBuffer = pool.GetCommandBuffer(context.FrameIndex);
+                            nodeCommandBuffers[capturedWorkItemIndex] = cmdBuffer;
 
-                m_TaskSystem.AddTask(recordTask);
+                            // Ensure the command buffer is in the recording state
+                            cmdBuffer.Begin();
+                            try
+                            {
+                                node.RecordWorkItem(context, cmdBuffer, workItem);
+                            }
+                            finally
+                            {
+                                // Finalize the command buffer to the Executable state
+                                cmdBuffer.End();
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            recordingErrors.Enqueue(new InvalidOperationException(
+                                $"Render pass '{node.Name}' failed while recording work item {capturedWorkItemIndex}.",
+                                ex));
+                        }
+                    }, $"{node.Name}[{capturedWorkItemIndex}]");
+
+                    m_TaskSystem.AddTask(recordTask);
+                }
             }
 
             // Parallel execution across worker threads
             m_TaskSystem.Execute();
+
+            if (!recordingErrors.IsEmpty)
+            {
+                throw new AggregateException("RenderGraph command recording failed.", recordingErrors);
+            }
         }
+
+        Profiler.PlotValue("RenderGraph.WorkItemCount", scheduledWorkItems);
 
         ulong lastTicket = 0;
         // 2. Submit all recorded command buffers in topological order to the GPU
-        var sorted = compiled.SortedNodes;
-            foreach (var node in sorted)
+        using (Profiler.Zone("RenderGraph.Submit"))
         {
-            if (node.CommandBuffer == null)
+            var sorted = compiled.SortedNodes;
+            foreach (var node in sorted)
             {
-                throw new InvalidOperationException($"Render pass '{node.Name}' completed without a recorded command buffer.");
+                if (!commandBuffers.TryGetValue(node, out var buffers))
+                {
+                    throw new InvalidOperationException($"Render pass '{node.Name}' was not scheduled for command recording.");
+                }
+
+                for (int i = 0; i < buffers.Length; i++)
+                {
+                    if (!buffers[i].IsValid)
+                    {
+                        throw new InvalidOperationException($"Render pass '{node.Name}' work item {i} completed without a recorded command buffer.");
+                    }
+
+                    lastTicket = context.Device.Submit(buffers[i]);
+                }
             }
 
-            lastTicket = context.Device.Submit(node.CommandBuffer.Value);
-        }
-
-        if (context.FrameIndex % 60 == 0)
-        {
-            ArisenEngine.Core.Diagnostics.Logger.Log($"[RenderGraph] Execute - Submitted {sorted.Count} nodes. Last Ticket: {lastTicket}");
+            if (context.FrameIndex % 60 == 0)
+            {
+                Logger.Log($"[RenderGraph] Execute - Submitted {sorted.Count} nodes / {scheduledWorkItems} work items. Last Ticket: {lastTicket}");
+            }
         }
 
         return lastTicket;
