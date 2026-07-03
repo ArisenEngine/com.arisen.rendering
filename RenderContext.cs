@@ -10,34 +10,25 @@ namespace ArisenEngine.Rendering;
 public struct RenderContext
 {
     public FrameArena Arena { get; }
-    public RHIDevice Device { get; }
-    public RHISwapChain SwapChain { get; }
-    public uint FrameIndex { get; }
-    public float DeltaTime { get; }
-    public uint Width { get; }
-    public uint Height { get; }
-    public uint SurfaceId { get; }
-    public RenderOutputKind OutputKind { get; }
-    public RHIImageHandle TargetImage { get; }
-    
-    // The list of meshes to be drawn this frame. 
-    // We use a raw pointer to allow this struct to be captured by TaskGraph lambdas.
-    public unsafe MeshDrawCommand* DrawListPtr;
-    public int DrawListCount;
+    public RenderFrameSnapshot Snapshot { get; }
 
-    public unsafe readonly ReadOnlySpan<MeshDrawCommand> DrawList => new(DrawListPtr, DrawListCount);
+    public RHIDevice Device => Snapshot.Device;
+    public RHISwapChain SwapChain => Snapshot.SwapChain;
+    public uint FrameIndex => Snapshot.FrameIndex;
+    public float DeltaTime => Snapshot.DeltaTime;
+    public uint Width => Snapshot.Width;
+    public uint Height => Snapshot.Height;
+    public uint SurfaceId => Snapshot.SurfaceId;
+    public RenderOutputKind OutputKind => Snapshot.OutputKind;
+    public RHIImageHandle TargetImage => Snapshot.TargetImage;
+    public int CameraCount => Snapshot.CameraCount;
+    public int DrawListCount => Snapshot.DrawListCount;
+    public readonly ReadOnlySpan<Camera> Cameras => Snapshot.Cameras;
+    public readonly ReadOnlySpan<MeshDrawCommand> DrawList => Snapshot.DrawList;
 
-    public RenderContext(FrameArena arena, RHIDevice device, RHISwapChain swapChain, RHIImageHandle targetImage, uint surfaceId, RenderOutputKind outputKind, uint frameIndex, float deltaTime, uint width, uint height)
+    public RenderContext(FrameArena arena, RenderFrameSnapshot snapshot)
     {
         Arena = arena;
-        Device = device;
-        SwapChain = swapChain;
-        TargetImage = targetImage;
-        SurfaceId = surfaceId;
-        OutputKind = outputKind;
-        FrameIndex = frameIndex;
-        DeltaTime = deltaTime;
-        Width = width;
-        Height = height;
+        Snapshot = snapshot;
     }
 }
