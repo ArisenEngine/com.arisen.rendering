@@ -46,6 +46,7 @@ public class RenderSubsystem : ITickableSubsystem
     }
     
     private readonly RHICommandQueue m_CommandQueue = new();
+    private readonly Dictionary<uint, RenderFrameSubmission> m_Submissions = new();
 
     private RenderPipeline? m_CurrentPipeline;
     private RenderPipelineAsset? m_CurrentAsset;
@@ -149,15 +150,22 @@ public class RenderSubsystem : ITickableSubsystem
             
             // Acquire the current swapchain image.
             // If this fails (e.g. window minimized or 0x0 size), we skip rendering for this surface.
-            var acquiredImage = swapChain.BeginFrame(frameIndex);
-            if (!acquiredImage.IsValid)
-            {
-                continue;
-            }
-
             var outputKind = ((surface.SurfaceId & RHISystem.VirtualSurfaceIDMask) != 0)
                 ? RenderOutputKind.EditorSharedTexture
                 : RenderOutputKind.NativeSwapchain;
+
+            var submission = GetOrCreateSubmission(surface.SurfaceId);
+            if (!submission.Begin(
+                    device,
+                    swapChain,
+                    surface.SurfaceId,
+                    outputKind,
+                    frameIndex,
+                    surface.Width,
+                    surface.Height))
+            {
+                continue;
+            }
 
             var arena = FrameArena.Instance;
             Span<MeshDrawCommand> frameDrawList = Span<MeshDrawCommand>.Empty;
@@ -223,7 +231,7 @@ public class RenderSubsystem : ITickableSubsystem
                     var snapshot = new RenderFrameSnapshot(
                         device,
                         swapChain,
-                        acquiredImage,
+                        submission.TargetImage,
                         surface.SurfaceId,
                         outputKind,
                         frameIndex,
@@ -235,7 +243,7 @@ public class RenderSubsystem : ITickableSubsystem
                         pDrawList,
                         frameDrawList.Length);
 
-                    var context = new RenderContext(arena, snapshot);
+                    var context = new RenderContext(arena, snapshot, submission);
                     Profiler.PlotValue("Render.DrawCount", snapshot.DrawListCount);
                     Profiler.PlotValue("Render.CameraCount", snapshot.CameraCount);
                     Profiler.PlotValue("Render.OutputWidth", snapshot.Width);
@@ -294,8 +302,8 @@ public class RenderSubsystem : ITickableSubsystem
                 }
             }
 
-                // Finalize work and signal presentation
-                swapChain.EndFrame(frameIndex);
+                // Finalize output work and signal presentation.
+                submission.End();
             }
         }
         finally
@@ -458,6 +466,7 @@ public class RenderSubsystem : ITickableSubsystem
     {
         if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
         {
+            m_Submissions.Remove(surfaceInfo.Surface.SurfaceId);
             surfaceInfo.Surface.DisposeSurface();
             s_GlobalSurfaces.TryRemove(host, out _);
 
@@ -488,6 +497,7 @@ public class RenderSubsystem : ITickableSubsystem
             surface.Surface.DisposeSurface();
         }
         s_GlobalSurfaces.Clear();
+        m_Submissions.Clear();
 
         m_CurrentPipeline?.Dispose();
         m_CurrentPipeline = null;
@@ -517,5 +527,16 @@ public class RenderSubsystem : ITickableSubsystem
         public IRenderSurface Surface;
         public SurfaceType SurfaceType;
         public uint SurfaceId => Surface.SurfaceId;
+    }
+
+    private RenderFrameSubmission GetOrCreateSubmission(uint surfaceId)
+    {
+        if (!m_Submissions.TryGetValue(surfaceId, out var submission))
+        {
+            submission = new RenderFrameSubmission();
+            m_Submissions.Add(surfaceId, submission);
+        }
+
+        return submission;
     }
 }

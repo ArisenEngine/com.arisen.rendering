@@ -11,6 +11,7 @@ public struct RenderContext
 {
     public FrameArena Arena { get; }
     public RenderFrameSnapshot Snapshot { get; }
+    internal RenderFrameSubmission Submission { get; }
 
     public RHIDevice Device => Snapshot.Device;
     public RHISwapChain SwapChain => Snapshot.SwapChain;
@@ -26,9 +27,10 @@ public struct RenderContext
     public readonly ReadOnlySpan<Camera> Cameras => Snapshot.Cameras;
     public readonly ReadOnlySpan<MeshDrawCommand> DrawList => Snapshot.DrawList;
 
-    public RenderContext(FrameArena arena, RenderFrameSnapshot snapshot)
+    internal RenderContext(FrameArena arena, RenderFrameSnapshot snapshot, RenderFrameSubmission submission)
     {
         Arena = arena;
         Snapshot = snapshot;
+        Submission = submission;
     }
 }
