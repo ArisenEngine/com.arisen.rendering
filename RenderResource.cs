@@ -24,4 +24,6 @@ public sealed class RenderResource
         Type = type;
         ResourceId = resourceId;
     }
+
+    public override string ToString() => $"{Name}#{ResourceId}({Type})";
 }

@@ -42,6 +42,12 @@ public readonly struct RenderCommandList
         m_CommandBuffer.BindPipeline(pipeline);
     }
 
+    public unsafe void PushConstants<T>(T data, EShaderStage stageFlags, uint offset = 0)
+        where T : unmanaged
+    {
+        m_CommandBuffer.PushConstants(offset, (uint)sizeof(T), (IntPtr)(&data), stageFlags);
+    }
+
     public void SetViewport(float x, float y, float width, float height, float minDepth = 0.0f, float maxDepth = 1.0f)
     {
         m_CommandBuffer.SetViewport(x, y, width, height, minDepth, maxDepth);
