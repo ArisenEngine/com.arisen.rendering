@@ -1,5 +1,6 @@
 using ArisenEngine.Core.Assets;
 using ArisenEngine.Core.Diagnostics;
+using ArisenEngine.Rendering.Resources;
 using ArisenEngine.ShaderLab;
 
 namespace ArisenEngine.Rendering;
@@ -30,10 +31,81 @@ public readonly record struct ShaderVariantKey(
         "0",
         DebugInfo: true);
 
-    public string GetCookedVariant(string entryPoint)
+    public string GetCookedVariant(string entryPoint, IReadOnlyList<string>? keywords = null)
     {
         var debugSuffix = DebugInfo ? ".debug" : string.Empty;
-        return $"{Backend.ToString().ToLowerInvariant()}.{TargetEnvironment}.sm{ShaderModel}.o{OptimizationLevel}{debugSuffix}.{entryPoint}";
+        var keywordSuffix = GetKeywordVariantSuffix(keywords);
+        return $"{Backend.ToString().ToLowerInvariant()}.{TargetEnvironment}.sm{ShaderModel}.o{OptimizationLevel}{debugSuffix}{keywordSuffix}.{entryPoint}";
+    }
+
+    public string GetVariantIdentity(IReadOnlyList<string>? keywords = null)
+    {
+        return $"{Backend}|{TargetEnvironment}|{ShaderModel}|{OptimizationLevel}|{DebugInfo}|{GetKeywordSetKey(keywords)}";
+    }
+
+    public static string GetKeywordSetKey(IReadOnlyList<string>? keywords)
+    {
+        var normalized = NormalizeKeywordSet(keywords);
+        return normalized.Length == 0 ? string.Empty : string.Join("+", normalized);
+    }
+
+    public static string[] NormalizeKeywordSet(IReadOnlyList<string>? keywords)
+    {
+        if (keywords == null || keywords.Count == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        var values = new List<string>(keywords.Count);
+        for (int i = 0; i < keywords.Count; i++)
+        {
+            var keyword = keywords[i]?.Trim();
+            if (!string.IsNullOrWhiteSpace(keyword) &&
+                !values.Contains(keyword, StringComparer.Ordinal))
+            {
+                values.Add(keyword);
+            }
+        }
+
+        if (values.Count == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        values.Sort(StringComparer.Ordinal);
+        return values.ToArray();
+    }
+
+    private static string GetKeywordVariantSuffix(IReadOnlyList<string>? keywords)
+    {
+        var normalized = NormalizeKeywordSet(keywords);
+        if (normalized.Length == 0)
+        {
+            return string.Empty;
+        }
+
+        var safeNames = new string[normalized.Length];
+        for (int i = 0; i < normalized.Length; i++)
+        {
+            safeNames[i] = SanitizeKeywordForVariant(normalized[i]);
+        }
+
+        return ".kw-" + string.Join("-", safeNames);
+    }
+
+    private static string SanitizeKeywordForVariant(string keyword)
+    {
+        Span<char> buffer = keyword.Length <= 128
+            ? stackalloc char[keyword.Length]
+            : new char[keyword.Length];
+
+        for (int i = 0; i < keyword.Length; i++)
+        {
+            var ch = keyword[i];
+            buffer[i] = char.IsLetterOrDigit(ch) || ch == '_' ? ch : '_';
+        }
+
+        return new string(buffer);
     }
 }
 
@@ -43,7 +115,14 @@ public sealed record ShaderAsset(
     IReadOnlyList<ShaderStageAsset> Stages,
     ShaderVariantKey Variant,
     IReadOnlyList<string>? Defines = null,
-    IReadOnlyList<string>? Includes = null);
+    IReadOnlyList<string>? Includes = null,
+    IReadOnlyList<string>? VariantKeywords = null)
+{
+    public string GetVariantIdentity()
+    {
+        return Variant.GetVariantIdentity(VariantKeywords);
+    }
+}
 
 public readonly record struct CookedShaderStage(
     ShaderStageAsset Stage,
@@ -55,7 +134,7 @@ public readonly record struct CookedShaderStage(
 
 public static class ShaderAssetCooker
 {
-    private const string ShaderSourceAssetType = "ShaderSource";
+    public const string ShaderSourceAssetType = "ShaderSource";
 
     public static CookedShaderStage LoadOrCookStage(
         IAssetDatabase assetDatabase,
@@ -84,7 +163,7 @@ public static class ShaderAssetCooker
                 $"[ShaderAssetCooker] Shader asset '{shader.Guid}' has asset type '{sourceAsset.AssetType}', expected '{ShaderSourceAssetType}'.");
         }
 
-        var variant = shader.Variant.GetCookedVariant(stage.EntryPoint);
+        var variant = shader.Variant.GetCookedVariant(stage.EntryPoint, shader.VariantKeywords);
         var outputPath = assetDatabase.GetCookedArtifactPath(shader.Guid, variant, GetCookedExtension(shader.Variant.Backend));
         var newestSourceWriteTimeUtc = GetNewestSourceWriteTimeUtc(sourceAsset.SourcePath, shader.Includes);
 
@@ -140,8 +219,19 @@ public static class ShaderAssetCooker
     {
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
+        var compileInputPath = sourceAsset.SourcePath;
+        var includes = shader.Includes ?? Array.Empty<string>();
+        if (ShaderLabSource.IsShaderLabPath(sourceAsset.SourcePath))
+        {
+            var shaderLab = ShaderLabSource.Load(sourceAsset.SourcePath);
+            compileInputPath = shaderLab.WriteStageHlsl(stage, outputPath + ".hlsl");
+            includes = MergeIncludes(includes, shaderLab.Includes);
+        }
+
+        var compilerDefines = BuildCompilerDefines(shader);
+        var variantKeywords = ShaderVariantKey.NormalizeKeywordSet(shader.VariantKeywords);
         var result = ShaderCompiler.Compile(
-            sourceAsset.SourcePath,
+            compileInputPath,
             stage.ProgramStage,
             new ShaderCompiler.CompileOptions
             {
@@ -150,19 +240,80 @@ public static class ShaderAssetCooker
                 Target = GetCompilerTarget(shader.Variant.Backend),
                 TargetEnv = shader.Variant.TargetEnvironment,
                 OptimizeLevel = shader.Variant.OptimizationLevel,
-                Defines = shader.Defines ?? Array.Empty<string>(),
-                Includes = shader.Includes ?? Array.Empty<string>(),
+                Defines = compilerDefines,
+                Includes = includes,
                 OutputPath = outputPath
             });
 
         if (!result.Success || !File.Exists(outputPath))
         {
             throw new InvalidOperationException(
-                $"[ShaderAssetCooker] Failed to cook shader asset '{shader.Guid}' stage '{stage.Name}' variant '{variant}'. {result.Message}");
+                $"[ShaderAssetCooker] Failed to cook shader asset '{shader.Guid}' stage '{stage.Name}' entry '{stage.EntryPoint}' backend '{shader.Variant.Backend}' target '{shader.Variant.TargetEnvironment}' variant '{variant}' keywords [{string.Join(", ", variantKeywords)}] defines [{string.Join(", ", compilerDefines)}]. {result.Message}");
         }
 
         Logger.Log(
-            $"[ShaderAssetCooker] Cooked shader asset {shader.Guid} | Stage: {stage.Name} | Variant: {variant} | Output: {outputPath}");
+            $"[ShaderAssetCooker] Cooked shader asset {shader.Guid} | Stage: {stage.Name} | Variant: {variant} | Keywords: [{string.Join(", ", variantKeywords)}] | Output: {outputPath}");
+    }
+
+    private static IReadOnlyList<string> BuildCompilerDefines(ShaderAsset shader)
+    {
+        var defines = shader.Defines ?? Array.Empty<string>();
+        var keywords = ShaderVariantKey.NormalizeKeywordSet(shader.VariantKeywords);
+        if (defines.Count == 0 && keywords.Length == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        var result = new List<string>(defines.Count + keywords.Length);
+        AppendUnique(result, defines);
+        AppendUnique(result, keywords);
+        return result;
+    }
+
+    private static void AppendUnique(List<string> result, IReadOnlyList<string> values)
+    {
+        for (int i = 0; i < values.Count; i++)
+        {
+            var value = values[i];
+            if (!string.IsNullOrWhiteSpace(value) &&
+                !result.Contains(value, StringComparer.Ordinal))
+            {
+                result.Add(value);
+            }
+        }
+    }
+
+    private static IReadOnlyList<string> MergeIncludes(
+        IReadOnlyList<string> first,
+        IReadOnlyList<string> second)
+    {
+        if (first.Count == 0)
+        {
+            return second;
+        }
+
+        if (second.Count == 0)
+        {
+            return first;
+        }
+
+        var merged = new List<string>(first.Count + second.Count);
+        AppendIncludes(merged, first);
+        AppendIncludes(merged, second);
+        return merged;
+    }
+
+    private static void AppendIncludes(List<string> merged, IReadOnlyList<string> includes)
+    {
+        for (int i = 0; i < includes.Count; i++)
+        {
+            var include = includes[i];
+            if (!string.IsNullOrWhiteSpace(include) &&
+                !merged.Contains(include, StringComparer.OrdinalIgnoreCase))
+            {
+                merged.Add(include);
+            }
+        }
     }
 
     private static DateTime GetNewestSourceWriteTimeUtc(string sourcePath, IReadOnlyList<string>? includes)

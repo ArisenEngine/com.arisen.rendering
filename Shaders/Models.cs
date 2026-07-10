@@ -91,6 +91,14 @@ public class ShaderLabShader
     public List<Property> properties = new();
     public List<SubShader> subShaders = new();
     public List<IncludedHLSL> includedHLSLs = new();
+    public ShaderLabMaterialContract materialContract = new();
+}
+
+public class ShaderLabMaterialContract
+{
+    public List<string> texture2DRefs = new();
+    public List<string> scalarProperties = new();
+    public List<string> vector4Properties = new();
 }
 
 public class Property

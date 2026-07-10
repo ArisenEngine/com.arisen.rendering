@@ -8,6 +8,7 @@ internal sealed class RuntimeWindowRenderSurface : IRenderSurface
     private readonly uint m_SurfaceId;
     private uint m_Width;
     private uint m_Height;
+    private uint m_ResizeGeneration;
 
     public RuntimeWindowRenderSurface(WindowSurfaceInfo windowInfo)
     {
@@ -27,6 +28,7 @@ internal sealed class RuntimeWindowRenderSurface : IRenderSurface
     {
         m_Width = Math.Max(1, width);
         m_Height = Math.Max(1, height);
+        m_ResizeGeneration++;
     }
 
     public void DisposeSurface()
@@ -60,6 +62,7 @@ internal sealed class RuntimeWindowRenderSurface : IRenderSurface
 
     public RenderOutputInfo GetOutputInfo() => new()
     {
+        ResizeGeneration = m_ResizeGeneration,
         Width = m_Width,
         Height = m_Height
     };

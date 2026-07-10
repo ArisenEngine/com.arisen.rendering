@@ -32,6 +32,47 @@ public readonly struct RenderCommandList
             x, y, width, height);
     }
 
+    public void BeginRendering(
+        RHIImageViewHandle colorImageView,
+        EImageLayout imageLayout,
+        EAttachmentLoadOp loadOp,
+        EAttachmentStoreOp storeOp,
+        float clearR,
+        float clearG,
+        float clearB,
+        float clearA,
+        RHIImageViewHandle depthImageView,
+        EImageLayout depthImageLayout,
+        EAttachmentLoadOp depthLoadOp,
+        EAttachmentStoreOp depthStoreOp,
+        float clearDepth,
+        uint clearStencil,
+        int x,
+        int y,
+        uint width,
+        uint height)
+    {
+        m_CommandBuffer.BeginRendering(
+            colorImageView,
+            imageLayout,
+            loadOp,
+            storeOp,
+            clearR,
+            clearG,
+            clearB,
+            clearA,
+            depthImageView,
+            depthImageLayout,
+            depthLoadOp,
+            depthStoreOp,
+            clearDepth,
+            clearStencil,
+            x,
+            y,
+            width,
+            height);
+    }
+
     public void EndRendering()
     {
         m_CommandBuffer.EndRendering();
@@ -99,5 +140,33 @@ public readonly struct RenderCommandList
             targetLayout,
             srcQueueFamilyIndex,
             dstQueueFamilyIndex);
+    }
+
+    public void PipelineBarrier(
+        EPipelineStageFlagBits srcStage,
+        EPipelineStageFlagBits dstStage,
+        ReadOnlySpan<RHIImageMemoryBarrier> imageBarriers,
+        uint dependency = 0)
+    {
+        m_CommandBuffer.PipelineBarrier(srcStage, dstStage, imageBarriers, dependency);
+    }
+
+    public void PipelineBarrier(
+        EPipelineStageFlagBits srcStage,
+        EPipelineStageFlagBits dstStage,
+        ReadOnlySpan<RHIBufferMemoryBarrier> bufferBarriers,
+        uint dependency = 0)
+    {
+        m_CommandBuffer.PipelineBarrier(srcStage, dstStage, bufferBarriers, dependency);
+    }
+
+    public void PipelineBarrier(
+        EPipelineStageFlagBits srcStage,
+        EPipelineStageFlagBits dstStage,
+        ReadOnlySpan<RHIImageMemoryBarrier> imageBarriers,
+        ReadOnlySpan<RHIBufferMemoryBarrier> bufferBarriers,
+        uint dependency = 0)
+    {
+        m_CommandBuffer.PipelineBarrier(srcStage, dstStage, imageBarriers, bufferBarriers, dependency);
     }
 }

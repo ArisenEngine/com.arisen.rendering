@@ -1,6 +1,3 @@
-using Arisen.Native.RHI;
-using ArisenEngine.Core.RHI;
-
 namespace ArisenEngine.Rendering;
 
 /// <summary>
@@ -16,23 +13,6 @@ public sealed class PrepareFrameTargetPass : RenderPassNode
 
     protected override void Record(RenderContext context, RenderCommandList commandList)
     {
-        // We currently clear the whole target every frame, so UNDEFINED is valid for the old
-        // layout. Shared editor output additionally needs ownership acquired back from the
-        // external compositor before any color attachment writes.
-        if (context.OutputKind == RenderOutputKind.EditorSharedTexture)
-        {
-            commandList.TransitionImageLayout(
-                context.TargetImage,
-                EImageLayout.IMAGE_LAYOUT_UNDEFINED,
-                EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                RHIQueueFamily.External,
-                RHIQueueFamily.Ignored);
-            return;
-        }
-
-        commandList.TransitionImageLayout(
-            context.TargetImage,
-            EImageLayout.IMAGE_LAYOUT_UNDEFINED,
-            EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        // RenderGraph records the planned FrameColor transition before this pass.
     }
 }

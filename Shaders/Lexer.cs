@@ -1,5 +1,4 @@
 using ArisenEngine.Core.Diagnostics;
-using ArisenEngine.Core.Serialization;
 
 namespace ArisenEngine.ShaderLab;
 
@@ -159,10 +158,7 @@ public class Lexer
         m_Tokens.Add(new Token
             { type = TokenType.EndOfFile, text = "<EOF>", line = _line + 1, start = k_Input.Length, length = 0 });
 
-        // TODO: 测试用
         RemovePropertiesBlock();
-
-        SerializationUtil.Serialize(m_Tokens, "tokens.token");
     }
 
     private void RemovePropertiesBlock()
