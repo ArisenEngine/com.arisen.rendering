@@ -29,6 +29,7 @@ public sealed class RHITexture2DResource : IDisposable
     public RHISamplerHandle Sampler => m_Sampler;
     public uint BindlessImageIndex => m_BindlessImageIndex;
     public uint BindlessSamplerIndex => m_BindlessSamplerIndex;
+    public AssetDependencyStamp DependencyStamp { get; private set; }
     public bool IsValid => m_Image.IsValid && m_ImageView.IsValid && m_Sampler.IsValid;
 
     public RHITexture2DResource(RHIDevice device, IAssetDatabase assetDatabase, Texture2DAsset asset)
@@ -56,6 +57,7 @@ public sealed class RHITexture2DResource : IDisposable
 
     private unsafe void CreateFromCookedAsset()
     {
+        DependencyStamp = AssetDependencyTracker.GetAssetStamp(m_AssetDatabase, m_Asset.Guid);
         m_CookedTexture = Texture2DAssetCooker.LoadOrCook(m_AssetDatabase, m_Asset);
         var cookedBytes = m_AssetDatabase.GetCookedAssetBytes(m_CookedTexture.Handle);
         var pixelBytes = cookedBytes.Slice(m_CookedTexture.PixelDataOffset, m_CookedTexture.PixelDataSize);
@@ -134,6 +136,10 @@ public sealed class RHITexture2DResource : IDisposable
 
             m_BindlessImageIndex = m_Factory.RegisterBindlessResourceImage(m_ImageView);
             m_BindlessSamplerIndex = m_Factory.RegisterBindlessResourceSampler(m_Sampler);
+            if (m_BindlessImageIndex == InvalidBindlessIndex || m_BindlessSamplerIndex == InvalidBindlessIndex)
+            {
+                throw new InvalidOperationException($"[RHITexture2DResource] Failed to register bindless descriptors for '{m_Asset.Name}'.");
+            }
 
             Logger.Log(
                 $"[RHITexture2DResource] Uploaded texture | Name: {m_Asset.Name} | Size: {Width}x{Height} | Format: {Format} | Image: {m_Image.Index}:{m_Image.Generation} | View: {m_ImageView.Index}:{m_ImageView.Generation} | BindlessImage: {m_BindlessImageIndex} | BindlessSampler: {m_BindlessSamplerIndex}");
@@ -202,6 +208,11 @@ public sealed class RHITexture2DResource : IDisposable
             : EFormat.FORMAT_R8G8B8A8_UNORM;
     }
 
+    public bool IsSourceStale()
+    {
+        return AssetDependencyTracker.GetAssetStamp(m_AssetDatabase, m_Asset.Guid) != DependencyStamp;
+    }
+
     public void Dispose()
     {
         if (m_Disposed)
@@ -211,6 +222,16 @@ public sealed class RHITexture2DResource : IDisposable
 
         if (m_Factory.IsValid)
         {
+            if (m_BindlessSamplerIndex != InvalidBindlessIndex)
+            {
+                m_Factory.UnregisterBindlessResourceSampler(m_BindlessSamplerIndex);
+            }
+
+            if (m_BindlessImageIndex != InvalidBindlessIndex)
+            {
+                m_Factory.UnregisterBindlessResourceImage(m_BindlessImageIndex);
+            }
+
             if (m_Sampler.IsValid)
             {
                 m_Factory.ReleaseSampler(m_Sampler);

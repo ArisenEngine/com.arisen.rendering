@@ -11,7 +11,9 @@ namespace ArisenEngine.Rendering;
 
 public class RenderSurface : IRenderSurface
 {
-    internal List<RenderSurface> Surfaces = new List<RenderSurface>();
+    internal List<RenderSurface> Surfaces = new();
+
+    private readonly object m_OutputLock = new();
     private IntPtr m_Host;
     private uint m_SurfaceId;
     private IntPtr m_Handle;
@@ -23,10 +25,13 @@ public class RenderSurface : IRenderSurface
     private uint m_LastConsumedFrameIndex;
     private uint m_LastRenderWidth;
     private uint m_LastRenderHeight;
+    private uint m_ResizeGeneration;
+    private uint m_LastRenderResizeGeneration;
     private RHISwapChain? m_LastRenderSwapChain;
-    private Core.RHI.RHISurface m_NativeSurface;
+    private Core.RHI.RHISurface? m_NativeSurface;
+    private RHISwapChain? m_CachedSwapChain;
 
-    private WindowProcessor m_Processor;
+    private WindowProcessor m_Processor = null!;
     private bool m_Hosted = true;
 
     public IntPtr Handle => m_Handle;
@@ -46,11 +51,11 @@ public class RenderSurface : IRenderSurface
         {
             m_Host = host;
 
-            // B101: If the host is in the dedicated virtual window range (e.g. from the Editor), 
+            // B101: If the host is in the dedicated virtual window range (e.g. from the Editor),
             // we bypass native window creation and use a virtual surface ID.
             if (host.ToInt64() >= 1000 && host.ToInt64() <= 65535)
             {
-                m_SurfaceId = RHISystem.VirtualSurfaceIDMask | (uint)host.ToInt64(); 
+                m_SurfaceId = RHISystem.VirtualSurfaceIDMask | (uint)host.ToInt64();
             }
             else
             {
@@ -104,43 +109,58 @@ public class RenderSurface : IRenderSurface
 
     public bool IsValid() 
     {
-        // B101: Virtual surfaces (Editor) don't have native window handles, 
-        // they are valid if their virtual surface ID is correctly assigned.
+            // B101: Virtual surfaces (Editor) don't have native window handles,
+            // they are valid if their virtual surface ID is correctly assigned.
         if ((m_SurfaceId & RHISystem.VirtualSurfaceIDMask) != 0)
             return true;
-            
+
         return ((m_Hosted && m_Host != IntPtr.Zero) || !m_Hosted) && m_Handle != IntPtr.Zero;
     }
 
     public void Resize(uint width, uint height)
     {
+        width = Math.Max(1u, width);
+        height = Math.Max(1u, height);
+
         if (m_Width == width && m_Height == height) return;
 
-        m_Width = width;
-        m_Height = height;
+        lock (m_OutputLock)
+        {
+            m_Width = width;
+            m_Height = height;
+            m_ResizeGeneration++;
+            m_LastTicket = 0;
+            m_LastFrameIndex = 0;
+            m_LastRenderWidth = 0;
+            m_LastRenderHeight = 0;
+            m_LastRenderSwapChain = null;
+            m_CachedSwapChain = null;
+        }
 
         // B101: Professional Virtual Surface Resizing.
         // We cannot call ResizeRenderSurface in HAL because that assumes a Win32 HWND exists.
         // Instead, we call the RHI-level SetResolution directly which handles swapchain recreation.
         if ((m_SurfaceId & RHISystem.VirtualSurfaceIDMask) != 0)
         {
-            // Reset cache to force re-fetch of swapchain images at the new resolution.
-            m_CachedSwapChain = null;
-
-            if (m_NativeSurface == null)
+            var nativeSurface = EnsureNativeSurface();
+            if (nativeSurface == null)
             {
-                var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
-                if (device.IsValid) m_NativeSurface = device.GetSurface();
+                return;
             }
 
-            if (m_NativeSurface != null)
+            lock (m_OutputLock)
             {
-                RHISurfaceAPI.RHISurface_SetResolution(m_NativeSurface.Handle, width, height);
+                RHISurfaceAPI.RHISurface_SetResolution(nativeSurface.Handle, width, height);
             }
+
+            Logger.Log(
+                $"[RenderSurface] Resized virtual surface | Name: {m_Name} | Surface: 0x{m_SurfaceId:X} | Size: {width}x{height} | Generation: {m_ResizeGeneration}");
             return;
         }
 
         NativeHAL.RenderWindowAPI.ResizeRenderSurface(m_SurfaceId, width, height);
+        Logger.Log(
+            $"[RenderSurface] Resized native surface | Name: {m_Name} | Surface: 0x{m_SurfaceId:X} | Size: {width}x{height} | Generation: {m_ResizeGeneration}");
     }
 
     public void Dispose() => DisposeSurface();
@@ -180,113 +200,87 @@ public class RenderSurface : IRenderSurface
     {
     }
 
-    private RHISwapChain? m_CachedSwapChain;
-
     public IntPtr GetSharedHandle(uint frameIndex)
     {
-        if (m_NativeSurface == null)
+        lock (m_OutputLock)
         {
-            var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
-            if (device.IsValid) m_NativeSurface = device.GetSurface();
+            return GetSharedHandleLocked(frameIndex);
         }
-
-        if (m_NativeSurface == null) return IntPtr.Zero;
-
-        // B101: Strict Synchronization.
-        // Always attempt to use the swapchain that was used for the last successful render.
-        // This ensures that the handle and dimensions match the reported ticket even during a resize.
-        var swapChainToUse = m_LastRenderSwapChain ?? (m_CachedSwapChain ?? m_NativeSurface.GetSwapChain());
-        if (m_CachedSwapChain == null) m_CachedSwapChain = swapChainToUse;
-
-        if (swapChainToUse.IsValid)
-        {
-            // For cross-API interop, we synchronize with the engine's frame rotation.
-            // RHIVkSwapChain consistently uses (frameIndex % imageCount) for virtual swapchains.
-            // Default image count for virtual surfaces is 3. 
-            uint imageCount = 3; 
-            return swapChainToUse.GetSharedWin32Handle(frameIndex % imageCount);
-        }
-        return IntPtr.Zero;
     }
 
-                public ulong GetSharedMemorySize(uint frameIndex)
+    public ulong GetSharedMemorySize(uint frameIndex)
     {
-        if (m_NativeSurface == null)
-
+        lock (m_OutputLock)
         {
-            var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
-            if (device.IsValid) m_NativeSurface = device.GetSurface();
+            return GetSharedMemorySizeLocked(frameIndex);
         }
-
-        if (m_NativeSurface == null) return 0;
-
-        var swapChainToUse = m_LastRenderSwapChain ?? (m_CachedSwapChain ?? m_NativeSurface.GetSwapChain());
-        if (m_CachedSwapChain == null) m_CachedSwapChain = swapChainToUse;
-
-        if (swapChainToUse.IsValid)
-        {
-            const uint imageCount = 3;
-            return swapChainToUse.GetSharedMemorySize(frameIndex % imageCount);
-        }
-
-        return 0;
     }
 
-        public IntPtr GetRenderFinishedSemaphoreHandle(uint frameIndex)
-
+    public IntPtr GetRenderFinishedSemaphoreHandle(uint frameIndex)
     {
-        if (m_NativeSurface == null)
+        lock (m_OutputLock)
         {
-            var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
-            if (device.IsValid) m_NativeSurface = device.GetSurface();
+            return GetRenderFinishedSemaphoreHandleLocked(frameIndex);
         }
-
-        if (m_NativeSurface == null) return IntPtr.Zero;
-
-        var swapChainToUse = m_LastRenderSwapChain ?? (m_CachedSwapChain ?? m_NativeSurface.GetSwapChain());
-        if (m_CachedSwapChain == null) m_CachedSwapChain = swapChainToUse;
-
-        return swapChainToUse.IsValid ? swapChainToUse.GetRenderFinishedSemaphoreWin32Handle(frameIndex) : IntPtr.Zero;
     }
 
     public IntPtr CreateConsumedSemaphoreHandle(uint frameIndex)
     {
-        if (m_NativeSurface == null)
+        lock (m_OutputLock)
         {
-            var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
-            if (device.IsValid) m_NativeSurface = device.GetSurface();
+            return CreateConsumedSemaphoreHandleLocked(frameIndex);
         }
-
-        if (m_NativeSurface == null) return IntPtr.Zero;
-
-        var swapChainToUse = m_LastRenderSwapChain ?? (m_CachedSwapChain ?? m_NativeSurface.GetSwapChain());
-        if (m_CachedSwapChain == null) m_CachedSwapChain = swapChainToUse;
-
-        return swapChainToUse.IsValid ? swapChainToUse.CreateConsumedSemaphoreWin32Handle(frameIndex) : IntPtr.Zero;
     }
 
     public void ReleaseConsumedSemaphoreHandle(IntPtr handle)
     {
         if (handle == IntPtr.Zero) return;
 
-        var swapChainToUse = m_LastRenderSwapChain ?? m_CachedSwapChain;
-        if (swapChainToUse.HasValue && swapChainToUse.Value.IsValid)
+        lock (m_OutputLock)
         {
-            swapChainToUse.Value.ReleaseConsumedSemaphoreWin32Handle(handle);
+            var swapChainToUse = m_LastRenderSwapChain ?? m_CachedSwapChain;
+            if (swapChainToUse.HasValue && swapChainToUse.Value.IsValid)
+            {
+                swapChainToUse.Value.ReleaseConsumedSemaphoreWin32Handle(handle);
+            }
         }
     }
 
-    public ulong GetLastRenderTicket() => m_LastTicket;
+    public ulong GetLastRenderTicket()
+    {
+        lock (m_OutputLock)
+        {
+            return m_LastTicket;
+        }
+    }
 
-    public uint GetLastRenderFrameIndex() => m_LastFrameIndex;
+    public uint GetLastRenderFrameIndex()
+    {
+        lock (m_OutputLock)
+        {
+            return m_LastFrameIndex;
+        }
+    }
 
-    public uint GetLastRenderWidth() => m_LastRenderWidth;
-    public uint GetLastRenderHeight() => m_LastRenderHeight;
+    public uint GetLastRenderWidth()
+    {
+        lock (m_OutputLock)
+        {
+            return m_LastRenderWidth;
+        }
+    }
 
-                public async Task WaitForRenderTicketAsync(ulong ticket)
+    public uint GetLastRenderHeight()
+    {
+        lock (m_OutputLock)
+        {
+            return m_LastRenderHeight;
+        }
+    }
+
+    public async Task WaitForRenderTicketAsync(ulong ticket)
     {
         if (ticket == 0) return;
-
 
         var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
         if (!device.IsValid) return;
@@ -310,21 +304,30 @@ public class RenderSurface : IRenderSurface
 
     public RenderOutputInfo GetOutputInfo()
     {
-        lock (this)
+        lock (m_OutputLock)
         {
+            if (m_LastTicket == 0 || m_LastRenderWidth == 0 || m_LastRenderHeight == 0)
+            {
+                return new RenderOutputInfo
+                {
+                    ResizeGeneration = m_ResizeGeneration,
+                    Width = m_Width,
+                    Height = m_Height
+                };
+            }
+
             return new RenderOutputInfo
             {
-                                Ticket = m_LastTicket,
+                Ticket = m_LastTicket,
                 FrameIndex = m_LastFrameIndex,
-
-                SharedHandle = GetSharedHandle(m_LastFrameIndex),
-                MemorySize = GetSharedMemorySize(m_LastFrameIndex),
-                WaitSemaphoreHandle = GetRenderFinishedSemaphoreHandle(m_LastFrameIndex),
-                                SignalSemaphoreHandle = CreateConsumedSemaphoreHandle(m_LastFrameIndex),
+                ResizeGeneration = m_LastRenderResizeGeneration,
+                SharedHandle = GetSharedHandleLocked(m_LastFrameIndex),
+                MemorySize = GetSharedMemorySizeLocked(m_LastFrameIndex),
+                WaitSemaphoreHandle = GetRenderFinishedSemaphoreHandleLocked(m_LastFrameIndex),
+                SignalSemaphoreHandle = CreateConsumedSemaphoreHandleLocked(m_LastFrameIndex),
                 Width = m_LastRenderWidth,
                 Height = m_LastRenderHeight
             };
-
         }
     }
 
@@ -335,13 +338,89 @@ public class RenderSurface : IRenderSurface
 
     public uint GetLastConsumedFrameIndex() => m_LastConsumedFrameIndex;
 
-    internal void SetLastRenderTicket(ulong ticket, uint frameIndex, uint width, uint height, RHISwapChain swapChain) 
-    { 
-        m_LastTicket = ticket; 
-        m_LastFrameIndex = frameIndex;
-        m_LastRenderWidth = width;
-        m_LastRenderHeight = height;
-        m_LastRenderSwapChain = swapChain;
+    internal void SetLastRenderTicket(ulong ticket, uint frameIndex, uint width, uint height, RHISwapChain swapChain)
+    {
+        lock (m_OutputLock)
+        {
+            m_LastTicket = ticket;
+            m_LastFrameIndex = frameIndex;
+            m_LastRenderWidth = width;
+            m_LastRenderHeight = height;
+            m_LastRenderResizeGeneration = m_ResizeGeneration;
+            m_LastRenderSwapChain = swapChain;
+        }
+    }
+
+    private Core.RHI.RHISurface? EnsureNativeSurface()
+    {
+        if (m_NativeSurface != null)
+        {
+            return m_NativeSurface;
+        }
+
+        var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
+        if (device.IsValid)
+        {
+            m_NativeSurface = device.GetSurface();
+        }
+
+        return m_NativeSurface;
+    }
+
+    private RHISwapChain? GetSwapChainForSharedOutputLocked()
+    {
+        var nativeSurface = EnsureNativeSurface();
+        if (nativeSurface == null)
+        {
+            return null;
+        }
+
+        // B101: Strict Synchronization.
+        // Prefer the swapchain that produced the last successful render so handles,
+        // memory size, semaphores, and dimensions describe the same output frame.
+        var swapChainToUse = m_LastRenderSwapChain ?? (m_CachedSwapChain ?? nativeSurface.GetSwapChain());
+        m_CachedSwapChain ??= swapChainToUse;
+        return swapChainToUse;
+    }
+
+    private IntPtr GetSharedHandleLocked(uint frameIndex)
+    {
+        var swapChainToUse = GetSwapChainForSharedOutputLocked();
+        if (swapChainToUse is not { IsValid: true })
+        {
+            return IntPtr.Zero;
+        }
+
+        const uint imageCount = 3;
+        return swapChainToUse.Value.GetSharedWin32Handle(frameIndex % imageCount);
+    }
+
+    private ulong GetSharedMemorySizeLocked(uint frameIndex)
+    {
+        var swapChainToUse = GetSwapChainForSharedOutputLocked();
+        if (swapChainToUse is not { IsValid: true })
+        {
+            return 0;
+        }
+
+        const uint imageCount = 3;
+        return swapChainToUse.Value.GetSharedMemorySize(frameIndex % imageCount);
+    }
+
+    private IntPtr GetRenderFinishedSemaphoreHandleLocked(uint frameIndex)
+    {
+        var swapChainToUse = GetSwapChainForSharedOutputLocked();
+        return swapChainToUse is { IsValid: true }
+            ? swapChainToUse.Value.GetRenderFinishedSemaphoreWin32Handle(frameIndex)
+            : IntPtr.Zero;
+    }
+
+    private IntPtr CreateConsumedSemaphoreHandleLocked(uint frameIndex)
+    {
+        var swapChainToUse = GetSwapChainForSharedOutputLocked();
+        return swapChainToUse is { IsValid: true }
+            ? swapChainToUse.Value.CreateConsumedSemaphoreWin32Handle(frameIndex)
+            : IntPtr.Zero;
     }
 }
 

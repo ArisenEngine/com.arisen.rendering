@@ -139,6 +139,11 @@ public class ShaderLabParser
                 includedHlsl.hlslCode = m_Lexer.Slice(sliceStart, sliceEnd);
                 shader.includedHLSLs.Add(includedHlsl);
             }
+            else if (Match(TokenType.Identifier, "MaterialContract"))
+            {
+                Next();
+                shader.materialContract = ParseMaterialContract();
+            }
             else if (Match(TokenType.Identifier, "CustomEditor"))
             {
                 // 引擎外的编辑器扩展字段，不参与运行时解析，跳过
@@ -498,6 +503,25 @@ public class ShaderLabParser
                 continue;
             }
 
+            if (Match(TokenType.Identifier, "BlendOp"))
+            {
+                Next();
+                if (Match(TokenType.Identifier))
+                {
+                    pass.states.BlendOp = Next().text;
+                    if (Match(TokenType.Symbol, ","))
+                    {
+                        Next();
+                        if (Match(TokenType.Identifier))
+                        {
+                            Next();
+                        }
+                    }
+                }
+
+                continue;
+            }
+
             // Cull Back/Front/Off
             if (Match(TokenType.Identifier, "Cull"))
             {
@@ -626,6 +650,108 @@ public class ShaderLabParser
         }
 
         return pass;
+    }
+
+    private ShaderLabMaterialContract ParseMaterialContract()
+    {
+        var contract = new ShaderLabMaterialContract();
+        Expect(TokenType.Symbol, "{");
+
+        while (!Match(TokenType.Symbol, "}"))
+        {
+            if (Match(TokenType.EndOfFile))
+            {
+                Logger.Error("Unexpected EOF while parsing MaterialContract block");
+                break;
+            }
+
+            if (Match(TokenType.CommentBlock) ||
+                Match(TokenType.CommentLine) ||
+                Match(TokenType.Symbol, ";") ||
+                Match(TokenType.Symbol, ","))
+            {
+                Next();
+                continue;
+            }
+
+            if (!Match(TokenType.Identifier))
+            {
+                Logger.Error($"[ShaderLabParser] Unexpected MaterialContract token: {Current.text} at line {Current.line}");
+                Next();
+                continue;
+            }
+
+            var kind = Next().text;
+            if (!TryReadContractName(out var name))
+            {
+                Logger.Error($"[ShaderLabParser] MaterialContract entry '{kind}' is missing a binding name at line {Current.line}");
+                continue;
+            }
+
+            if (IsTextureContractKind(kind))
+            {
+                contract.texture2DRefs.Add(name);
+            }
+            else if (IsScalarContractKind(kind))
+            {
+                contract.scalarProperties.Add(name);
+            }
+            else if (IsVector4ContractKind(kind))
+            {
+                contract.vector4Properties.Add(name);
+            }
+            else
+            {
+                Logger.Error($"[ShaderLabParser] Unsupported MaterialContract kind '{kind}' at line {Current.line}");
+            }
+
+            while (!Match(TokenType.Symbol, "}") &&
+                   !Match(TokenType.EndOfFile) &&
+                   !Match(TokenType.Identifier))
+            {
+                Next();
+            }
+        }
+
+        Expect(TokenType.Symbol, "}");
+        return contract;
+    }
+
+    private bool TryReadContractName(out string name)
+    {
+        name = string.Empty;
+        if (Match(TokenType.StringLiteral))
+        {
+            name = Next().text.Trim('"');
+            return !string.IsNullOrWhiteSpace(name);
+        }
+
+        if (Match(TokenType.Identifier))
+        {
+            name = Next().text;
+            return !string.IsNullOrWhiteSpace(name);
+        }
+
+        return false;
+    }
+
+    private static bool IsTextureContractKind(string kind)
+    {
+        return string.Equals(kind, "Texture2D", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(kind, "Texture", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsScalarContractKind(string kind)
+    {
+        return string.Equals(kind, "Scalar", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(kind, "Float", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsVector4ContractKind(string kind)
+    {
+        return string.Equals(kind, "Vector4", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(kind, "Float4", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(kind, "Color", StringComparison.OrdinalIgnoreCase);
     }
 
     // 解析 Tags 字典：支持 "Key" = "Value"，或无等号的连续字符串（退化为列表合并为原文）

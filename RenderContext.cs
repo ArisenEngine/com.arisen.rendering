@@ -24,8 +24,10 @@ public struct RenderContext
     public RHIImageHandle TargetImage => Snapshot.TargetImage;
     public int CameraCount => Snapshot.CameraCount;
     public int DrawListCount => Snapshot.DrawListCount;
+    public int StaticMeshItemCount => Snapshot.StaticMeshItemCount;
     public readonly ReadOnlySpan<Camera> Cameras => Snapshot.Cameras;
     public readonly ReadOnlySpan<MeshDrawCommand> DrawList => Snapshot.DrawList;
+    public readonly ReadOnlySpan<StaticMeshRenderItem> StaticMeshItems => Snapshot.StaticMeshItems;
 
     internal RenderContext(FrameArena arena, RenderFrameSnapshot snapshot, RenderFrameSubmission submission)
     {

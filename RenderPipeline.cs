@@ -40,13 +40,19 @@ public abstract class RenderPipeline : IDisposable
         }
 
         // 3. Execution Phase: Record parallel commands and submit to GPU.
-        return m_RenderGraph.Execute(context);
+        var submittedTicket = m_RenderGraph.Execute(context);
+        OnFrameSubmitted(context, submittedTicket);
+        return submittedTicket;
     }
 
     /// <summary>
     /// Hook for derived pipelines to define their frame structure by adding passes to the graph.
     /// </summary>
     protected abstract void SetupGraph(RenderGraph graph, RenderContext context);
+
+    protected virtual void OnFrameSubmitted(RenderContext context, ulong submittedTicket)
+    {
+    }
 
     protected abstract void OnDisposed();
 

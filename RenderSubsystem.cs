@@ -169,6 +169,7 @@ public class RenderSubsystem : ITickableSubsystem
 
             var arena = FrameArena.Instance;
             Span<MeshDrawCommand> frameDrawList = Span<MeshDrawCommand>.Empty;
+            Span<StaticMeshRenderItem> frameStaticMeshItems = Span<StaticMeshRenderItem>.Empty;
 
             if (sceneSubsystem != null)
             {
@@ -177,6 +178,13 @@ public class RenderSubsystem : ITickableSubsystem
                 {
                     frameDrawList = arena.Alloc<MeshDrawCommand>(drawList.Length);
                     drawList.CopyTo(frameDrawList);
+                }
+
+                var staticMeshItems = sceneSubsystem.GetCurrentStaticMeshItems();
+                if (staticMeshItems.Length > 0)
+                {
+                    frameStaticMeshItems = arena.Alloc<StaticMeshRenderItem>(staticMeshItems.Length);
+                    staticMeshItems.CopyTo(frameStaticMeshItems);
                 }
             }
 
@@ -227,6 +235,7 @@ public class RenderSubsystem : ITickableSubsystem
             {
                 fixed (Camera* pCameras = frameCameras)
                 fixed (MeshDrawCommand* pDrawList = frameDrawList)
+                fixed (StaticMeshRenderItem* pStaticMeshItems = frameStaticMeshItems)
                 {
                     var snapshot = new RenderFrameSnapshot(
                         device,
@@ -241,17 +250,20 @@ public class RenderSubsystem : ITickableSubsystem
                         pCameras,
                         cameraCount,
                         pDrawList,
-                        frameDrawList.Length);
+                        frameDrawList.Length,
+                        pStaticMeshItems,
+                        frameStaticMeshItems.Length);
 
                     var context = new RenderContext(arena, snapshot, submission);
                     Profiler.PlotValue("Render.DrawCount", snapshot.DrawListCount);
+                    Profiler.PlotValue("Render.StaticMeshItemCount", snapshot.StaticMeshItemCount);
                     Profiler.PlotValue("Render.CameraCount", snapshot.CameraCount);
                     Profiler.PlotValue("Render.OutputWidth", snapshot.Width);
                     Profiler.PlotValue("Render.OutputHeight", snapshot.Height);
 
                     if (frameIndex % 60 == 0)
                     {
-                        Logger.Log($"[RenderSubsystem] FrameSnapshot | Frame: {snapshot.FrameIndex} | Surface: 0x{snapshot.SurfaceId:X} | Size: {snapshot.Width}x{snapshot.Height} | Cameras: {snapshot.CameraCount} | Draws: {snapshot.DrawListCount} | Output: {snapshot.OutputKind}");
+                        Logger.Log($"[RenderSubsystem] FrameSnapshot | Frame: {snapshot.FrameIndex} | Surface: 0x{snapshot.SurfaceId:X} | Size: {snapshot.Width}x{snapshot.Height} | Cameras: {snapshot.CameraCount} | Draws: {snapshot.DrawListCount} | StaticMeshItems: {snapshot.StaticMeshItemCount} | Output: {snapshot.OutputKind}");
                     }
 
                     // B11: RenderDoc Integration
@@ -365,8 +377,19 @@ public class RenderSubsystem : ITickableSubsystem
     {
         if (s_GlobalSurfaces.TryGetValue(host, out var surface))
         {
-            surface.Surface.Resize((uint)width, (uint)height);
+            var resizedWidth = Math.Max(1, width);
+            var resizedHeight = Math.Max(1, height);
+            surface.Surface.Resize((uint)resizedWidth, (uint)resizedHeight);
+            Logger.Log(
+                $"[RenderSubsystem] Processed surface resize | Host: 0x{host.ToInt64():X} | Name: {surface.Name} | Size: {resizedWidth}x{resizedHeight}");
+            return;
         }
+
+        KernelLog.WarningFormat(
+            "[RenderSubsystem] Ignored resize for unknown surface. Host=0x{0:X}, RequestedSize={1}x{2}",
+            host.ToInt64(),
+            width,
+            height);
     }
 
     public IntPtr GetSurfaceSharedHandle(IntPtr host, uint frameIndex)

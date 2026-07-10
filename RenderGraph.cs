@@ -18,38 +18,37 @@ public sealed class RenderGraph : IDisposable
 {
     private const uint DiagnosticsFrameInterval = 60;
 
-    private enum RenderResourceAccessKind
+    private readonly struct RenderGraphCullingResult
     {
-        Read,
-        Write
-    }
-
-    private readonly struct RenderResourceAccess
-    {
-        public RenderResourceAccess(uint resourceId, uint passNodeId, RenderResourceAccessKind kind)
+        public RenderGraphCullingResult(uint[] culledNodeIds, string[] culledPassNames)
         {
-            ResourceId = resourceId;
-            PassNodeId = passNodeId;
-            Kind = kind;
+            CulledNodeIds = culledNodeIds;
+            CulledPassNames = culledPassNames;
         }
 
-        public uint ResourceId { get; }
-        public uint PassNodeId { get; }
-        public RenderResourceAccessKind Kind { get; }
+        public uint[] CulledNodeIds { get; }
+        public string[] CulledPassNames { get; }
+        public int CulledCount => CulledNodeIds.Length;
     }
 
     private sealed class CompiledRenderGraphLayout
     {
-        public CompiledRenderGraphLayout(ulong signature, uint[] sortedNodeIds, uint[][] parallelLayerNodeIds)
+        public CompiledRenderGraphLayout(
+            ulong signature,
+            uint[] sortedNodeIds,
+            uint[][] parallelLayerNodeIds,
+            RenderGraphCullingResult culling)
         {
             Signature = signature;
             SortedNodeIds = sortedNodeIds;
             ParallelLayerNodeIds = parallelLayerNodeIds;
+            Culling = culling;
         }
 
         public ulong Signature { get; }
         public uint[] SortedNodeIds { get; }
         public uint[][] ParallelLayerNodeIds { get; }
+        public RenderGraphCullingResult Culling { get; }
     }
 
     private struct ResourceAccessState
@@ -67,11 +66,11 @@ public sealed class RenderGraph : IDisposable
     private readonly Graph<RenderPassNode> m_Graph = new();
     private readonly List<RenderResource> m_Resources = new();
     private readonly Dictionary<uint, ResourceAccessState> m_ResourceAccess = new();
-    private readonly List<RenderResourceAccess> m_ResourceAccessEvents = new();
+    private readonly List<RenderGraphResourceAccess> m_ResourceAccessEvents = new();
     private readonly Dictionary<uint, RHICommandBuffer[]> m_CommandBuffers = new();
     private readonly ConcurrentQueue<Exception> m_RecordingErrors = new();
     private readonly ITaskGraph m_TaskSystem;
-    private uint m_NextResourceId = 1;
+    private uint m_NextResourceId = 2;
     
     // Key: (ThreadId, SurfaceId), Value: Command Pool for that thread/surface combination
     private readonly ConcurrentDictionary<(int, uint), RHICommandBufferPool> m_CommandPools = new();
@@ -85,12 +84,24 @@ public sealed class RenderGraph : IDisposable
     /// Pipeline passes should declare reads/writes against this instead of manually ordering
     /// passes that touch the camera/output color image.
     /// </summary>
-    public RenderResource FrameColor { get; } = new("FrameColor", RenderResourceType.Texture, 0);
+    public RenderResource FrameColor { get; } = new(
+        "FrameColor",
+        RenderResourceType.Texture,
+        0,
+        isImported: true,
+        initialState: RenderResourceState.OutputOwnership);
+
+    /// <summary>
+    /// Graph resource representing the active frame depth target.
+    /// The first implementation uses pass-owned lifetime while exposing ordering diagnostics.
+    /// </summary>
+    public RenderResource FrameDepth { get; } = new("FrameDepth", RenderResourceType.Texture, 1);
     
     public RenderGraph(ITaskGraph taskSystem)
     {
         m_TaskSystem = taskSystem;
         m_Resources.Add(FrameColor);
+        m_Resources.Add(FrameDepth);
     }
 
     /// <summary>
@@ -136,10 +147,11 @@ public sealed class RenderGraph : IDisposable
         m_Graph.Connect(src.Id, 0, dst.Id, 0);
     }
 
-    internal void RegisterRead(RenderPassNode pass, RenderResource resource)
+    internal void RegisterRead(RenderPassNode pass, RenderResource resource, RenderResourceState state)
     {
         ValidateResource(pass, resource, "read");
-        RegisterDiagnosticAccess(pass, resource, RenderResourceAccessKind.Read);
+        ValidateResourceState(pass, resource, state);
+        RegisterDiagnosticAccess(pass, resource, RenderGraphResourceAccessKind.Read, state);
         ref var access = ref GetResourceAccess(resource);
 
         if (access.LastWriter != null)
@@ -153,10 +165,11 @@ public sealed class RenderGraph : IDisposable
         }
     }
 
-    internal void RegisterWrite(RenderPassNode pass, RenderResource resource)
+    internal void RegisterWrite(RenderPassNode pass, RenderResource resource, RenderResourceState state)
     {
         ValidateResource(pass, resource, "write");
-        RegisterDiagnosticAccess(pass, resource, RenderResourceAccessKind.Write);
+        ValidateResourceState(pass, resource, state);
+        RegisterDiagnosticAccess(pass, resource, RenderGraphResourceAccessKind.Write, state);
         ref var access = ref GetResourceAccess(resource);
 
         if (access.LastWriter != null)
@@ -173,9 +186,13 @@ public sealed class RenderGraph : IDisposable
         access.LastWriter = pass;
     }
 
-    private void RegisterDiagnosticAccess(RenderPassNode pass, RenderResource resource, RenderResourceAccessKind kind)
+    private void RegisterDiagnosticAccess(
+        RenderPassNode pass,
+        RenderResource resource,
+        RenderGraphResourceAccessKind kind,
+        RenderResourceState state)
     {
-        m_ResourceAccessEvents.Add(new RenderResourceAccess(resource.ResourceId, pass.Id, kind));
+        m_ResourceAccessEvents.Add(new RenderGraphResourceAccess(resource.ResourceId, pass.Id, kind, state));
     }
 
     private ref ResourceAccessState GetResourceAccess(RenderResource resource)
@@ -214,6 +231,27 @@ public sealed class RenderGraph : IDisposable
             "Create transient resources from the current RenderGraph and do not cache them across frames.");
     }
 
+    private static void ValidateResourceState(
+        RenderPassNode pass,
+        RenderResource resource,
+        RenderResourceState state)
+    {
+        if (state == RenderResourceState.Unknown)
+        {
+            throw new InvalidOperationException(
+                $"Render pass '{pass.Name}' declared unknown state for resource '{resource}'.");
+        }
+
+        if (resource.Type == RenderResourceType.Buffer &&
+            (state == RenderResourceState.ColorAttachment ||
+             state == RenderResourceState.DepthAttachment ||
+             state == RenderResourceState.OutputOwnership))
+        {
+            throw new InvalidOperationException(
+                $"Render pass '{pass.Name}' declared {state} for buffer resource '{resource}'.");
+        }
+    }
+
     /// <summary>
     /// Wraps the pipeline-authored graph in engine-owned frame target setup/finalization passes.
     /// The setup pass is connected to every current root, and every current leaf is connected to
@@ -225,8 +263,16 @@ public sealed class RenderGraph : IDisposable
 
         AddPass(setupPass);
         AddPass(finalPass);
-        RegisterDiagnosticAccess(setupPass, FrameColor, RenderResourceAccessKind.Write);
-        RegisterDiagnosticAccess(finalPass, FrameColor, RenderResourceAccessKind.Read);
+        RegisterDiagnosticAccess(
+            setupPass,
+            FrameColor,
+            RenderGraphResourceAccessKind.Write,
+            RenderResourceState.ColorAttachment);
+        RegisterDiagnosticAccess(
+            finalPass,
+            FrameColor,
+            RenderGraphResourceAccessKind.Write,
+            RenderResourceState.OutputOwnership);
 
         if (userPasses.Length == 0)
         {
@@ -270,9 +316,10 @@ public sealed class RenderGraph : IDisposable
         m_Graph.Clear();
         m_Resources.Clear();
         m_Resources.Add(FrameColor);
+        m_Resources.Add(FrameDepth);
         m_ResourceAccess.Clear();
         m_ResourceAccessEvents.Clear();
-        m_NextResourceId = 1;
+        m_NextResourceId = 2;
     }
 
     /// <summary>
@@ -285,22 +332,25 @@ public sealed class RenderGraph : IDisposable
         m_Factory = factory; // B1: Store factory for safe resource cleanup on Dispose
         var diagnosticsEnabled = ShouldLogDiagnostics(context);
         var layout = GetOrCompileLayout(out var compileCacheHit);
+        var transitionPlan = BuildResourceTransitionPlan(layout);
 
         Profiler.PlotValue("RenderGraph.PassCount", layout.SortedNodeIds.Length);
         Profiler.PlotValue("RenderGraph.LayerCount", layout.ParallelLayerNodeIds.Length);
         Profiler.PlotValue("RenderGraph.CompileCacheHit", compileCacheHit ? 1 : 0);
-        Profiler.PlotValue("RenderGraph.CulledPassCount", 0);
+        Profiler.PlotValue("RenderGraph.CulledPassCount", layout.Culling.CulledCount);
+        Profiler.PlotValue("RenderGraph.ResourceTransitionCount", transitionPlan.Length);
         uint surfaceId = context.SurfaceId;
 
         if (diagnosticsEnabled)
         {
             LogCompiledGraph(layout, compileCacheHit);
+            LogResourceTransitionDiagnostics(transitionPlan);
             m_DiagnosticsLoggedOnce = true;
         }
 
         try
         {
-            return ExecuteCompiled(context, factory, layout, surfaceId, diagnosticsEnabled);
+            return ExecuteCompiled(context, factory, layout, transitionPlan, surfaceId, diagnosticsEnabled);
         }
         finally
         {
@@ -322,8 +372,12 @@ public sealed class RenderGraph : IDisposable
         {
             try
             {
-                var compiled = GraphCompiler.Compile(m_Graph);
-                m_CachedLayout = CreateLayout(signature, compiled);
+                var uncullCompiled = GraphCompiler.Compile(m_Graph);
+                var culling = CullDeadPasses(uncullCompiled);
+                var compiled = culling.CulledCount > 0
+                    ? GraphCompiler.Compile(m_Graph)
+                    : uncullCompiled;
+                m_CachedLayout = CreateLayout(signature, compiled, culling);
                 cacheHit = false;
                 return m_CachedLayout;
             }
@@ -334,7 +388,10 @@ public sealed class RenderGraph : IDisposable
         }
     }
 
-    private static CompiledRenderGraphLayout CreateLayout(ulong signature, CompiledGraph<RenderPassNode> compiled)
+    private static CompiledRenderGraphLayout CreateLayout(
+        ulong signature,
+        CompiledGraph<RenderPassNode> compiled,
+        RenderGraphCullingResult culling)
     {
         var sortedNodeIds = new uint[compiled.SortedNodes.Count];
         for (int i = 0; i < compiled.SortedNodes.Count; i++)
@@ -355,13 +412,104 @@ public sealed class RenderGraph : IDisposable
             parallelLayerNodeIds[layerIndex] = layerNodeIds;
         }
 
-        return new CompiledRenderGraphLayout(signature, sortedNodeIds, parallelLayerNodeIds);
+        return new CompiledRenderGraphLayout(signature, sortedNodeIds, parallelLayerNodeIds, culling);
+    }
+
+    private RenderGraphCullingResult CullDeadPasses(CompiledGraph<RenderPassNode> uncullCompiled)
+    {
+        if (m_Graph.Nodes.Count == 0)
+        {
+            return new RenderGraphCullingResult(Array.Empty<uint>(), Array.Empty<string>());
+        }
+
+        var liveNodeIds = new HashSet<uint>();
+        for (int i = 0; i < m_ResourceAccessEvents.Count; i++)
+        {
+            var access = m_ResourceAccessEvents[i];
+            if (access.Kind == RenderGraphResourceAccessKind.Write &&
+                access.State == RenderResourceState.OutputOwnership)
+            {
+                liveNodeIds.Add(access.PassNodeId);
+            }
+        }
+
+        foreach (var pass in m_Graph.Nodes)
+        {
+            if (!PassHasDeclaredWrite(pass.Id))
+            {
+                liveNodeIds.Add(pass.Id);
+            }
+        }
+
+        if (liveNodeIds.Count == 0)
+        {
+            return new RenderGraphCullingResult(Array.Empty<uint>(), Array.Empty<string>());
+        }
+
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            for (int nodeIndex = uncullCompiled.SortedNodes.Count - 1; nodeIndex >= 0; nodeIndex--)
+            {
+                var pass = uncullCompiled.SortedNodes[nodeIndex];
+                if (!liveNodeIds.Contains(pass.Id))
+                {
+                    continue;
+                }
+
+                var hasOutputOwnership = PassHasOutputOwnership(pass.Id);
+                if (AddResourceProducersBefore(pass.Id, liveNodeIds, uncullCompiled.SortedNodes))
+                {
+                    changed = true;
+                }
+
+                if (hasOutputOwnership)
+                {
+                    continue;
+                }
+
+                foreach (var edge in m_Graph.Edges)
+                {
+                    if (edge.TargetNodeId == pass.Id && liveNodeIds.Add(edge.SourceNodeId))
+                    {
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        var culledNodeIds = new List<uint>();
+        var culledPassNames = new List<string>();
+        foreach (var pass in m_Graph.Nodes.ToArray())
+        {
+            if (liveNodeIds.Contains(pass.Id))
+            {
+                continue;
+            }
+
+            culledNodeIds.Add(pass.Id);
+            culledPassNames.Add($"{pass.Name}#{pass.Id}");
+        }
+
+        if (culledNodeIds.Count == 0)
+        {
+            return new RenderGraphCullingResult(Array.Empty<uint>(), Array.Empty<string>());
+        }
+
+        for (int i = 0; i < culledNodeIds.Count; i++)
+        {
+            m_Graph.RemoveNode(culledNodeIds[i]);
+        }
+
+        return new RenderGraphCullingResult(culledNodeIds.ToArray(), culledPassNames.ToArray());
     }
 
     private ulong ExecuteCompiled(
         RenderContext context,
         RHIFactory factory,
         CompiledRenderGraphLayout layout,
+        RenderGraphResourceTransition[] transitionPlan,
         uint surfaceId,
         bool diagnosticsEnabled)
     {
@@ -460,6 +608,7 @@ public sealed class RenderGraph : IDisposable
                             cmdBuffer.Begin();
                             try
                             {
+                                RecordPlannedTransitionsForPass(context, cmdBuffer, transitionPlan, node.Id, workItem);
                                 node.RecordWorkItem(context, cmdBuffer, workItem);
                             }
                             finally
@@ -545,6 +694,155 @@ public sealed class RenderGraph : IDisposable
         return !m_DiagnosticsLoggedOnce || context.FrameIndex % DiagnosticsFrameInterval == 0;
     }
 
+    private void RecordPlannedTransitionsForPass(
+        RenderContext context,
+        RHICommandBuffer commandBuffer,
+        RenderGraphResourceTransition[] transitionPlan,
+        uint passNodeId,
+        RenderPassWorkItem workItem)
+    {
+        if (transitionPlan.Length == 0 || workItem.Index != 0)
+        {
+            return;
+        }
+
+        for (int i = 0; i < transitionPlan.Length; i++)
+        {
+            var transition = transitionPlan[i];
+            if (transition.BeforePassNodeId != passNodeId)
+            {
+                continue;
+            }
+
+            if (transition.ResourceId != FrameColor.ResourceId)
+            {
+                continue;
+            }
+
+            RecordFrameColorTransition(context, commandBuffer, transition);
+        }
+    }
+
+    private static void RecordFrameColorTransition(
+        RenderContext context,
+        RHICommandBuffer commandBuffer,
+        RenderGraphResourceTransition transition)
+    {
+        if (!TryBuildFrameColorBarrier(context, transition.FromState, transition.ToState, out var barrier))
+        {
+            return;
+        }
+
+        commandBuffer.PipelineBarrier(
+            barrier.SrcStageMask,
+            barrier.DstStageMask,
+            MemoryMarshal.CreateReadOnlySpan(ref barrier, 1));
+    }
+
+    private static bool TryBuildFrameColorBarrier(
+        RenderContext context,
+        RenderResourceState fromState,
+        RenderResourceState toState,
+        out RHIImageMemoryBarrier barrier)
+    {
+        barrier = default;
+
+        if (fromState == toState)
+        {
+            return false;
+        }
+
+        if (context.TargetImage.IsValid == false)
+        {
+            return false;
+        }
+
+        var from = MapFrameColorState(context, fromState, isSource: true);
+        var to = MapFrameColorState(context, toState, isSource: false);
+        barrier = new RHIImageMemoryBarrier
+        {
+            SrcAccessMask = from.Access,
+            DstAccessMask = to.Access,
+            OldLayout = from.Layout,
+            NewLayout = to.Layout,
+            SrcQueueFamilyIndex = from.QueueFamily,
+            DstQueueFamilyIndex = to.QueueFamily,
+            Image = context.TargetImage,
+            SubresourceRange = RHIImageSubresourceRange.Color2D(),
+            SrcStageMask = from.Stage,
+            DstStageMask = to.Stage
+        };
+
+        return true;
+    }
+
+    private static RenderFrameColorRhiState MapFrameColorState(
+        RenderContext context,
+        RenderResourceState state,
+        bool isSource)
+    {
+        return state switch
+        {
+            RenderResourceState.OutputOwnership => new RenderFrameColorRhiState(
+                isSource && context.OutputKind != RenderOutputKind.EditorSharedTexture
+                    ? EImageLayout.IMAGE_LAYOUT_UNDEFINED
+                    : EImageLayout.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                isSource || context.OutputKind == RenderOutputKind.EditorSharedTexture
+                    ? EAccessFlag.ACCESS_NONE
+                    : EAccessFlag.ACCESS_TRANSFER_READ_BIT,
+                context.OutputKind == RenderOutputKind.EditorSharedTexture
+                    ? RHIQueueFamily.External
+                    : RHIQueueFamily.Ignored,
+                isSource
+                    ? EPipelineStageFlagBits.PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                    : (context.OutputKind == RenderOutputKind.EditorSharedTexture
+                        ? EPipelineStageFlagBits.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
+                        : EPipelineStageFlagBits.PIPELINE_STAGE_TRANSFER_BIT)),
+            RenderResourceState.ColorAttachment => new RenderFrameColorRhiState(
+                EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                EAccessFlag.ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                RHIQueueFamily.Ignored,
+                EPipelineStageFlagBits.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT),
+            RenderResourceState.TransferRead => new RenderFrameColorRhiState(
+                EImageLayout.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                EAccessFlag.ACCESS_TRANSFER_READ_BIT,
+                RHIQueueFamily.Ignored,
+                EPipelineStageFlagBits.PIPELINE_STAGE_TRANSFER_BIT),
+            RenderResourceState.TransferWrite => new RenderFrameColorRhiState(
+                EImageLayout.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                EAccessFlag.ACCESS_TRANSFER_WRITE_BIT,
+                RHIQueueFamily.Ignored,
+                EPipelineStageFlagBits.PIPELINE_STAGE_TRANSFER_BIT),
+            RenderResourceState.ShaderRead => new RenderFrameColorRhiState(
+                EImageLayout.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                EAccessFlag.ACCESS_SHADER_READ_BIT,
+                RHIQueueFamily.Ignored,
+                EPipelineStageFlagBits.PIPELINE_STAGE_FRAGMENT_SHADER_BIT),
+            _ => throw new InvalidOperationException(
+                $"FrameColor does not support graph transition state '{state}'.")
+        };
+    }
+
+    private readonly struct RenderFrameColorRhiState
+    {
+        public RenderFrameColorRhiState(
+            EImageLayout layout,
+            EAccessFlag access,
+            uint queueFamily,
+            EPipelineStageFlagBits stage)
+        {
+            Layout = layout;
+            Access = access;
+            QueueFamily = queueFamily;
+            Stage = stage;
+        }
+
+        public EImageLayout Layout { get; }
+        public EAccessFlag Access { get; }
+        public uint QueueFamily { get; }
+        public EPipelineStageFlagBits Stage { get; }
+    }
+
     private RenderPassNode GetRequiredNode(uint nodeId)
     {
         var node = m_Graph.GetNode(nodeId);
@@ -555,7 +853,6 @@ public sealed class RenderGraph : IDisposable
 
         return node;
     }
-
     private static void AppendLayerDiagnostic(StringBuilder? builder, RenderPassNode node, int workItemCount)
     {
         if (builder == null)
@@ -625,8 +922,7 @@ public sealed class RenderGraph : IDisposable
         }
 
         LogResourceAccessDiagnostics(layout);
-        Logger.Log(
-            "[RenderGraph] Culling: 0 culled passes; pass culling planner is not enabled for the current runtime slice.");
+        LogPassCullingDiagnostics(layout.Culling);
     }
 
     private void LogResourceAccessDiagnostics(CompiledRenderGraphLayout layout)
@@ -662,7 +958,7 @@ public sealed class RenderGraph : IDisposable
                 chain.Append('#');
                 chain.Append(pass.Id);
                 chain.Append('[');
-                AppendAccessMask(chain, accessMask);
+                AppendAccessMask(chain, resource.ResourceId, nodeId, accessMask);
                 chain.Append(']');
                 accessCount++;
             }
@@ -677,27 +973,201 @@ public sealed class RenderGraph : IDisposable
         }
     }
 
-    private int GetResourceAccessMask(uint resourceId, uint nodeId)
+    private RenderGraphResourceTransition[] BuildResourceTransitionPlan(CompiledRenderGraphLayout layout)
     {
-        var mask = 0;
+        return RenderGraphResourcePlanner.BuildTransitionPlan(
+            m_Resources,
+            layout.SortedNodeIds,
+            m_ResourceAccessEvents,
+            nodeId => GetRequiredNode(nodeId).Name);
+    }
+
+    private bool TryGetResourceAccessState(
+        uint resourceId,
+        uint nodeId,
+        out RenderResourceState state,
+        out int accessMask)
+    {
+        state = RenderResourceState.Unknown;
+        accessMask = 0;
+        return RenderGraphResourcePlanner.TryGetAccessState(
+            m_ResourceAccessEvents,
+            resourceId,
+            nodeId,
+            GetResourceName(resourceId),
+            node => GetRequiredNode(node).Name,
+            out state,
+            out accessMask);
+    }
+
+    private bool PassHasDeclaredWrite(uint nodeId)
+    {
         for (int i = 0; i < m_ResourceAccessEvents.Count; i++)
         {
             var access = m_ResourceAccessEvents[i];
-            if (access.ResourceId != resourceId || access.PassNodeId != nodeId)
+            if (access.PassNodeId == nodeId && access.Kind == RenderGraphResourceAccessKind.Write)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool PassHasOutputOwnership(uint nodeId)
+    {
+        for (int i = 0; i < m_ResourceAccessEvents.Count; i++)
+        {
+            var access = m_ResourceAccessEvents[i];
+            if (access.PassNodeId == nodeId &&
+                access.Kind == RenderGraphResourceAccessKind.Write &&
+                access.State == RenderResourceState.OutputOwnership)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool AddResourceProducersBefore(
+        uint consumerNodeId,
+        HashSet<uint> liveNodeIds,
+        IReadOnlyList<RenderPassNode> sortedNodes)
+    {
+        var changed = false;
+        for (int i = 0; i < m_ResourceAccessEvents.Count; i++)
+        {
+            var access = m_ResourceAccessEvents[i];
+            if (access.PassNodeId != consumerNodeId)
             {
                 continue;
             }
 
-            mask |= access.Kind == RenderResourceAccessKind.Read ? 1 : 2;
+            if (access.Kind != RenderGraphResourceAccessKind.Read &&
+                access.State != RenderResourceState.OutputOwnership)
+            {
+                continue;
+            }
+
+            if (TryFindLastResourceWriterBefore(
+                    access.ResourceId,
+                    consumerNodeId,
+                    sortedNodes,
+                    out var producerNodeId) &&
+                liveNodeIds.Add(producerNodeId))
+            {
+                changed = true;
+            }
         }
 
-        return mask;
+        return changed;
     }
 
-    private static void AppendAccessMask(StringBuilder builder, int accessMask)
+    private bool TryFindLastResourceWriterBefore(
+        uint resourceId,
+        uint consumerNodeId,
+        IReadOnlyList<RenderPassNode> sortedNodes,
+        out uint producerNodeId)
+    {
+        producerNodeId = 0;
+        for (int nodeIndex = 0; nodeIndex < sortedNodes.Count; nodeIndex++)
+        {
+            var nodeId = sortedNodes[nodeIndex].Id;
+            if (nodeId == consumerNodeId)
+            {
+                return producerNodeId != 0;
+            }
+
+            if (PassWritesResource(nodeId, resourceId))
+            {
+                producerNodeId = nodeId;
+            }
+        }
+
+        return false;
+    }
+
+    private bool PassWritesResource(uint nodeId, uint resourceId)
+    {
+        for (int i = 0; i < m_ResourceAccessEvents.Count; i++)
+        {
+            var access = m_ResourceAccessEvents[i];
+            if (access.PassNodeId == nodeId &&
+                access.ResourceId == resourceId &&
+                access.Kind == RenderGraphResourceAccessKind.Write)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void LogPassCullingDiagnostics(RenderGraphCullingResult culling)
+    {
+        if (culling.CulledCount == 0)
+        {
+            Logger.Log("[RenderGraph] Culling: 0 culled passes.");
+            return;
+        }
+
+        var summary = new StringBuilder(96);
+        for (int i = 0; i < culling.CulledPassNames.Length; i++)
+        {
+            if (i > 0)
+            {
+                summary.Append(", ");
+            }
+
+            summary.Append(culling.CulledPassNames[i]);
+        }
+
+        Logger.Log($"[RenderGraph] Culling: {culling.CulledCount} culled passes: {summary}");
+    }
+
+    private void LogResourceTransitionDiagnostics(RenderGraphResourceTransition[] transitions)
+    {
+        if (transitions.Length == 0)
+        {
+            Logger.Log("[RenderGraph] Resource transition plan: <none>");
+            return;
+        }
+
+        var summary = new StringBuilder(128);
+        for (int i = 0; i < transitions.Length; i++)
+        {
+            var transition = transitions[i];
+            if (i > 0)
+            {
+                summary.Append(" | ");
+            }
+
+            var pass = GetRequiredNode(transition.BeforePassNodeId);
+            summary.Append(GetResourceName(transition.ResourceId));
+            summary.Append(": ");
+            summary.Append(transition.FromState);
+            summary.Append(" -> ");
+            summary.Append(transition.ToState);
+            summary.Append(" before ");
+            summary.Append(pass.Name);
+            summary.Append('#');
+            summary.Append(pass.Id);
+        }
+
+        Logger.Log($"[RenderGraph] Resource transition plan ({transitions.Length}): {summary}");
+    }
+
+    private int GetResourceAccessMask(uint resourceId, uint nodeId)
+    {
+        return RenderGraphResourcePlanner.GetAccessMask(m_ResourceAccessEvents, resourceId, nodeId);
+    }
+
+    private void AppendAccessMask(StringBuilder builder, uint resourceId, uint nodeId, int accessMask)
     {
         var hasRead = (accessMask & 1) != 0;
         var hasWrite = (accessMask & 2) != 0;
+        TryGetResourceAccessState(resourceId, nodeId, out var state, out _);
 
         if (hasRead)
         {
@@ -713,6 +1183,25 @@ public sealed class RenderGraph : IDisposable
 
             builder.Append("write");
         }
+
+        if (state != RenderResourceState.Unknown)
+        {
+            builder.Append(':');
+            builder.Append(state);
+        }
+    }
+
+    private string GetResourceName(uint resourceId)
+    {
+        for (int i = 0; i < m_Resources.Count; i++)
+        {
+            if (m_Resources[i].ResourceId == resourceId)
+            {
+                return m_Resources[i].ToString();
+            }
+        }
+
+        return $"Resource#{resourceId}";
     }
 
     private string BuildGraphSummary()
@@ -748,6 +1237,16 @@ public sealed class RenderGraph : IDisposable
                 Mix(ref hash, (uint)edge.SourcePortIndex);
                 Mix(ref hash, edge.TargetNodeId);
                 Mix(ref hash, (uint)edge.TargetPortIndex);
+            }
+
+            Mix(ref hash, (ulong)m_ResourceAccessEvents.Count);
+            for (int i = 0; i < m_ResourceAccessEvents.Count; i++)
+            {
+                var access = m_ResourceAccessEvents[i];
+                Mix(ref hash, access.ResourceId);
+                Mix(ref hash, access.PassNodeId);
+                Mix(ref hash, (uint)access.Kind);
+                Mix(ref hash, (uint)access.State);
             }
 
             return hash;

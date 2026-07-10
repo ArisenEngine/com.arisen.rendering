@@ -2,7 +2,7 @@ namespace ArisenEngine.Rendering;
 
 /// <summary>
 /// A single CPU command-recording unit for a RenderGraph pass.
-/// Draw ranges point into RenderFrameSnapshot.DrawList.
+/// Draw ranges point into a pass-defined prepared draw span.
 /// </summary>
 public readonly struct RenderPassWorkItem
 {

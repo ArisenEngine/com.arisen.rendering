@@ -22,7 +22,9 @@ public readonly unsafe struct RenderFrameSnapshot
         Camera* cameraPtr,
         int cameraCount,
         MeshDrawCommand* drawListPtr,
-        int drawListCount)
+        int drawListCount,
+        StaticMeshRenderItem* staticMeshItemPtr,
+        int staticMeshItemCount)
     {
         Device = device;
         SwapChain = swapChain;
@@ -37,6 +39,8 @@ public readonly unsafe struct RenderFrameSnapshot
         CameraCount = cameraCount;
         DrawListPtr = drawListPtr;
         DrawListCount = drawListCount;
+        StaticMeshItemPtr = staticMeshItemPtr;
+        StaticMeshItemCount = staticMeshItemCount;
     }
 
     public RHIDevice Device { get; }
@@ -52,7 +56,10 @@ public readonly unsafe struct RenderFrameSnapshot
     public int CameraCount { get; }
     public MeshDrawCommand* DrawListPtr { get; }
     public int DrawListCount { get; }
+    public StaticMeshRenderItem* StaticMeshItemPtr { get; }
+    public int StaticMeshItemCount { get; }
 
     public ReadOnlySpan<Camera> Cameras => new(CameraPtr, CameraCount);
     public ReadOnlySpan<MeshDrawCommand> DrawList => new(DrawListPtr, DrawListCount);
+    public ReadOnlySpan<StaticMeshRenderItem> StaticMeshItems => new(StaticMeshItemPtr, StaticMeshItemCount);
 }

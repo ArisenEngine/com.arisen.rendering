@@ -23,7 +23,7 @@ public sealed class RenderGraphBuilder
     public RenderGraphBuilder Read(RenderResource resource)
     {
         ArgumentNullException.ThrowIfNull(resource);
-        m_Graph.RegisterRead(m_Pass, resource);
+        m_Graph.RegisterRead(m_Pass, resource, RenderResourceState.ShaderRead);
         return this;
     }
 
@@ -33,7 +33,63 @@ public sealed class RenderGraphBuilder
     public RenderGraphBuilder Write(RenderResource resource)
     {
         ArgumentNullException.ThrowIfNull(resource);
-        m_Graph.RegisterWrite(m_Pass, resource);
+        m_Graph.RegisterWrite(m_Pass, resource, RenderResourceState.TransferWrite);
+        return this;
+    }
+
+    public RenderGraphBuilder Read(RenderResource resource, RenderResourceState state)
+    {
+        ArgumentNullException.ThrowIfNull(resource);
+        m_Graph.RegisterRead(m_Pass, resource, state);
+        return this;
+    }
+
+    public RenderGraphBuilder Write(RenderResource resource, RenderResourceState state)
+    {
+        ArgumentNullException.ThrowIfNull(resource);
+        m_Graph.RegisterWrite(m_Pass, resource, state);
+        return this;
+    }
+
+    public RenderGraphBuilder ReadColorAttachment(RenderResource resource)
+    {
+        return Read(resource, RenderResourceState.ColorAttachment);
+    }
+
+    public RenderGraphBuilder WriteColorAttachment(RenderResource resource)
+    {
+        return Write(resource, RenderResourceState.ColorAttachment);
+    }
+
+    public RenderGraphBuilder ReadDepthAttachment(RenderResource resource)
+    {
+        return Read(resource, RenderResourceState.DepthAttachment);
+    }
+
+    public RenderGraphBuilder WriteDepthAttachment(RenderResource resource)
+    {
+        return Write(resource, RenderResourceState.DepthAttachment);
+    }
+
+    public RenderGraphBuilder ReadShader(RenderResource resource)
+    {
+        return Read(resource, RenderResourceState.ShaderRead);
+    }
+
+    public RenderGraphBuilder ReadTransfer(RenderResource resource)
+    {
+        return Read(resource, RenderResourceState.TransferRead);
+    }
+
+    public RenderGraphBuilder WriteTransfer(RenderResource resource)
+    {
+        return Write(resource, RenderResourceState.TransferWrite);
+    }
+
+    public RenderGraphBuilder OwnOutput(RenderResource resource)
+    {
+        ArgumentNullException.ThrowIfNull(resource);
+        m_Graph.RegisterWrite(m_Pass, resource, RenderResourceState.OutputOwnership);
         return this;
     }
 
