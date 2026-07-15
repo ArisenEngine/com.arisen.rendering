@@ -2,12 +2,14 @@ using System.Buffers.Binary;
 using System.Text;
 using ArisenEngine.Core.Assets;
 using ArisenEngine.Core.Diagnostics;
+using StbImageSharp;
 
 namespace ArisenEngine.Rendering.Resources;
 
 public enum Texture2DSourceFormat
 {
-    PpmP3
+    PpmP3,
+    ImageFile
 }
 
 public enum Texture2DCookedFormat
@@ -160,6 +162,7 @@ public static class Texture2DAssetCooker
         var source = texture.SourceFormat switch
         {
             Texture2DSourceFormat.PpmP3 => ReadPpmP3(sourceAsset.SourcePath),
+            Texture2DSourceFormat.ImageFile => ReadImageFile(sourceAsset.SourcePath),
             _ => throw new NotSupportedException($"Texture source format '{texture.SourceFormat}' is not implemented yet.")
         };
 
@@ -245,6 +248,25 @@ public static class Texture2DAssetCooker
         }
 
         return new SourceTexture(width, height, pixels);
+    }
+
+    private static SourceTexture ReadImageFile(string sourcePath)
+    {
+        using var stream = File.OpenRead(sourcePath);
+        var image = ImageResult.FromStream(stream, ColorComponents.RedGreenBlueAlpha);
+        if (image.Width <= 0 || image.Height <= 0)
+        {
+            throw new InvalidOperationException($"[Texture2DAssetCooker] '{sourcePath}' has invalid image dimensions.");
+        }
+
+        var expectedLength = checked(image.Width * image.Height * 4);
+        if (image.Data.Length != expectedLength)
+        {
+            throw new InvalidOperationException(
+                $"[Texture2DAssetCooker] '{sourcePath}' decoded to {image.Data.Length} bytes, expected {expectedLength}.");
+        }
+
+        return new SourceTexture(checked((uint)image.Width), checked((uint)image.Height), image.Data);
     }
 
     private static byte ScaleToByte(uint value, uint maxValue)

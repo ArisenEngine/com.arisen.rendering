@@ -21,7 +21,7 @@ public abstract class RenderPipeline : IDisposable
         {
             // Acquire the shared TaskGraph from the kernel to enable parallel recording
             var taskGraph = EngineKernel.Instance.Services.GetService<ITaskGraph>();
-            m_RenderGraph = new RenderGraph(taskGraph);
+            m_RenderGraph = CreateRenderGraph(taskGraph);
         }
 
         // 1. Setup Phase: Derived pipelines register their content passes.
@@ -49,6 +49,11 @@ public abstract class RenderPipeline : IDisposable
     /// Hook for derived pipelines to define their frame structure by adding passes to the graph.
     /// </summary>
     protected abstract void SetupGraph(RenderGraph graph, RenderContext context);
+
+    protected virtual RenderGraph CreateRenderGraph(ITaskGraph taskGraph)
+    {
+        return new RenderGraph(taskGraph);
+    }
 
     protected virtual void OnFrameSubmitted(RenderContext context, ulong submittedTicket)
     {

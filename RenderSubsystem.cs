@@ -154,6 +154,21 @@ public class RenderSubsystem : ITickableSubsystem
                 ? RenderOutputKind.EditorSharedTexture
                 : RenderOutputKind.NativeSwapchain;
 
+            var concreteSurface = surface as RenderSurface;
+            if (outputKind == RenderOutputKind.EditorSharedTexture &&
+                concreteSurface != null &&
+                !concreteSurface.CanSubmitOutputFrame(frameIndex, RenderSurface.EditorSharedTextureMaxOutstandingFrames))
+            {
+                Profiler.PlotValue("Render.SharedTexturePacingSkipped", 1);
+                if (frameIndex % 60 == 0)
+                {
+                    Logger.Log(
+                        $"[RenderSubsystem] Shared texture pacing skipped frame | Surface: 0x{surface.SurfaceId:X} | Frame: {frameIndex} | LastConsumed: {surface.GetLastConsumedFrameIndex()}");
+                }
+
+                continue;
+            }
+
             var submission = GetOrCreateSubmission(surface.SurfaceId);
             if (!submission.Begin(
                     device,
@@ -190,11 +205,27 @@ public class RenderSubsystem : ITickableSubsystem
 
             Span<Camera> frameCameras = Span<Camera>.Empty;
             var cameraCount = 0;
+            Span<DirectionalLight> frameDirectionalLights = Span<DirectionalLight>.Empty;
+            var directionalLightCount = 0;
+            DirectionalLightExtractionStats directionalLightStats = default;
+            Span<PointLight> framePointLights = Span<PointLight>.Empty;
+            var pointLightCount = 0;
+            PointLightExtractionStats pointLightStats = default;
+            Span<SpotLight> frameSpotLights = Span<SpotLight>.Empty;
+            var spotLightCount = 0;
+            SpotLightExtractionStats spotLightStats = default;
+            SceneEnvironment frameSceneEnvironment = default;
+            var sceneEnvironmentCount = 0;
+            SceneEnvironmentExtractionStats sceneEnvironmentStats = default;
 
             if (entityManager != null)
             {
                 var cameraPool = entityManager.GetPool<CameraComponent>();
                 var transformPool = entityManager.GetPool<TransformComponent>();
+                var directionalLightPool = entityManager.GetPool<DirectionalLightComponent>();
+                var pointLightPool = entityManager.GetPool<PointLightComponent>();
+                var spotLightPool = entityManager.GetPool<SpotLightComponent>();
+                var sceneEnvironmentPool = entityManager.GetPool<SceneEnvironmentComponent>();
 
                 var cameraComponents = cameraPool.GetRawComponentArray();
                 var cameraEntities = cameraPool.GetRawEntityArray();
@@ -227,6 +258,67 @@ public class RenderSubsystem : ITickableSubsystem
 
                     frameCameras = frameCameras.Slice(0, cameraCount);
                 }
+
+                int lightCount = directionalLightPool.Count;
+                if (lightCount > 0)
+                {
+                    var lightComponents = directionalLightPool.GetRawComponentArray();
+                    int snapshotCapacity = Math.Min(
+                        lightCount,
+                        DirectionalLightSnapshotExtractor.MaxDirectionalLightsPerFrame);
+                    frameDirectionalLights = arena.Alloc<DirectionalLight>(snapshotCapacity);
+                    directionalLightStats = DirectionalLightSnapshotExtractor.Extract(
+                        lightComponents.AsSpan(0, lightCount),
+                        frameDirectionalLights);
+                    directionalLightCount = directionalLightStats.AcceptedCount;
+                    frameDirectionalLights = frameDirectionalLights.Slice(0, directionalLightCount);
+                }
+
+                int pointLightSourceCount = pointLightPool.Count;
+                if (pointLightSourceCount > 0)
+                {
+                    var pointLightComponents = pointLightPool.GetRawComponentArray();
+                    var pointLightEntities = pointLightPool.GetRawEntityArray();
+                    int snapshotCapacity = Math.Min(
+                        pointLightSourceCount,
+                        PointLightSnapshotExtractor.MaxPointLightsPerFrame);
+                    framePointLights = arena.Alloc<PointLight>(snapshotCapacity);
+                    pointLightStats = PointLightSnapshotExtractor.Extract(
+                        pointLightComponents.AsSpan(0, pointLightSourceCount),
+                        pointLightEntities.AsSpan(0, pointLightSourceCount),
+                        transformPool,
+                        framePointLights);
+                    pointLightCount = pointLightStats.AcceptedCount;
+                    framePointLights = framePointLights.Slice(0, pointLightCount);
+                }
+
+                int spotLightSourceCount = spotLightPool.Count;
+                if (spotLightSourceCount > 0)
+                {
+                    var spotLightComponents = spotLightPool.GetRawComponentArray();
+                    var spotLightEntities = spotLightPool.GetRawEntityArray();
+                    int snapshotCapacity = Math.Min(
+                        spotLightSourceCount,
+                        SpotLightSnapshotExtractor.MaxSpotLightsPerFrame);
+                    frameSpotLights = arena.Alloc<SpotLight>(snapshotCapacity);
+                    spotLightStats = SpotLightSnapshotExtractor.Extract(
+                        spotLightComponents.AsSpan(0, spotLightSourceCount),
+                        spotLightEntities.AsSpan(0, spotLightSourceCount),
+                        transformPool,
+                        frameSpotLights);
+                    spotLightCount = spotLightStats.AcceptedCount;
+                    frameSpotLights = frameSpotLights.Slice(0, spotLightCount);
+                }
+
+                int environmentCount = sceneEnvironmentPool.Count;
+                if (environmentCount > 0)
+                {
+                    var environmentComponents = sceneEnvironmentPool.GetRawComponentArray();
+                    sceneEnvironmentStats = SceneEnvironmentSnapshotExtractor.Extract(
+                        environmentComponents.AsSpan(0, environmentCount),
+                        out frameSceneEnvironment);
+                    sceneEnvironmentCount = sceneEnvironmentStats.AcceptedCount;
+                }
             }
 
             ulong ticket = 0;
@@ -234,6 +326,9 @@ public class RenderSubsystem : ITickableSubsystem
             unsafe
             {
                 fixed (Camera* pCameras = frameCameras)
+                fixed (DirectionalLight* pDirectionalLights = frameDirectionalLights)
+                fixed (PointLight* pPointLights = framePointLights)
+                fixed (SpotLight* pSpotLights = frameSpotLights)
                 fixed (MeshDrawCommand* pDrawList = frameDrawList)
                 fixed (StaticMeshRenderItem* pStaticMeshItems = frameStaticMeshItems)
                 {
@@ -249,6 +344,14 @@ public class RenderSubsystem : ITickableSubsystem
                         surface.Height,
                         pCameras,
                         cameraCount,
+                        pDirectionalLights,
+                        directionalLightCount,
+                        pPointLights,
+                        pointLightCount,
+                        pSpotLights,
+                        spotLightCount,
+                        frameSceneEnvironment,
+                        sceneEnvironmentCount,
                         pDrawList,
                         frameDrawList.Length,
                         pStaticMeshItems,
@@ -258,12 +361,57 @@ public class RenderSubsystem : ITickableSubsystem
                     Profiler.PlotValue("Render.DrawCount", snapshot.DrawListCount);
                     Profiler.PlotValue("Render.StaticMeshItemCount", snapshot.StaticMeshItemCount);
                     Profiler.PlotValue("Render.CameraCount", snapshot.CameraCount);
+                    Profiler.PlotValue("Render.DirectionalLightCount", snapshot.DirectionalLightCount);
+                    Profiler.PlotValue("Render.DirectionalLightSourceCount", directionalLightStats.SourceCount);
+                    Profiler.PlotValue("Render.DirectionalLightEnabledCount", directionalLightStats.EnabledCount);
+                    Profiler.PlotValue("Render.DirectionalLightDroppedCount", directionalLightStats.DroppedCount);
+                    Profiler.PlotValue("Render.PointLightCount", snapshot.PointLightCount);
+                    Profiler.PlotValue("Render.PointLightSourceCount", pointLightStats.SourceCount);
+                    Profiler.PlotValue("Render.PointLightEnabledCount", pointLightStats.EnabledCount);
+                    Profiler.PlotValue("Render.PointLightDroppedCount", pointLightStats.DroppedCount);
+                    Profiler.PlotValue("Render.PointLightMissingTransformCount", pointLightStats.MissingTransformCount);
+                    Profiler.PlotValue("Render.SpotLightCount", snapshot.SpotLightCount);
+                    Profiler.PlotValue("Render.SpotLightSourceCount", spotLightStats.SourceCount);
+                    Profiler.PlotValue("Render.SpotLightEnabledCount", spotLightStats.EnabledCount);
+                    Profiler.PlotValue("Render.SpotLightDroppedCount", spotLightStats.DroppedCount);
+                    Profiler.PlotValue("Render.SpotLightMissingTransformCount", spotLightStats.MissingTransformCount);
+                    Profiler.PlotValue("Render.SceneEnvironmentCount", snapshot.SceneEnvironmentCount);
+                    Profiler.PlotValue("Render.SceneEnvironmentSourceCount", sceneEnvironmentStats.SourceCount);
+                    Profiler.PlotValue("Render.SceneEnvironmentEnabledCount", sceneEnvironmentStats.EnabledCount);
+                    Profiler.PlotValue("Render.SceneEnvironmentDroppedCount", sceneEnvironmentStats.DroppedCount);
                     Profiler.PlotValue("Render.OutputWidth", snapshot.Width);
                     Profiler.PlotValue("Render.OutputHeight", snapshot.Height);
 
                     if (frameIndex % 60 == 0)
                     {
-                        Logger.Log($"[RenderSubsystem] FrameSnapshot | Frame: {snapshot.FrameIndex} | Surface: 0x{snapshot.SurfaceId:X} | Size: {snapshot.Width}x{snapshot.Height} | Cameras: {snapshot.CameraCount} | Draws: {snapshot.DrawListCount} | StaticMeshItems: {snapshot.StaticMeshItemCount} | Output: {snapshot.OutputKind}");
+                        Logger.Log($"[RenderSubsystem] FrameSnapshot | Frame: {snapshot.FrameIndex} | Surface: 0x{snapshot.SurfaceId:X} | Size: {snapshot.Width}x{snapshot.Height} | Cameras: {snapshot.CameraCount} | DirectionalLights: {snapshot.DirectionalLightCount}/{directionalLightStats.EnabledCount} enabled ({directionalLightStats.SourceCount} source) | PointLights: {snapshot.PointLightCount}/{pointLightStats.EnabledCount} enabled ({pointLightStats.SourceCount} source) | SpotLights: {snapshot.SpotLightCount}/{spotLightStats.EnabledCount} enabled ({spotLightStats.SourceCount} source) | Environments: {snapshot.SceneEnvironmentCount}/{sceneEnvironmentStats.EnabledCount} enabled ({sceneEnvironmentStats.SourceCount} source) | Draws: {snapshot.DrawListCount} | StaticMeshItems: {snapshot.StaticMeshItemCount} | Output: {snapshot.OutputKind}");
+                        if (directionalLightStats.DroppedCount > 0)
+                        {
+                            Logger.Warning(
+                                $"[RenderSubsystem] Directional light frame limit exceeded for surface 0x{snapshot.SurfaceId:X}. " +
+                                $"Accepted the first {DirectionalLightSnapshotExtractor.MaxDirectionalLightsPerFrame} enabled light(s) and dropped {directionalLightStats.DroppedCount}.");
+                        }
+
+                        if (pointLightStats.DroppedCount > 0)
+                        {
+                            Logger.Warning(
+                                $"[RenderSubsystem] Point light frame limit or transform requirement exceeded for surface 0x{snapshot.SurfaceId:X}. " +
+                                $"Accepted the first {PointLightSnapshotExtractor.MaxPointLightsPerFrame} enabled light(s), dropped {pointLightStats.DroppedCount}, missing transforms {pointLightStats.MissingTransformCount}.");
+                        }
+
+                        if (spotLightStats.DroppedCount > 0)
+                        {
+                            Logger.Warning(
+                                $"[RenderSubsystem] Spot light frame limit or transform requirement exceeded for surface 0x{snapshot.SurfaceId:X}. " +
+                                $"Accepted the first {SpotLightSnapshotExtractor.MaxSpotLightsPerFrame} enabled light(s), dropped {spotLightStats.DroppedCount}, missing transforms {spotLightStats.MissingTransformCount}.");
+                        }
+
+                        if (sceneEnvironmentStats.DroppedCount > 0)
+                        {
+                            Logger.Warning(
+                                $"[RenderSubsystem] Scene environment frame limit exceeded for surface 0x{snapshot.SurfaceId:X}. " +
+                                $"Accepted the first {SceneEnvironmentSnapshotExtractor.MaxEnvironmentsPerFrame} enabled environment(s) and dropped {sceneEnvironmentStats.DroppedCount}.");
+                        }
                     }
 
                     // B11: RenderDoc Integration
@@ -296,7 +444,7 @@ public class RenderSubsystem : ITickableSubsystem
                     // Instead of stalling the CPU here (which slows down the simulation),
                     // we pass the ticket to the surface so the consumer (Editor Viewport)
                     // can perform a targeted asynchronous wait.
-                    if (surface is RenderSurface concreteSurface)
+                    if (concreteSurface != null)
                     {
                         var pid = System.Diagnostics.Process.GetCurrentProcess().Id;
                         var sharedHandle = surface.GetSharedHandle(context.FrameIndex);

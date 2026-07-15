@@ -11,6 +11,8 @@ namespace ArisenEngine.Rendering;
 
 public class RenderSurface : IRenderSurface
 {
+    internal const uint EditorSharedTextureMaxOutstandingFrames = 3;
+
     internal List<RenderSurface> Surfaces = new();
 
     private readonly object m_OutputLock = new();
@@ -27,6 +29,7 @@ public class RenderSurface : IRenderSurface
     private uint m_LastRenderHeight;
     private uint m_ResizeGeneration;
     private uint m_LastRenderResizeGeneration;
+    private RenderOutputFramePacingState m_FramePacing;
     private RHISwapChain? m_LastRenderSwapChain;
     private Core.RHI.RHISurface? m_NativeSurface;
     private RHISwapChain? m_CachedSwapChain;
@@ -131,10 +134,12 @@ public class RenderSurface : IRenderSurface
             m_ResizeGeneration++;
             m_LastTicket = 0;
             m_LastFrameIndex = 0;
+            m_LastConsumedFrameIndex = 0;
             m_LastRenderWidth = 0;
             m_LastRenderHeight = 0;
             m_LastRenderSwapChain = null;
             m_CachedSwapChain = null;
+            m_FramePacing.Reset();
         }
 
         // B101: Professional Virtual Surface Resizing.
@@ -333,10 +338,28 @@ public class RenderSurface : IRenderSurface
 
     public void ReportConsumedFrameIndex(uint frameIndex)
     {
-        m_LastConsumedFrameIndex = frameIndex;
+        lock (m_OutputLock)
+        {
+            m_FramePacing.MarkConsumed(frameIndex);
+            m_LastConsumedFrameIndex = m_FramePacing.LastConsumedFrameIndex;
+        }
     }
 
-    public uint GetLastConsumedFrameIndex() => m_LastConsumedFrameIndex;
+    public uint GetLastConsumedFrameIndex()
+    {
+        lock (m_OutputLock)
+        {
+            return m_LastConsumedFrameIndex;
+        }
+    }
+
+    internal bool CanSubmitOutputFrame(uint frameIndex, uint maxOutstandingFrames)
+    {
+        lock (m_OutputLock)
+        {
+            return m_FramePacing.CanSubmit(frameIndex, maxOutstandingFrames);
+        }
+    }
 
     internal void SetLastRenderTicket(ulong ticket, uint frameIndex, uint width, uint height, RHISwapChain swapChain)
     {
@@ -348,6 +371,7 @@ public class RenderSurface : IRenderSurface
             m_LastRenderHeight = height;
             m_LastRenderResizeGeneration = m_ResizeGeneration;
             m_LastRenderSwapChain = swapChain;
+            m_FramePacing.MarkSubmitted(frameIndex);
         }
     }
 

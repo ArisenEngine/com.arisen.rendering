@@ -154,6 +154,21 @@ public sealed class RHIStaticMeshResource : IDisposable
     public MeshDrawCommand CreateDrawCommand(Matrix4x4 localToWorld, uint materialId, int submeshIndex = 0)
     {
         var submesh = GetSubmeshOrDefault(submeshIndex);
+        return CreateDrawCommand(localToWorld, materialId, submesh, applyMaterialSlot: true);
+    }
+
+    public MeshDrawCommand CreateDrawCommandWithMaterialOverride(Matrix4x4 localToWorld, uint materialId, int submeshIndex = 0)
+    {
+        var submesh = GetSubmeshOrDefault(submeshIndex);
+        return CreateDrawCommand(localToWorld, materialId, submesh, applyMaterialSlot: false);
+    }
+
+    private MeshDrawCommand CreateDrawCommand(
+        Matrix4x4 localToWorld,
+        uint materialId,
+        MeshSubmesh submesh,
+        bool applyMaterialSlot)
+    {
         return new MeshDrawCommand
         {
             LocalToWorld = localToWorld,
@@ -163,7 +178,9 @@ public sealed class RHIStaticMeshResource : IDisposable
             IndexCount = submesh.IndexCount,
             VertexOffset = submesh.VertexOffset,
             IndexType = IndexType,
-            MaterialID = checked(materialId + submesh.MaterialSlot)
+            MaterialID = applyMaterialSlot
+                ? checked(materialId + submesh.MaterialSlot)
+                : materialId
         };
     }
 
@@ -173,6 +190,39 @@ public sealed class RHIStaticMeshResource : IDisposable
         uint materialId,
         int firstSubmeshIndex = 0,
         int submeshCount = -1)
+    {
+        return CreateDrawCommands(
+            destination,
+            localToWorld,
+            materialId,
+            firstSubmeshIndex,
+            submeshCount,
+            applyMaterialSlots: true);
+    }
+
+    public int CreateDrawCommandsWithMaterialOverride(
+        Span<MeshDrawCommand> destination,
+        Matrix4x4 localToWorld,
+        uint materialId,
+        int firstSubmeshIndex = 0,
+        int submeshCount = -1)
+    {
+        return CreateDrawCommands(
+            destination,
+            localToWorld,
+            materialId,
+            firstSubmeshIndex,
+            submeshCount,
+            applyMaterialSlots: false);
+    }
+
+    private int CreateDrawCommands(
+        Span<MeshDrawCommand> destination,
+        Matrix4x4 localToWorld,
+        uint materialId,
+        int firstSubmeshIndex,
+        int submeshCount,
+        bool applyMaterialSlots)
     {
         if (firstSubmeshIndex < 0 || firstSubmeshIndex > m_Submeshes.Length)
         {
@@ -196,18 +246,11 @@ public sealed class RHIStaticMeshResource : IDisposable
 
         for (int i = 0; i < drawCount; i++)
         {
-            var submesh = m_Submeshes[firstSubmeshIndex + i];
-            destination[i] = new MeshDrawCommand
-            {
-                LocalToWorld = localToWorld,
-                VertexBuffer = VertexBuffer,
-                IndexBuffer = IndexBuffer,
-                FirstIndex = submesh.FirstIndex,
-                IndexCount = submesh.IndexCount,
-                VertexOffset = submesh.VertexOffset,
-                IndexType = IndexType,
-                MaterialID = checked(materialId + submesh.MaterialSlot)
-            };
+            destination[i] = CreateDrawCommand(
+                localToWorld,
+                materialId,
+                m_Submeshes[firstSubmeshIndex + i],
+                applyMaterialSlots);
         }
 
         return drawCount;

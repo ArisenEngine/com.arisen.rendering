@@ -21,6 +21,14 @@ public readonly unsafe struct RenderFrameSnapshot
         uint height,
         Camera* cameraPtr,
         int cameraCount,
+        DirectionalLight* directionalLightPtr,
+        int directionalLightCount,
+        PointLight* pointLightPtr,
+        int pointLightCount,
+        SpotLight* spotLightPtr,
+        int spotLightCount,
+        SceneEnvironment sceneEnvironment,
+        int sceneEnvironmentCount,
         MeshDrawCommand* drawListPtr,
         int drawListCount,
         StaticMeshRenderItem* staticMeshItemPtr,
@@ -37,6 +45,14 @@ public readonly unsafe struct RenderFrameSnapshot
         Height = height;
         CameraPtr = cameraPtr;
         CameraCount = cameraCount;
+        DirectionalLightPtr = directionalLightPtr;
+        DirectionalLightCount = directionalLightCount;
+        PointLightPtr = pointLightPtr;
+        PointLightCount = pointLightCount;
+        SpotLightPtr = spotLightPtr;
+        SpotLightCount = spotLightCount;
+        SceneEnvironment = sceneEnvironment;
+        SceneEnvironmentCount = sceneEnvironmentCount;
         DrawListPtr = drawListPtr;
         DrawListCount = drawListCount;
         StaticMeshItemPtr = staticMeshItemPtr;
@@ -54,12 +70,23 @@ public readonly unsafe struct RenderFrameSnapshot
     public uint Height { get; }
     public Camera* CameraPtr { get; }
     public int CameraCount { get; }
+    public DirectionalLight* DirectionalLightPtr { get; }
+    public int DirectionalLightCount { get; }
+    public PointLight* PointLightPtr { get; }
+    public int PointLightCount { get; }
+    public SpotLight* SpotLightPtr { get; }
+    public int SpotLightCount { get; }
+    public SceneEnvironment SceneEnvironment { get; }
+    public int SceneEnvironmentCount { get; }
     public MeshDrawCommand* DrawListPtr { get; }
     public int DrawListCount { get; }
     public StaticMeshRenderItem* StaticMeshItemPtr { get; }
     public int StaticMeshItemCount { get; }
 
     public ReadOnlySpan<Camera> Cameras => new(CameraPtr, CameraCount);
+    public ReadOnlySpan<DirectionalLight> DirectionalLights => new(DirectionalLightPtr, DirectionalLightCount);
+    public ReadOnlySpan<PointLight> PointLights => new(PointLightPtr, PointLightCount);
+    public ReadOnlySpan<SpotLight> SpotLights => new(SpotLightPtr, SpotLightCount);
     public ReadOnlySpan<MeshDrawCommand> DrawList => new(DrawListPtr, DrawListCount);
     public ReadOnlySpan<StaticMeshRenderItem> StaticMeshItems => new(StaticMeshItemPtr, StaticMeshItemCount);
 }

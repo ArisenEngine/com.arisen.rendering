@@ -37,5 +37,8 @@
     "com.arisen.core.native": "1.0.0",
     "com.arisen.dag": "1.0.0",
     "com.arisen.taskgraph": "1.0.0"
+  },
+  "nugetDependencies": {
+    "StbImageSharp": "2.30.15"
   }
 }

@@ -74,6 +74,11 @@ public static class MeshAssetCooker
     public const uint SubmeshStride = 16;
 
     private const string MeshAssetType = "Mesh";
+    private const uint GltfBinaryMagic = 0x46546C67;
+    private const uint GltfBinaryJsonChunkType = 0x4E4F534A;
+    private const uint GltfBinaryBinChunkType = 0x004E4942;
+    private const int GltfBinaryHeaderSize = 12;
+    private const int GltfBinaryChunkHeaderSize = 8;
     private const int CurrentCookedVersion = 4;
     private const int HeaderSize = 80;
     private static readonly Vector3 s_DefaultNormal = new(0.0f, 0.0f, 1.0f);
@@ -170,8 +175,7 @@ public static class MeshAssetCooker
             MeshSourceFormat.ArisenTextMesh => ReadArisenTextMesh(sourceAsset.SourcePath),
             MeshSourceFormat.WavefrontObj => ReadWavefrontObj(sourceAsset.SourcePath),
             MeshSourceFormat.GltfJson => ReadGltfJson(sourceAsset.SourcePath),
-            MeshSourceFormat.GltfBinary => throw new NotSupportedException(
-                "[MeshAssetCooker] Binary glTF (.glb) import is not part of the first static mesh importer scope yet. Use .gltf with an external .bin buffer."),
+            MeshSourceFormat.GltfBinary => ReadGltfBinary(sourceAsset.SourcePath),
             _ => throw new NotSupportedException($"Mesh source format '{mesh.SourceFormat}' is not implemented yet.")
         };
 
@@ -698,7 +702,93 @@ public static class MeshAssetCooker
     private static SourceMesh ReadGltfJson(string sourcePath)
     {
         using var document = JsonDocument.Parse(File.ReadAllText(sourcePath));
-        var root = document.RootElement;
+        return ReadGltfDocument(sourcePath, document.RootElement, embeddedBinaryBuffer: null);
+    }
+
+    private static SourceMesh ReadGltfBinary(string sourcePath)
+    {
+        var bytes = File.ReadAllBytes(sourcePath);
+        if (bytes.Length < GltfBinaryHeaderSize)
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] GLB source '{sourcePath}' is smaller than the GLB header.");
+        }
+
+        var magic = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(0, sizeof(uint)));
+        var version = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(4, sizeof(uint)));
+        var declaredLength = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(8, sizeof(uint)));
+        if (magic != GltfBinaryMagic)
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] GLB source '{sourcePath}' has invalid magic.");
+        }
+
+        if (version != 2)
+        {
+            throw new NotSupportedException($"[MeshAssetCooker] GLB source '{sourcePath}' uses version '{version}', expected 2.");
+        }
+
+        if (declaredLength > bytes.Length)
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] GLB source '{sourcePath}' declares length '{declaredLength}' but file has only '{bytes.Length}' bytes.");
+        }
+
+        ReadOnlyMemory<byte> jsonChunk = ReadOnlyMemory<byte>.Empty;
+        byte[]? binaryChunk = null;
+        var offset = GltfBinaryHeaderSize;
+        while (offset < declaredLength)
+        {
+            if (offset + GltfBinaryChunkHeaderSize > declaredLength)
+            {
+                throw new InvalidOperationException($"[MeshAssetCooker] GLB source '{sourcePath}' has a truncated chunk header.");
+            }
+
+            var rawChunkLength = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(offset, sizeof(uint)));
+            if (rawChunkLength > int.MaxValue)
+            {
+                throw new InvalidOperationException($"[MeshAssetCooker] GLB source '{sourcePath}' has a chunk larger than the supported importer range.");
+            }
+
+            var chunkLength = (int)rawChunkLength;
+            var chunkType = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(offset + sizeof(uint), sizeof(uint)));
+            offset += GltfBinaryChunkHeaderSize;
+            if (offset + chunkLength > declaredLength)
+            {
+                throw new InvalidOperationException($"[MeshAssetCooker] GLB source '{sourcePath}' has a truncated chunk payload.");
+            }
+
+            var chunk = bytes.AsMemory(offset, chunkLength);
+            if (chunkType == GltfBinaryJsonChunkType)
+            {
+                if (!jsonChunk.IsEmpty)
+                {
+                    throw new InvalidOperationException($"[MeshAssetCooker] GLB source '{sourcePath}' contains multiple JSON chunks.");
+                }
+
+                jsonChunk = chunk;
+            }
+            else if (chunkType == GltfBinaryBinChunkType)
+            {
+                if (binaryChunk != null)
+                {
+                    throw new InvalidOperationException($"[MeshAssetCooker] GLB source '{sourcePath}' contains multiple BIN chunks.");
+                }
+
+                binaryChunk = chunk.ToArray();
+            }
+
+            offset += chunkLength;
+        }
+
+        if (jsonChunk.IsEmpty)
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] GLB source '{sourcePath}' contains no JSON chunk.");
+        }
+
+        using var document = JsonDocument.Parse(jsonChunk);
+        return ReadGltfDocument(sourcePath, document.RootElement, binaryChunk);
+    }
+
+    private static SourceMesh ReadGltfDocument(string sourcePath, JsonElement root, byte[]? embeddedBinaryBuffer)
+    {
         if (!root.TryGetProperty("asset", out var asset) ||
             !asset.TryGetProperty("version", out var version) ||
             !version.GetString()!.StartsWith("2.", StringComparison.Ordinal))
@@ -706,7 +796,7 @@ public static class MeshAssetCooker
             throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' must be glTF 2.x.");
         }
 
-        var buffers = LoadGltfBuffers(sourcePath, root);
+        var buffers = LoadGltfBuffers(sourcePath, root, embeddedBinaryBuffer);
         var bufferViews = ReadGltfBufferViews(sourcePath, root);
         var accessors = ReadGltfAccessors(sourcePath, root);
         var vertices = new List<SourceVertex>();
@@ -720,144 +810,33 @@ public static class MeshAssetCooker
             throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' contains no mesh array.");
         }
 
-        foreach (var mesh in meshes.EnumerateArray())
+        if (!TryImportGltfSceneNodes(
+                sourcePath,
+                root,
+                meshes,
+                buffers,
+                bufferViews,
+                accessors,
+                vertices,
+                indices,
+                submeshes,
+                materialSlots,
+                ref hasMissingNormals))
         {
-            if (!mesh.TryGetProperty("primitives", out var primitives) || primitives.ValueKind != JsonValueKind.Array)
+            foreach (var mesh in meshes.EnumerateArray())
             {
-                continue;
-            }
-
-            foreach (var primitive in primitives.EnumerateArray())
-            {
-                var mode = primitive.TryGetProperty("mode", out var modeElement) ? modeElement.GetInt32() : 4;
-                if (mode != 4)
-                {
-                    throw new NotSupportedException($"[MeshAssetCooker] glTF source '{sourcePath}' uses primitive mode '{mode}', but the first importer scope supports triangles only.");
-                }
-
-                if (!primitive.TryGetProperty("attributes", out var attributes) ||
-                    !attributes.TryGetProperty("POSITION", out var positionAccessorElement))
-                {
-                    throw new InvalidOperationException($"[MeshAssetCooker] glTF primitive in '{sourcePath}' must contain POSITION.");
-                }
-
-                ValidateSupportedGltfStaticMeshAttributes(sourcePath, attributes);
-
-                var positionAccessorIndex = positionAccessorElement.GetInt32();
-                var positionAccessor = GetGltfAccessor(sourcePath, accessors, positionAccessorIndex);
-                if (positionAccessor.ComponentType != GltfComponentType.Float || positionAccessor.Type != "VEC3")
-                {
-                    throw new NotSupportedException($"[MeshAssetCooker] glTF POSITION in '{sourcePath}' must be FLOAT VEC3.");
-                }
-
-                var normalAccessorIndex = TryGetGltfAttributeAccessor(attributes, "NORMAL");
-                var tangentAccessorIndex = TryGetGltfAttributeAccessor(attributes, "TANGENT");
-                var texCoordAccessorIndex = TryGetGltfAttributeAccessor(attributes, "TEXCOORD_0");
-                var colorAccessorIndex = TryGetGltfAttributeAccessor(attributes, "COLOR_0");
-                if (normalAccessorIndex >= 0)
-                {
-                    var normalAccessor = GetGltfAccessor(sourcePath, accessors, normalAccessorIndex);
-                    if (normalAccessor.ComponentType != GltfComponentType.Float || normalAccessor.Type != "VEC3")
-                    {
-                        throw new NotSupportedException($"[MeshAssetCooker] glTF NORMAL in '{sourcePath}' must be FLOAT VEC3.");
-                    }
-                }
-                else
-                {
-                    hasMissingNormals = true;
-                }
-
-                if (tangentAccessorIndex >= 0)
-                {
-                    var tangentAccessor = GetGltfAccessor(sourcePath, accessors, tangentAccessorIndex);
-                    if (tangentAccessor.ComponentType != GltfComponentType.Float || tangentAccessor.Type != "VEC4")
-                    {
-                        throw new NotSupportedException($"[MeshAssetCooker] glTF TANGENT in '{sourcePath}' must be FLOAT VEC4.");
-                    }
-                }
-
-                if (texCoordAccessorIndex >= 0)
-                {
-                    var texCoordAccessor = GetGltfAccessor(sourcePath, accessors, texCoordAccessorIndex);
-                    if (texCoordAccessor.ComponentType != GltfComponentType.Float || texCoordAccessor.Type != "VEC2")
-                    {
-                        throw new NotSupportedException($"[MeshAssetCooker] glTF TEXCOORD_0 in '{sourcePath}' must be FLOAT VEC2.");
-                    }
-                }
-
-                var firstVertex = checked((uint)vertices.Count);
-                for (int i = 0; i < positionAccessor.Count; i++)
-                {
-                    var position = ReadGltfVector3(sourcePath, buffers, bufferViews, positionAccessor, i);
-                    var normal = normalAccessorIndex >= 0
-                        ? NormalizeOrDefault(ReadGltfVector3(sourcePath, buffers, bufferViews, accessors[normalAccessorIndex], i))
-                        : s_DefaultNormal;
-                    var tangent = tangentAccessorIndex >= 0
-                        ? NormalizeTangentOrDefault(ReadGltfVector4(sourcePath, buffers, bufferViews, accessors[tangentAccessorIndex], i))
-                        : s_DefaultTangent;
-                    var texCoord = texCoordAccessorIndex >= 0
-                        ? ReadGltfVector2(sourcePath, buffers, bufferViews, accessors[texCoordAccessorIndex], i)
-                        : new Vector2(0.0f, 0.0f);
-                    var color = colorAccessorIndex >= 0
-                        ? ReadGltfColor(sourcePath, buffers, bufferViews, accessors[colorAccessorIndex], i)
-                        : new Vector3(1.0f, 1.0f, 1.0f);
-
-                    vertices.Add(new SourceVertex(
-                        position.X,
-                        position.Y,
-                        position.Z,
-                        normal.X,
-                        normal.Y,
-                        normal.Z,
-                        tangent.X,
-                        tangent.Y,
-                        tangent.Z,
-                        tangent.W,
-                        texCoord.X,
-                        texCoord.Y,
-                        color.X,
-                        color.Y,
-                        color.Z));
-                }
-
-                var firstIndex = checked((uint)indices.Count);
-                if (primitive.TryGetProperty("indices", out var indicesAccessorElement))
-                {
-                    var indexAccessor = GetGltfAccessor(sourcePath, accessors, indicesAccessorElement.GetInt32());
-                    if (indexAccessor.Type != "SCALAR")
-                    {
-                        throw new InvalidOperationException($"[MeshAssetCooker] glTF indices in '{sourcePath}' must be SCALAR.");
-                    }
-
-                    for (int i = 0; i < indexAccessor.Count; i++)
-                    {
-                        indices.Add(checked(firstVertex + ReadGltfIndex(sourcePath, buffers, bufferViews, indexAccessor, i)));
-                    }
-                }
-                else
-                {
-                    for (uint i = 0; i < checked((uint)positionAccessor.Count); i++)
-                    {
-                        indices.Add(checked(firstVertex + i));
-                    }
-                }
-
-                var indexCount = checked((uint)indices.Count - firstIndex);
-                if (indexCount == 0 || indexCount % 3 != 0)
-                {
-                    throw new InvalidOperationException($"[MeshAssetCooker] glTF primitive in '{sourcePath}' produced a non-triangle index count '{indexCount}'.");
-                }
-
-                var materialIndex = primitive.TryGetProperty("material", out var materialElement)
-                    ? materialElement.GetInt32()
-                    : -1;
-                if (!materialSlots.TryGetValue(materialIndex, out var materialSlot))
-                {
-                    materialSlot = checked((uint)materialSlots.Count);
-                    materialSlots.Add(materialIndex, materialSlot);
-                }
-
-                submeshes.Add(new SourceSubmesh(firstIndex, indexCount, 0, materialSlot));
+                ImportGltfMeshPrimitives(
+                    sourcePath,
+                    mesh,
+                    buffers,
+                    bufferViews,
+                    accessors,
+                    Matrix4x4.Identity,
+                    vertices,
+                    indices,
+                    submeshes,
+                    materialSlots,
+                    ref hasMissingNormals);
             }
         }
 
@@ -872,6 +851,407 @@ public static class MeshAssetCooker
         var sourceSubmeshes = submeshes.ToArray();
         ValidateSourceSubmeshes(sourcePath, sourceSubmeshes, checked((uint)indices.Count));
         return new SourceMesh(sourceVertices, indices.ToArray(), sourceSubmeshes);
+    }
+
+    private static bool TryImportGltfSceneNodes(
+        string sourcePath,
+        JsonElement root,
+        JsonElement meshes,
+        byte[][] buffers,
+        GltfBufferView[] bufferViews,
+        GltfAccessor[] accessors,
+        List<SourceVertex> vertices,
+        List<uint> indices,
+        List<SourceSubmesh> submeshes,
+        Dictionary<int, uint> materialSlots,
+        ref bool hasMissingNormals)
+    {
+        if (!root.TryGetProperty("nodes", out var nodes) ||
+            nodes.ValueKind != JsonValueKind.Array ||
+            !root.TryGetProperty("scenes", out var scenes) ||
+            scenes.ValueKind != JsonValueKind.Array ||
+            scenes.GetArrayLength() == 0)
+        {
+            return false;
+        }
+
+        var sceneIndex = root.TryGetProperty("scene", out var sceneElement)
+            ? sceneElement.GetInt32()
+            : 0;
+        if (sceneIndex < 0 || sceneIndex >= scenes.GetArrayLength())
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' scene index '{sceneIndex}' is outside scene count '{scenes.GetArrayLength()}'.");
+        }
+
+        var scene = scenes[sceneIndex];
+        if (!scene.TryGetProperty("nodes", out var rootNodes) || rootNodes.ValueKind != JsonValueKind.Array)
+        {
+            return true;
+        }
+
+        var stack = new HashSet<int>();
+        foreach (var rootNode in rootNodes.EnumerateArray())
+        {
+            ImportGltfNode(
+                sourcePath,
+                nodes,
+                meshes,
+                buffers,
+                bufferViews,
+                accessors,
+                rootNode.GetInt32(),
+                Matrix4x4.Identity,
+                stack,
+                vertices,
+                indices,
+                submeshes,
+                materialSlots,
+                ref hasMissingNormals);
+        }
+
+        return true;
+    }
+
+    private static void ImportGltfNode(
+        string sourcePath,
+        JsonElement nodes,
+        JsonElement meshes,
+        byte[][] buffers,
+        GltfBufferView[] bufferViews,
+        GltfAccessor[] accessors,
+        int nodeIndex,
+        Matrix4x4 parentTransform,
+        HashSet<int> stack,
+        List<SourceVertex> vertices,
+        List<uint> indices,
+        List<SourceSubmesh> submeshes,
+        Dictionary<int, uint> materialSlots,
+        ref bool hasMissingNormals)
+    {
+        if (nodeIndex < 0 || nodeIndex >= nodes.GetArrayLength())
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] glTF node index '{nodeIndex}' in '{sourcePath}' is outside node count '{nodes.GetArrayLength()}'.");
+        }
+
+        if (!stack.Add(nodeIndex))
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' contains a node hierarchy cycle at node '{nodeIndex}'.");
+        }
+
+        try
+        {
+            var node = nodes[nodeIndex];
+            var nodeTransform = ReadGltfNodeTransform(sourcePath, node, $"nodes[{nodeIndex}]") * parentTransform;
+            if (node.TryGetProperty("mesh", out var meshElement))
+            {
+                var meshIndex = meshElement.GetInt32();
+                if (meshIndex < 0 || meshIndex >= meshes.GetArrayLength())
+                {
+                    throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' nodes[{nodeIndex}].mesh index '{meshIndex}' is outside mesh count '{meshes.GetArrayLength()}'.");
+                }
+
+                ImportGltfMeshPrimitives(
+                    sourcePath,
+                    meshes[meshIndex],
+                    buffers,
+                    bufferViews,
+                    accessors,
+                    nodeTransform,
+                    vertices,
+                    indices,
+                    submeshes,
+                    materialSlots,
+                    ref hasMissingNormals);
+            }
+
+            if (node.TryGetProperty("children", out var children))
+            {
+                if (children.ValueKind != JsonValueKind.Array)
+                {
+                    throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' nodes[{nodeIndex}].children must be an array.");
+                }
+
+                foreach (var child in children.EnumerateArray())
+                {
+                    ImportGltfNode(
+                        sourcePath,
+                        nodes,
+                        meshes,
+                        buffers,
+                        bufferViews,
+                        accessors,
+                        child.GetInt32(),
+                        nodeTransform,
+                        stack,
+                        vertices,
+                        indices,
+                        submeshes,
+                        materialSlots,
+                        ref hasMissingNormals);
+                }
+            }
+        }
+        finally
+        {
+            stack.Remove(nodeIndex);
+        }
+    }
+
+    private static void ImportGltfMeshPrimitives(
+        string sourcePath,
+        JsonElement mesh,
+        byte[][] buffers,
+        GltfBufferView[] bufferViews,
+        GltfAccessor[] accessors,
+        Matrix4x4 transform,
+        List<SourceVertex> vertices,
+        List<uint> indices,
+        List<SourceSubmesh> submeshes,
+        Dictionary<int, uint> materialSlots,
+        ref bool hasMissingNormals)
+    {
+        if (!mesh.TryGetProperty("primitives", out var primitives) || primitives.ValueKind != JsonValueKind.Array)
+        {
+            return;
+        }
+
+        var normalTransform = GetNormalTransform(sourcePath, transform);
+        foreach (var primitive in primitives.EnumerateArray())
+        {
+            var mode = primitive.TryGetProperty("mode", out var modeElement) ? modeElement.GetInt32() : 4;
+            if (mode != 4)
+            {
+                throw new NotSupportedException($"[MeshAssetCooker] glTF source '{sourcePath}' uses primitive mode '{mode}', but the first importer scope supports triangles only.");
+            }
+
+            if (!primitive.TryGetProperty("attributes", out var attributes) ||
+                !attributes.TryGetProperty("POSITION", out var positionAccessorElement))
+            {
+                throw new InvalidOperationException($"[MeshAssetCooker] glTF primitive in '{sourcePath}' must contain POSITION.");
+            }
+
+            ValidateSupportedGltfStaticMeshAttributes(sourcePath, attributes);
+
+            var positionAccessorIndex = positionAccessorElement.GetInt32();
+            var positionAccessor = GetGltfAccessor(sourcePath, accessors, positionAccessorIndex);
+            if (positionAccessor.ComponentType != GltfComponentType.Float || positionAccessor.Type != "VEC3")
+            {
+                throw new NotSupportedException($"[MeshAssetCooker] glTF POSITION in '{sourcePath}' must be FLOAT VEC3.");
+            }
+
+            var normalAccessorIndex = TryGetGltfAttributeAccessor(attributes, "NORMAL");
+            var tangentAccessorIndex = TryGetGltfAttributeAccessor(attributes, "TANGENT");
+            var texCoordAccessorIndex = TryGetGltfAttributeAccessor(attributes, "TEXCOORD_0");
+            var colorAccessorIndex = TryGetGltfAttributeAccessor(attributes, "COLOR_0");
+            if (normalAccessorIndex >= 0)
+            {
+                var normalAccessor = GetGltfAccessor(sourcePath, accessors, normalAccessorIndex);
+                if (normalAccessor.ComponentType != GltfComponentType.Float || normalAccessor.Type != "VEC3")
+                {
+                    throw new NotSupportedException($"[MeshAssetCooker] glTF NORMAL in '{sourcePath}' must be FLOAT VEC3.");
+                }
+            }
+            else
+            {
+                hasMissingNormals = true;
+            }
+
+            if (tangentAccessorIndex >= 0)
+            {
+                var tangentAccessor = GetGltfAccessor(sourcePath, accessors, tangentAccessorIndex);
+                if (tangentAccessor.ComponentType != GltfComponentType.Float || tangentAccessor.Type != "VEC4")
+                {
+                    throw new NotSupportedException($"[MeshAssetCooker] glTF TANGENT in '{sourcePath}' must be FLOAT VEC4.");
+                }
+            }
+
+            if (texCoordAccessorIndex >= 0)
+            {
+                var texCoordAccessor = GetGltfAccessor(sourcePath, accessors, texCoordAccessorIndex);
+                if (texCoordAccessor.ComponentType != GltfComponentType.Float || texCoordAccessor.Type != "VEC2")
+                {
+                    throw new NotSupportedException($"[MeshAssetCooker] glTF TEXCOORD_0 in '{sourcePath}' must be FLOAT VEC2.");
+                }
+            }
+
+            var firstVertex = checked((uint)vertices.Count);
+            for (int i = 0; i < positionAccessor.Count; i++)
+            {
+                var position = Vector3.Transform(
+                    ReadGltfVector3(sourcePath, buffers, bufferViews, positionAccessor, i),
+                    transform);
+                var normal = normalAccessorIndex >= 0
+                    ? NormalizeOrDefault(Vector3.TransformNormal(
+                        ReadGltfVector3(sourcePath, buffers, bufferViews, accessors[normalAccessorIndex], i),
+                        normalTransform))
+                    : s_DefaultNormal;
+                var tangent = tangentAccessorIndex >= 0
+                    ? TransformTangent(ReadGltfVector4(sourcePath, buffers, bufferViews, accessors[tangentAccessorIndex], i), transform)
+                    : TransformTangent(s_DefaultTangent, transform);
+                var texCoord = texCoordAccessorIndex >= 0
+                    ? ReadGltfVector2(sourcePath, buffers, bufferViews, accessors[texCoordAccessorIndex], i)
+                    : new Vector2(0.0f, 0.0f);
+                var color = colorAccessorIndex >= 0
+                    ? ReadGltfColor(sourcePath, buffers, bufferViews, accessors[colorAccessorIndex], i)
+                    : new Vector3(1.0f, 1.0f, 1.0f);
+
+                vertices.Add(new SourceVertex(
+                    position.X,
+                    position.Y,
+                    position.Z,
+                    normal.X,
+                    normal.Y,
+                    normal.Z,
+                    tangent.X,
+                    tangent.Y,
+                    tangent.Z,
+                    tangent.W,
+                    texCoord.X,
+                    texCoord.Y,
+                    color.X,
+                    color.Y,
+                    color.Z));
+            }
+
+            var firstIndex = checked((uint)indices.Count);
+            if (primitive.TryGetProperty("indices", out var indicesAccessorElement))
+            {
+                var indexAccessor = GetGltfAccessor(sourcePath, accessors, indicesAccessorElement.GetInt32());
+                if (indexAccessor.Type != "SCALAR")
+                {
+                    throw new InvalidOperationException($"[MeshAssetCooker] glTF indices in '{sourcePath}' must be SCALAR.");
+                }
+
+                for (int i = 0; i < indexAccessor.Count; i++)
+                {
+                    indices.Add(checked(firstVertex + ReadGltfIndex(sourcePath, buffers, bufferViews, indexAccessor, i)));
+                }
+            }
+            else
+            {
+                for (uint i = 0; i < checked((uint)positionAccessor.Count); i++)
+                {
+                    indices.Add(checked(firstVertex + i));
+                }
+            }
+
+            var indexCount = checked((uint)indices.Count - firstIndex);
+            if (indexCount == 0 || indexCount % 3 != 0)
+            {
+                throw new InvalidOperationException($"[MeshAssetCooker] glTF primitive in '{sourcePath}' produced a non-triangle index count '{indexCount}'.");
+            }
+
+            var materialIndex = primitive.TryGetProperty("material", out var materialElement)
+                ? materialElement.GetInt32()
+                : -1;
+            if (!materialSlots.TryGetValue(materialIndex, out var materialSlot))
+            {
+                materialSlot = checked((uint)materialSlots.Count);
+                materialSlots.Add(materialIndex, materialSlot);
+            }
+
+            submeshes.Add(new SourceSubmesh(firstIndex, indexCount, 0, materialSlot));
+        }
+    }
+
+    private static Matrix4x4 ReadGltfNodeTransform(string sourcePath, JsonElement node, string context)
+    {
+        var hasMatrix = node.TryGetProperty("matrix", out var matrixElement);
+        var hasTranslation = node.TryGetProperty("translation", out var translationElement);
+        var hasRotation = node.TryGetProperty("rotation", out var rotationElement);
+        var hasScale = node.TryGetProperty("scale", out var scaleElement);
+        if (hasMatrix && (hasTranslation || hasRotation || hasScale))
+        {
+            throw new NotSupportedException($"[MeshAssetCooker] glTF source '{sourcePath}' {context} uses matrix and TRS together.");
+        }
+
+        if (hasMatrix)
+        {
+            var values = ReadGltfFloatArray(sourcePath, matrixElement, 16, $"{context}.matrix");
+            return new Matrix4x4(
+                values[0],
+                values[1],
+                values[2],
+                values[3],
+                values[4],
+                values[5],
+                values[6],
+                values[7],
+                values[8],
+                values[9],
+                values[10],
+                values[11],
+                values[12],
+                values[13],
+                values[14],
+                values[15]);
+        }
+
+        var translation = hasTranslation
+            ? ReadGltfVector3Property(sourcePath, translationElement, $"{context}.translation")
+            : Vector3.Zero;
+        var rotation = hasRotation
+            ? ReadGltfQuaternionProperty(sourcePath, rotationElement, $"{context}.rotation")
+            : Quaternion.Identity;
+        var scale = hasScale
+            ? ReadGltfVector3Property(sourcePath, scaleElement, $"{context}.scale")
+            : Vector3.One;
+
+        return Matrix4x4.CreateScale(scale) *
+               Matrix4x4.CreateFromQuaternion(rotation) *
+               Matrix4x4.CreateTranslation(translation);
+    }
+
+    private static Matrix4x4 GetNormalTransform(string sourcePath, Matrix4x4 transform)
+    {
+        if (!Matrix4x4.Invert(transform, out var inverse))
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' contains a non-invertible node transform.");
+        }
+
+        return Matrix4x4.Transpose(inverse);
+    }
+
+    private static Vector4 TransformTangent(Vector4 tangent, Matrix4x4 transform)
+    {
+        var direction = Vector3.TransformNormal(new Vector3(tangent.X, tangent.Y, tangent.Z), transform);
+        direction = NormalizeOrDefault(direction);
+        return new Vector4(direction, tangent.W < 0.0f ? -1.0f : 1.0f);
+    }
+
+    private static Vector3 ReadGltfVector3Property(string sourcePath, JsonElement element, string context)
+    {
+        var values = ReadGltfFloatArray(sourcePath, element, 3, context);
+        return new Vector3(values[0], values[1], values[2]);
+    }
+
+    private static Quaternion ReadGltfQuaternionProperty(string sourcePath, JsonElement element, string context)
+    {
+        var values = ReadGltfFloatArray(sourcePath, element, 4, context);
+        var quaternion = new Quaternion(values[0], values[1], values[2], values[3]);
+        if (quaternion.LengthSquared() <= float.Epsilon)
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' {context} is a zero quaternion.");
+        }
+
+        return Quaternion.Normalize(quaternion);
+    }
+
+    private static float[] ReadGltfFloatArray(string sourcePath, JsonElement element, int expectedCount, string context)
+    {
+        if (element.ValueKind != JsonValueKind.Array || element.GetArrayLength() != expectedCount)
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' {context} must contain {expectedCount} numeric values.");
+        }
+
+        var values = new float[expectedCount];
+        var index = 0;
+        foreach (var value in element.EnumerateArray())
+        {
+            values[index++] = value.GetSingle();
+        }
+
+        return values;
     }
 
     private static DateTime GetSourceDependencyWriteTimeUtc(string sourcePath, MeshSourceFormat sourceFormat)
@@ -923,7 +1303,7 @@ public static class MeshAssetCooker
         return a >= b ? a : b;
     }
 
-    private static byte[][] LoadGltfBuffers(string sourcePath, JsonElement root)
+    private static byte[][] LoadGltfBuffers(string sourcePath, JsonElement root, byte[]? embeddedBinaryBuffer)
     {
         if (!root.TryGetProperty("buffers", out var buffersElement) || buffersElement.ValueKind != JsonValueKind.Array)
         {
@@ -937,7 +1317,13 @@ public static class MeshAssetCooker
             var context = $"buffers[{index}]";
             if (!buffer.TryGetProperty("uri", out var uriElement))
             {
-                throw new NotSupportedException($"[MeshAssetCooker] glTF source '{sourcePath}' {context} has no uri and is treated as an embedded GLB buffer; .glb support is not in the first importer scope.");
+                if (index != 0)
+                {
+                    throw new NotSupportedException($"[MeshAssetCooker] glTF source '{sourcePath}' {context} has no uri, but only buffers[0] may use a GLB BIN chunk.");
+                }
+
+                buffers[index++] = GetGltfEmbeddedBinaryBuffer(sourcePath, embeddedBinaryBuffer, GetRequiredInt32(sourcePath, buffer, "byteLength", context), context);
+                continue;
             }
 
             var uri = uriElement.GetString();
@@ -952,6 +1338,28 @@ public static class MeshAssetCooker
         }
 
         return buffers;
+    }
+
+    private static byte[] GetGltfEmbeddedBinaryBuffer(string sourcePath, byte[]? embeddedBinaryBuffer, int byteLength, string context)
+    {
+        if (embeddedBinaryBuffer == null)
+        {
+            throw new NotSupportedException($"[MeshAssetCooker] glTF source '{sourcePath}' {context} has no uri and no GLB BIN chunk was found.");
+        }
+
+        if (byteLength < 0)
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' {context}.byteLength is invalid.");
+        }
+
+        if (byteLength > embeddedBinaryBuffer.Length)
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] GLB source '{sourcePath}' {context}.byteLength '{byteLength}' exceeds BIN chunk length '{embeddedBinaryBuffer.Length}'.");
+        }
+
+        var buffer = new byte[byteLength];
+        Buffer.BlockCopy(embeddedBinaryBuffer, 0, buffer, 0, byteLength);
+        return buffer;
     }
 
     private static GltfBufferView[] ReadGltfBufferViews(string sourcePath, JsonElement root)

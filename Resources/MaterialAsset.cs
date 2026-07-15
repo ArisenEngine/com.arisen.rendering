@@ -10,11 +10,14 @@ namespace ArisenEngine.Rendering.Resources;
 public static class MaterialTextureSlots
 {
     public const string BaseColor = "BaseColor";
+    public const string Normal = "Normal";
+    public const string Emissive = "Emissive";
 }
 
 public static class MaterialPropertySlots
 {
     public const string BaseColorFactor = "BaseColorFactor";
+    public const string EmissiveFactor = "EmissiveFactor";
     public const string MetallicFactor = "MetallicFactor";
     public const string RoughnessFactor = "RoughnessFactor";
 }
