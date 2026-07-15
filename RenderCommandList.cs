@@ -78,6 +78,31 @@ public readonly struct RenderCommandList
         m_CommandBuffer.EndRendering();
     }
 
+    public void BeginRenderingDepthOnly(
+        RHIImageViewHandle depthImageView,
+        EImageLayout depthImageLayout,
+        EAttachmentLoadOp depthLoadOp,
+        EAttachmentStoreOp depthStoreOp,
+        float clearDepth,
+        uint clearStencil,
+        int x,
+        int y,
+        uint width,
+        uint height)
+    {
+        m_CommandBuffer.BeginRenderingDepthOnly(
+            depthImageView,
+            depthImageLayout,
+            depthLoadOp,
+            depthStoreOp,
+            clearDepth,
+            clearStencil,
+            x,
+            y,
+            width,
+            height);
+    }
+
     public void BindPipeline(RHIPipelineHandle pipeline)
     {
         m_CommandBuffer.BindPipeline(pipeline);

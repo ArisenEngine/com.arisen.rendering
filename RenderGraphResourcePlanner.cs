@@ -39,7 +39,7 @@ internal static class RenderGraphResourcePlanner
         {
             var resource = resources[resourceIndex];
             var currentState = resource.InitialState;
-            var hasKnownState = resource.IsImported && currentState != RenderResourceState.Unknown;
+            var hasKnownState = currentState != RenderResourceState.Unknown;
             var hasWriter = resource.IsImported;
 
             for (int nodeIndex = 0; nodeIndex < sortedNodeIds.Count; nodeIndex++)

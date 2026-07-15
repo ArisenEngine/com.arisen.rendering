@@ -67,9 +67,13 @@ public sealed class RenderGraph : IDisposable
     private readonly List<RenderResource> m_Resources = new();
     private readonly Dictionary<uint, ResourceAccessState> m_ResourceAccess = new();
     private readonly List<RenderGraphResourceAccess> m_ResourceAccessEvents = new();
+    private readonly Dictionary<string, RenderGraphTexture> m_TransientTextures = new(StringComparer.Ordinal);
+    private readonly Dictionary<uint, RenderGraphTexture> m_TransientTexturesByResourceId = new();
+    private readonly HashSet<string> m_FrameTransientTextureNames = new(StringComparer.Ordinal);
     private readonly Dictionary<uint, RHICommandBuffer[]> m_CommandBuffers = new();
     private readonly ConcurrentQueue<Exception> m_RecordingErrors = new();
     private readonly ITaskGraph m_TaskSystem;
+    private readonly DeferredRenderResourceDisposalQueue? m_DisposalQueue;
     private uint m_NextResourceId = 2;
     
     // Key: (ThreadId, SurfaceId), Value: Command Pool for that thread/surface combination
@@ -77,6 +81,7 @@ public sealed class RenderGraph : IDisposable
 
     private RHIFactory? m_Factory;
     private CompiledRenderGraphLayout? m_CachedLayout;
+    private ulong m_LastSubmittedTicket;
     private bool m_DiagnosticsLoggedOnce;
 
     /// <summary>
@@ -98,8 +103,16 @@ public sealed class RenderGraph : IDisposable
     public RenderResource FrameDepth { get; } = new("FrameDepth", RenderResourceType.Texture, 1);
     
     public RenderGraph(ITaskGraph taskSystem)
+        : this(taskSystem, disposalQueue: null)
+    {
+    }
+
+    public RenderGraph(
+        ITaskGraph taskSystem,
+        DeferredRenderResourceDisposalQueue? disposalQueue)
     {
         m_TaskSystem = taskSystem;
+        m_DisposalQueue = disposalQueue;
         m_Resources.Add(FrameColor);
         m_Resources.Add(FrameDepth);
     }
@@ -132,6 +145,47 @@ public sealed class RenderGraph : IDisposable
         var resource = new RenderResource(name, type, m_NextResourceId++);
         m_Resources.Add(resource);
         return resource;
+    }
+
+    public RenderGraphTexture CreateTransientTexture(
+        RenderContext context,
+        string name,
+        RenderGraphTextureDescriptor descriptor)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+
+        if (!m_FrameTransientTextureNames.Add(name))
+        {
+            throw new InvalidOperationException(
+                $"RenderGraph transient texture '{name}' was created more than once in the same frame graph.");
+        }
+
+        var texture = m_TransientTextures.TryGetValue(name, out var existingTexture)
+            ? existingTexture
+            : CreateTransientTexturePoolEntry(name);
+
+        texture.Ensure(
+            context.Device.GetFactory(),
+            descriptor,
+            m_DisposalQueue,
+            m_LastSubmittedTicket);
+        var resource = new RenderResource(
+            name,
+            RenderResourceType.Texture,
+            m_NextResourceId++,
+            initialState: texture.CurrentState);
+
+        texture.Resource = resource;
+        m_Resources.Add(resource);
+        m_TransientTexturesByResourceId.Add(resource.ResourceId, texture);
+        return texture;
+    }
+
+    private RenderGraphTexture CreateTransientTexturePoolEntry(string name)
+    {
+        var texture = new RenderGraphTexture(new RenderResource(name, RenderResourceType.Texture, 0));
+        m_TransientTextures.Add(name, texture);
+        return texture;
     }
 
     /// <summary>
@@ -319,6 +373,8 @@ public sealed class RenderGraph : IDisposable
         m_Resources.Add(FrameDepth);
         m_ResourceAccess.Clear();
         m_ResourceAccessEvents.Clear();
+        m_TransientTexturesByResourceId.Clear();
+        m_FrameTransientTextureNames.Clear();
         m_NextResourceId = 2;
     }
 
@@ -339,6 +395,7 @@ public sealed class RenderGraph : IDisposable
         Profiler.PlotValue("RenderGraph.CompileCacheHit", compileCacheHit ? 1 : 0);
         Profiler.PlotValue("RenderGraph.CulledPassCount", layout.Culling.CulledCount);
         Profiler.PlotValue("RenderGraph.ResourceTransitionCount", transitionPlan.Length);
+        Profiler.PlotValue("RenderGraph.TransientTextureCount", m_TransientTexturesByResourceId.Count);
         uint surfaceId = context.SurfaceId;
 
         if (diagnosticsEnabled)
@@ -350,7 +407,10 @@ public sealed class RenderGraph : IDisposable
 
         try
         {
-            return ExecuteCompiled(context, factory, layout, transitionPlan, surfaceId, diagnosticsEnabled);
+            var submittedTicket = ExecuteCompiled(context, factory, layout, transitionPlan, surfaceId, diagnosticsEnabled);
+            UpdateTransientTextureStates(layout);
+            m_LastSubmittedTicket = submittedTicket;
+            return submittedTicket;
         }
         finally
         {
@@ -716,11 +776,32 @@ public sealed class RenderGraph : IDisposable
 
             if (transition.ResourceId != FrameColor.ResourceId)
             {
+                if (m_TransientTexturesByResourceId.TryGetValue(transition.ResourceId, out var texture))
+                {
+                    RecordTransientTextureTransition(commandBuffer, texture, transition);
+                }
+
                 continue;
             }
 
             RecordFrameColorTransition(context, commandBuffer, transition);
         }
+    }
+
+    private static void RecordTransientTextureTransition(
+        RHICommandBuffer commandBuffer,
+        RenderGraphTexture texture,
+        RenderGraphResourceTransition transition)
+    {
+        if (!TryBuildTransientTextureBarrier(texture, transition.FromState, transition.ToState, out var barrier))
+        {
+            return;
+        }
+
+        commandBuffer.PipelineBarrier(
+            barrier.SrcStageMask,
+            barrier.DstStageMask,
+            MemoryMarshal.CreateReadOnlySpan(ref barrier, 1));
     }
 
     private static void RecordFrameColorTransition(
@@ -841,6 +922,146 @@ public sealed class RenderGraph : IDisposable
         public EAccessFlag Access { get; }
         public uint QueueFamily { get; }
         public EPipelineStageFlagBits Stage { get; }
+    }
+
+    private static bool TryBuildTransientTextureBarrier(
+        RenderGraphTexture texture,
+        RenderResourceState fromState,
+        RenderResourceState toState,
+        out RHIImageMemoryBarrier barrier)
+    {
+        barrier = default;
+
+        if (fromState == toState)
+        {
+            return false;
+        }
+
+        if (!texture.Image.IsValid)
+        {
+            return false;
+        }
+
+        var from = MapTransientTextureState(fromState, isSource: true);
+        var to = MapTransientTextureState(toState, isSource: false);
+        barrier = new RHIImageMemoryBarrier
+        {
+            SrcAccessMask = from.Access,
+            DstAccessMask = to.Access,
+            OldLayout = from.Layout,
+            NewLayout = to.Layout,
+            SrcQueueFamilyIndex = RHIQueueFamily.Ignored,
+            DstQueueFamilyIndex = RHIQueueFamily.Ignored,
+            Image = texture.Image,
+            SubresourceRange = new RHIImageSubresourceRange
+            {
+                AspectMask = texture.AspectMask,
+                BaseMipLevel = 0,
+                LevelCount = 1,
+                BaseArrayLayer = 0,
+                LayerCount = 1
+            },
+            SrcStageMask = from.Stage,
+            DstStageMask = to.Stage
+        };
+
+        return true;
+    }
+
+    private static RenderTextureRhiState MapTransientTextureState(
+        RenderResourceState state,
+        bool isSource)
+    {
+        return state switch
+        {
+            RenderResourceState.Unknown when isSource => new RenderTextureRhiState(
+                EImageLayout.IMAGE_LAYOUT_UNDEFINED,
+                EAccessFlag.ACCESS_NONE,
+                EPipelineStageFlagBits.PIPELINE_STAGE_TOP_OF_PIPE_BIT),
+            RenderResourceState.ColorAttachment => new RenderTextureRhiState(
+                EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                EAccessFlag.ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                EPipelineStageFlagBits.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT),
+            RenderResourceState.DepthAttachment => new RenderTextureRhiState(
+                EImageLayout.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                EAccessFlag.ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                EAccessFlag.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                (EPipelineStageFlagBits)(
+                    (uint)EPipelineStageFlagBits.PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                    (uint)EPipelineStageFlagBits.PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT)),
+            RenderResourceState.ShaderRead => new RenderTextureRhiState(
+                EImageLayout.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                EAccessFlag.ACCESS_SHADER_READ_BIT,
+                EPipelineStageFlagBits.PIPELINE_STAGE_FRAGMENT_SHADER_BIT),
+            RenderResourceState.TransferRead => new RenderTextureRhiState(
+                EImageLayout.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                EAccessFlag.ACCESS_TRANSFER_READ_BIT,
+                EPipelineStageFlagBits.PIPELINE_STAGE_TRANSFER_BIT),
+            RenderResourceState.TransferWrite => new RenderTextureRhiState(
+                EImageLayout.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                EAccessFlag.ACCESS_TRANSFER_WRITE_BIT,
+                EPipelineStageFlagBits.PIPELINE_STAGE_TRANSFER_BIT),
+            _ => throw new InvalidOperationException(
+                $"Transient texture does not support graph transition state '{state}'.")
+        };
+    }
+
+    private readonly struct RenderTextureRhiState
+    {
+        public RenderTextureRhiState(
+            EImageLayout layout,
+            EAccessFlag access,
+            EPipelineStageFlagBits stage)
+        {
+            Layout = layout;
+            Access = access;
+            Stage = stage;
+        }
+
+        public EImageLayout Layout { get; }
+        public EAccessFlag Access { get; }
+        public EPipelineStageFlagBits Stage { get; }
+    }
+
+    private void UpdateTransientTextureStates(CompiledRenderGraphLayout layout)
+    {
+        if (m_TransientTexturesByResourceId.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var pair in m_TransientTexturesByResourceId)
+        {
+            if (TryGetFinalResourceState(pair.Key, layout.SortedNodeIds, out var finalState))
+            {
+                pair.Value.CurrentState = finalState;
+            }
+        }
+    }
+
+    private bool TryGetFinalResourceState(
+        uint resourceId,
+        IReadOnlyList<uint> sortedNodeIds,
+        out RenderResourceState finalState)
+    {
+        finalState = RenderResourceState.Unknown;
+        var hasState = false;
+        for (int nodeIndex = 0; nodeIndex < sortedNodeIds.Count; nodeIndex++)
+        {
+            if (!TryGetResourceAccessState(
+                    resourceId,
+                    sortedNodeIds[nodeIndex],
+                    out var state,
+                    out _))
+            {
+                continue;
+            }
+
+            finalState = state;
+            hasState = true;
+        }
+
+        return hasState;
     }
 
     private RenderPassNode GetRequiredNode(uint nodeId)
@@ -1290,6 +1511,14 @@ public sealed class RenderGraph : IDisposable
         m_CommandPools.Clear();
         m_CommandBuffers.Clear();
         m_RecordingErrors.Clear();
+        foreach (var texture in m_TransientTextures.Values)
+        {
+            texture.DisposeDeferred(m_DisposalQueue, m_LastSubmittedTicket);
+        }
+
+        m_TransientTextures.Clear();
+        m_TransientTexturesByResourceId.Clear();
+        m_FrameTransientTextureNames.Clear();
         m_CachedLayout = null;
         m_Graph.Clear();
         m_Resources.Clear();

@@ -23,9 +23,17 @@ public struct RenderContext
     public RenderOutputKind OutputKind => Snapshot.OutputKind;
     public RHIImageHandle TargetImage => Snapshot.TargetImage;
     public int CameraCount => Snapshot.CameraCount;
+    public int DirectionalLightCount => Snapshot.DirectionalLightCount;
+    public int PointLightCount => Snapshot.PointLightCount;
+    public int SpotLightCount => Snapshot.SpotLightCount;
+    public SceneEnvironment SceneEnvironment => Snapshot.SceneEnvironment;
+    public int SceneEnvironmentCount => Snapshot.SceneEnvironmentCount;
     public int DrawListCount => Snapshot.DrawListCount;
     public int StaticMeshItemCount => Snapshot.StaticMeshItemCount;
     public readonly ReadOnlySpan<Camera> Cameras => Snapshot.Cameras;
+    public readonly ReadOnlySpan<DirectionalLight> DirectionalLights => Snapshot.DirectionalLights;
+    public readonly ReadOnlySpan<PointLight> PointLights => Snapshot.PointLights;
+    public readonly ReadOnlySpan<SpotLight> SpotLights => Snapshot.SpotLights;
     public readonly ReadOnlySpan<MeshDrawCommand> DrawList => Snapshot.DrawList;
     public readonly ReadOnlySpan<StaticMeshRenderItem> StaticMeshItems => Snapshot.StaticMeshItems;
 
