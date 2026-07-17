@@ -24,6 +24,7 @@ public class RenderSubsystem : ITickableSubsystem
 
     public static RenderSubsystem? Instance;
     public static Action? AllSurfacesDestroyed;
+    public event Action<IntPtr>? OutputFrameReady;
     private static ConcurrentDictionary<IntPtr, SurfaceInfo> s_GlobalSurfaces
     {
         get
@@ -146,7 +147,7 @@ public class RenderSubsystem : ITickableSubsystem
             var sceneSubsystem = EngineKernel.Instance.GetSubsystem<SceneSubsystem>();
             var entityManager = sceneSubsystem?.ActiveEntityManager;
             
-            var frameIndex = EngineKernel.Instance.CurrentFrameIndex;
+            var engineFrameIndex = EngineKernel.Instance.CurrentFrameIndex;
             
             // Acquire the current swapchain image.
             // If this fails (e.g. window minimized or 0x0 size), we skip rendering for this surface.
@@ -155,15 +156,18 @@ public class RenderSubsystem : ITickableSubsystem
                 : RenderOutputKind.NativeSwapchain;
 
             var concreteSurface = surface as RenderSurface;
+            var frameIndex = engineFrameIndex;
             if (outputKind == RenderOutputKind.EditorSharedTexture &&
                 concreteSurface != null &&
-                !concreteSurface.CanSubmitOutputFrame(frameIndex, RenderSurface.EditorSharedTextureMaxOutstandingFrames))
+                !concreteSurface.TryGetNextOutputFrameIndex(
+                    RenderSurface.EditorSharedTextureMaxOutstandingFrames,
+                    out frameIndex))
             {
                 Profiler.PlotValue("Render.SharedTexturePacingSkipped", 1);
-                if (frameIndex % 60 == 0)
+                if (engineFrameIndex % 60 == 0)
                 {
                     Logger.Log(
-                        $"[RenderSubsystem] Shared texture pacing skipped frame | Surface: 0x{surface.SurfaceId:X} | Frame: {frameIndex} | LastConsumed: {surface.GetLastConsumedFrameIndex()}");
+                        $"[RenderSubsystem] Shared texture pacing skipped frame | Surface: 0x{surface.SurfaceId:X} | EngineFrame: {engineFrameIndex} | NextOutputFrame: {frameIndex} | LastConsumed: {surface.GetLastConsumedFrameIndex()}");
                 }
 
                 continue;
@@ -444,7 +448,7 @@ public class RenderSubsystem : ITickableSubsystem
                     // Instead of stalling the CPU here (which slows down the simulation),
                     // we pass the ticket to the surface so the consumer (Editor Viewport)
                     // can perform a targeted asynchronous wait.
-                    if (concreteSurface != null)
+                    if (concreteSurface != null && ticket != 0)
                     {
                         var pid = System.Diagnostics.Process.GetCurrentProcess().Id;
                         var sharedHandle = surface.GetSharedHandle(context.FrameIndex);
@@ -464,6 +468,12 @@ public class RenderSubsystem : ITickableSubsystem
 
                 // Finalize output work and signal presentation.
                 submission.End();
+                if (outputKind == RenderOutputKind.EditorSharedTexture &&
+                    concreteSurface != null &&
+                    ticket != 0)
+                {
+                    NotifyOutputFrameReady(surfaceInfo.Parent);
+                }
             }
         }
         finally
@@ -475,6 +485,21 @@ public class RenderSubsystem : ITickableSubsystem
     public void RegisterSurface(IntPtr host, string name, SurfaceType surfaceType, int width = 0, int height = 0)
     {
         m_CommandQueue.Enqueue(new RegisterSurfaceCommand(host, name, surfaceType, width, height));
+    }
+
+    private void NotifyOutputFrameReady(IntPtr host)
+    {
+        try
+        {
+            OutputFrameReady?.Invoke(host);
+        }
+        catch (Exception ex)
+        {
+            KernelLog.WarningFormat(
+                "[RenderSubsystem] Output-ready subscriber failed for host 0x{0:X}: {1}",
+                host.ToInt64(),
+                ex.Message);
+        }
     }
 
     internal void InternalRegisterSurface(IntPtr host, string name, SurfaceType surfaceType, int width = 0, int height = 0)
