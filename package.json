@@ -39,6 +39,7 @@
     "com.arisen.taskgraph": "1.0.0"
   },
   "nugetDependencies": {
-    "StbImageSharp": "2.30.15"
+    "StbImageSharp": "2.30.15",
+    "YamlDotNet": "16.3.0"
   }
 }

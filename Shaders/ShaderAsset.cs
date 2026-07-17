@@ -167,7 +167,9 @@ public static class ShaderAssetCooker
         var outputPath = assetDatabase.GetCookedArtifactPath(shader.Guid, variant, GetCookedExtension(shader.Variant.Backend));
         var newestSourceWriteTimeUtc = GetNewestSourceWriteTimeUtc(sourceAsset.SourcePath, shader.Includes);
 
-        if (!File.Exists(outputPath) || File.GetLastWriteTimeUtc(outputPath) < newestSourceWriteTimeUtc)
+        if (!assetDatabase.TryGetCookedArtifact(shader.Guid, variant, out _) ||
+            !File.Exists(outputPath) ||
+            File.GetLastWriteTimeUtc(outputPath) < newestSourceWriteTimeUtc)
         {
             CookStage(sourceAsset, shader, stage, variant, outputPath);
         }

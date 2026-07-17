@@ -46,6 +46,11 @@ public sealed record Texture2DAsset(
     Texture2DVariantKey Variant,
     Texture2DSourceFormat SourceFormat = Texture2DSourceFormat.PpmP3);
 
+public readonly record struct DecodedTexture2DSource(
+    uint Width,
+    uint Height,
+    byte[] RgbaPixels);
+
 public readonly record struct CookedTexture2D(
     Texture2DAsset Asset,
     string Variant,
@@ -96,7 +101,9 @@ public static class Texture2DAssetCooker
         var outputPath = assetDatabase.GetCookedArtifactPath(texture.Guid, variant, ".texture2d");
         var sourceWriteTimeUtc = File.GetLastWriteTimeUtc(sourceAsset.SourcePath);
 
-        if (!File.Exists(outputPath) || File.GetLastWriteTimeUtc(outputPath) < sourceWriteTimeUtc)
+        if (!assetDatabase.TryGetCookedArtifact(texture.Guid, variant, out _) ||
+            !File.Exists(outputPath) ||
+            File.GetLastWriteTimeUtc(outputPath) < sourceWriteTimeUtc)
         {
             CookTexture(sourceAsset, texture, variant, outputPath);
         }
@@ -151,6 +158,23 @@ public static class Texture2DAssetCooker
         return bytes.Span.Slice(HeaderSize, header.PixelDataSize);
     }
 
+    public static DecodedTexture2DSource DecodeSource(
+        string sourcePath,
+        Texture2DSourceFormat sourceFormat)
+    {
+        if (string.IsNullOrWhiteSpace(sourcePath))
+        {
+            throw new ArgumentException("Texture source path cannot be empty.", nameof(sourcePath));
+        }
+
+        return sourceFormat switch
+        {
+            Texture2DSourceFormat.PpmP3 => ReadPpmP3(sourcePath),
+            Texture2DSourceFormat.ImageFile => ReadImageFile(sourcePath),
+            _ => throw new NotSupportedException($"Texture source format '{sourceFormat}' is not implemented yet.")
+        };
+    }
+
     private static void CookTexture(
         AssetRecord sourceAsset,
         Texture2DAsset texture,
@@ -159,12 +183,7 @@ public static class Texture2DAssetCooker
     {
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
-        var source = texture.SourceFormat switch
-        {
-            Texture2DSourceFormat.PpmP3 => ReadPpmP3(sourceAsset.SourcePath),
-            Texture2DSourceFormat.ImageFile => ReadImageFile(sourceAsset.SourcePath),
-            _ => throw new NotSupportedException($"Texture source format '{texture.SourceFormat}' is not implemented yet.")
-        };
+        var source = DecodeSource(sourceAsset.SourcePath, texture.SourceFormat);
 
         using var stream = File.Create(outputPath);
         stream.Write(s_Magic);
@@ -220,7 +239,7 @@ public static class Texture2DAssetCooker
             pixelDataSize);
     }
 
-    private static SourceTexture ReadPpmP3(string sourcePath)
+    private static DecodedTexture2DSource ReadPpmP3(string sourcePath)
     {
         var tokenizer = new PpmTokenizer(File.ReadAllText(sourcePath));
         var magic = tokenizer.NextToken();
@@ -247,10 +266,10 @@ public static class Texture2DAssetCooker
             pixels[(i * 4) + 3] = 255;
         }
 
-        return new SourceTexture(width, height, pixels);
+        return new DecodedTexture2DSource(width, height, pixels);
     }
 
-    private static SourceTexture ReadImageFile(string sourcePath)
+    private static DecodedTexture2DSource ReadImageFile(string sourcePath)
     {
         using var stream = File.OpenRead(sourcePath);
         var image = ImageResult.FromStream(stream, ColorComponents.RedGreenBlueAlpha);
@@ -266,7 +285,7 @@ public static class Texture2DAssetCooker
                 $"[Texture2DAssetCooker] '{sourcePath}' decoded to {image.Data.Length} bytes, expected {expectedLength}.");
         }
 
-        return new SourceTexture(checked((uint)image.Width), checked((uint)image.Height), image.Data);
+        return new DecodedTexture2DSource(checked((uint)image.Width), checked((uint)image.Height), image.Data);
     }
 
     private static byte ScaleToByte(uint value, uint maxValue)
@@ -290,8 +309,6 @@ public static class Texture2DAssetCooker
     {
         return BinaryPrimitives.ReadInt32LittleEndian(bytes.Slice(offset, 4));
     }
-
-    private readonly record struct SourceTexture(uint Width, uint Height, byte[] RgbaPixels);
 
     private readonly record struct CookedTexture2DHeader(
         uint Width,

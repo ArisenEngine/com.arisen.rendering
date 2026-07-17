@@ -9,7 +9,8 @@ public readonly record struct MaterialTexture2DBinding(
     string Name,
     uint Slot,
     uint ImageIndex,
-    uint SamplerIndex);
+    uint SamplerIndex,
+    MaterialTextureTransform Transform);
 
 [StructLayout(LayoutKind.Sequential)]
 public readonly struct MaterialTexture2DBindlessConstants
@@ -84,7 +85,11 @@ public sealed class RHIMaterialResource : IDisposable
                     throw new InvalidOperationException($"[RHIMaterialResource] Material '{m_Asset.Name}' has an unnamed Texture2D binding at index {i}.");
                 }
 
-                var texture = new RHITexture2DResource(device, m_AssetDatabase, textureRef.Texture);
+                var texture = new RHITexture2DResource(
+                    device,
+                    m_AssetDatabase,
+                    textureRef.Texture,
+                    textureRef.ResolvedSampler);
                 if (!texture.IsValid ||
                     texture.BindlessImageIndex == InvalidBindlessIndex ||
                     texture.BindlessSamplerIndex == InvalidBindlessIndex)
@@ -99,7 +104,8 @@ public sealed class RHIMaterialResource : IDisposable
                     textureRef.Name,
                     textureRef.Slot,
                     texture.BindlessImageIndex,
-                    texture.BindlessSamplerIndex);
+                    texture.BindlessSamplerIndex,
+                    textureRef.ResolvedTransform);
             }
 
             IsValid = true;
@@ -138,6 +144,22 @@ public sealed class RHIMaterialResource : IDisposable
 
         throw new InvalidOperationException(
             $"[RHIMaterialResource] Material '{m_Asset.Name}' does not define Texture2D binding '{name}'.");
+    }
+
+    public bool TryGetTexture2DTransform(string name, out MaterialTextureTransform transform)
+    {
+        for (int i = 0; i < m_TextureBindings.Length; i++)
+        {
+            var binding = m_TextureBindings[i];
+            if (string.Equals(binding.Name, name, StringComparison.OrdinalIgnoreCase))
+            {
+                transform = binding.Transform;
+                return true;
+            }
+        }
+
+        transform = MaterialTextureTransform.Identity;
+        return false;
     }
 
     public bool TryGetScalarProperty(string name, out float value)
