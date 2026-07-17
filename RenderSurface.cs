@@ -27,6 +27,7 @@ public class RenderSurface : IRenderSurface
     private uint m_LastConsumedFrameIndex;
     private uint m_LastRenderWidth;
     private uint m_LastRenderHeight;
+    private uint m_NextOutputFrameIndex;
     private uint m_ResizeGeneration;
     private uint m_LastRenderResizeGeneration;
     private RenderOutputFramePacingState m_FramePacing;
@@ -353,11 +354,12 @@ public class RenderSurface : IRenderSurface
         }
     }
 
-    internal bool CanSubmitOutputFrame(uint frameIndex, uint maxOutstandingFrames)
+    internal bool TryGetNextOutputFrameIndex(uint maxOutstandingFrames, out uint frameIndex)
     {
         lock (m_OutputLock)
         {
-            return m_FramePacing.CanSubmit(frameIndex, maxOutstandingFrames);
+            frameIndex = m_NextOutputFrameIndex;
+            return m_FramePacing.CanSubmit(maxOutstandingFrames);
         }
     }
 
@@ -372,6 +374,7 @@ public class RenderSurface : IRenderSurface
             m_LastRenderResizeGeneration = m_ResizeGeneration;
             m_LastRenderSwapChain = swapChain;
             m_FramePacing.MarkSubmitted(frameIndex);
+            m_NextOutputFrameIndex = unchecked(frameIndex + 1);
         }
     }
 
