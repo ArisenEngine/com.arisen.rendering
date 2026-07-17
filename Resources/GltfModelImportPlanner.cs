@@ -18,6 +18,14 @@ public sealed record GltfGeneratedChildAsset(
     string Key,
     AssetMetadata Metadata);
 
+public enum GltfMaterialAlphaMode
+{
+    Opaque,
+    Mask,
+    Blend,
+    Unsupported
+}
+
 public sealed record GltfImportedMaterial(
     Guid Guid,
     string Name,
@@ -27,14 +35,21 @@ public sealed record GltfImportedMaterial(
     float RoughnessFactor,
     GltfImportedTextureRef? BaseColorTexture,
     GltfImportedTextureRef? NormalTexture,
-    GltfImportedTextureRef? EmissiveTexture);
+    GltfImportedTextureRef? EmissiveTexture,
+    GltfImportedTextureRef? MetallicRoughnessTexture,
+    GltfImportedTextureRef? OcclusionTexture,
+    float OcclusionStrength,
+    GltfMaterialAlphaMode AlphaMode,
+    float AlphaCutoff);
 
 public sealed record GltfImportedTextureRef(
     int TextureIndex,
     int ImageIndex,
     string? Uri,
-    int BufferView = -1,
-    string? MimeType = null);
+    int BufferView,
+    string? MimeType,
+    MaterialTextureSamplerSettings Sampler,
+    MaterialTextureTransform Transform);
 
 public sealed record GltfImportedImageSource(
     int ImageIndex,
@@ -78,7 +93,7 @@ public static class GltfModelImportPlanner
         AddMeshChildren(root, sourceGuid, normalizedPackageId, children);
         var images = ReadImageSources(sourcePath, root);
         var materials = ReadMaterials(sourcePath, root, sourceGuid, normalizedPackageId, children, warnings);
-        AddTextureChildren(sourceGuid, normalizedPackageId, images, children);
+        AddTextureChildren(sourceGuid, normalizedPackageId, materials, children);
         AddUnsupportedFeatureWarnings(root, warnings);
 
         return new GltfModelImportPlan(
@@ -236,17 +251,11 @@ public static class GltfModelImportPlanner
                 : Vector3.Zero;
             var emissiveStrength = ReadEmissiveStrength(material);
             var emissiveFactor = new Vector4(emissiveColor, emissiveStrength);
-
-            if (material.TryGetProperty("occlusionTexture", out _))
-            {
-                warnings.Add($"materials/{i}.occlusionTexture is not imported by the first material slice.");
-            }
-
-            if (material.TryGetProperty("alphaMode", out var alphaMode) &&
-                !string.Equals(alphaMode.GetString(), "OPAQUE", StringComparison.OrdinalIgnoreCase))
-            {
-                warnings.Add($"materials/{i}.alphaMode '{alphaMode.GetString()}' is not imported by the first material slice.");
-            }
+            var alphaMode = ReadAlphaMode(material, key, warnings);
+            var alphaCutoff = material.TryGetProperty("alphaCutoff", out var alphaCutoffElement)
+                ? alphaCutoffElement.GetSingle()
+                : MaterialPbrDefaults.AlphaCutoff;
+            var occlusionStrength = ReadOcclusionStrength(material);
 
             materials[i] = new GltfImportedMaterial(
                 child.Metadata.Guid,
@@ -255,9 +264,14 @@ public static class GltfModelImportPlanner
                 emissiveFactor,
                 metallicFactor,
                 roughnessFactor,
-                ReadTextureRef(root, pbr, "baseColorTexture"),
-                ReadTextureRef(root, material, "normalTexture"),
-                ReadTextureRef(root, material, "emissiveTexture"));
+                ReadTextureRef(sourcePath, root, pbr, "baseColorTexture", $"{key}.pbrMetallicRoughness", warnings),
+                ReadTextureRef(sourcePath, root, material, "normalTexture", key, warnings),
+                ReadTextureRef(sourcePath, root, material, "emissiveTexture", key, warnings),
+                ReadTextureRef(sourcePath, root, pbr, "metallicRoughnessTexture", $"{key}.pbrMetallicRoughness", warnings),
+                ReadTextureRef(sourcePath, root, material, "occlusionTexture", key, warnings),
+                occlusionStrength,
+                alphaMode,
+                alphaCutoff);
         }
 
         return materials;
@@ -300,16 +314,40 @@ public static class GltfModelImportPlanner
     private static void AddTextureChildren(
         Guid sourceGuid,
         string packageId,
-        IReadOnlyList<GltfImportedImageSource> images,
+        IReadOnlyList<GltfImportedMaterial> materials,
         List<GltfGeneratedChildAsset> children)
     {
-        for (int i = 0; i < images.Count; i++)
+        var imageIndices = new SortedSet<int>();
+        for (int i = 0; i < materials.Count; i++)
         {
-            children.Add(CreateChild(sourceGuid, packageId, "texture2d", $"images/{i}", "Texture2D", "GltfTextureImporter"));
+            AddReferencedImageIndex(imageIndices, materials[i].BaseColorTexture);
+            AddReferencedImageIndex(imageIndices, materials[i].NormalTexture);
+            AddReferencedImageIndex(imageIndices, materials[i].EmissiveTexture);
+            AddReferencedImageIndex(imageIndices, materials[i].MetallicRoughnessTexture);
+            AddReferencedImageIndex(imageIndices, materials[i].OcclusionTexture);
+        }
+
+        foreach (var imageIndex in imageIndices)
+        {
+            children.Add(CreateChild(sourceGuid, packageId, "texture2d", $"images/{imageIndex}", "Texture2D", "GltfTextureImporter"));
         }
     }
 
-    private static GltfImportedTextureRef? ReadTextureRef(JsonElement root, JsonElement owner, string propertyName)
+    private static void AddReferencedImageIndex(SortedSet<int> imageIndices, GltfImportedTextureRef? textureRef)
+    {
+        if (textureRef != null && textureRef.ImageIndex >= 0)
+        {
+            imageIndices.Add(textureRef.ImageIndex);
+        }
+    }
+
+    private static GltfImportedTextureRef? ReadTextureRef(
+        string sourcePath,
+        JsonElement root,
+        JsonElement owner,
+        string propertyName,
+        string ownerContext,
+        List<string> warnings)
     {
         if (owner.ValueKind != JsonValueKind.Object ||
             !owner.TryGetProperty(propertyName, out var textureInfo) ||
@@ -319,15 +357,25 @@ public static class GltfModelImportPlanner
         }
 
         var textureIndex = indexElement.GetInt32();
+        var context = $"{ownerContext}.{propertyName}";
+        var transform = ReadTextureTransform(sourcePath, textureInfo, context, warnings);
         if (!root.TryGetProperty("textures", out var textures) ||
             textures.ValueKind != JsonValueKind.Array ||
             textureIndex < 0 ||
             textureIndex >= textures.GetArrayLength())
         {
-            return new GltfImportedTextureRef(textureIndex, -1, null);
+            return new GltfImportedTextureRef(
+                textureIndex,
+                -1,
+                null,
+                -1,
+                null,
+                MaterialTextureSamplerSettings.Default,
+                transform);
         }
 
         var texture = textures[textureIndex];
+        var sampler = ReadTextureSamplerSettings(root, texture, context, warnings);
         var imageIndex = texture.TryGetProperty("source", out var sourceElement)
             ? sourceElement.GetInt32()
             : -1;
@@ -353,7 +401,222 @@ public static class GltfModelImportPlanner
                 : null;
         }
 
-        return new GltfImportedTextureRef(textureIndex, imageIndex, uri, bufferView, mimeType);
+        return new GltfImportedTextureRef(
+            textureIndex,
+            imageIndex,
+            uri,
+            bufferView,
+            mimeType,
+            sampler,
+            transform);
+    }
+
+    private static MaterialTextureSamplerSettings ReadTextureSamplerSettings(
+        JsonElement root,
+        JsonElement texture,
+        string context,
+        List<string> warnings)
+    {
+        var defaults = MaterialTextureSamplerSettings.Default;
+        if (!texture.TryGetProperty("sampler", out var samplerIndexElement))
+        {
+            return defaults;
+        }
+
+        if (!samplerIndexElement.TryGetInt32(out var samplerIndex) ||
+            samplerIndex < 0 ||
+            !root.TryGetProperty("samplers", out var samplers) ||
+            samplers.ValueKind != JsonValueKind.Array ||
+            samplerIndex >= samplers.GetArrayLength())
+        {
+            warnings.Add($"{context} references invalid sampler '{samplerIndexElement}'; default sampler settings are used.");
+            return defaults;
+        }
+
+        var sampler = samplers[samplerIndex];
+        var minFilter = defaults.MinFilter;
+        var magFilter = defaults.MagFilter;
+        var mipmapMode = defaults.MipmapMode;
+        var wrapU = defaults.WrapU;
+        var wrapV = defaults.WrapV;
+
+        if (sampler.TryGetProperty("minFilter", out var minFilterElement))
+        {
+            var value = minFilterElement.GetInt32();
+            if (!TryMapMinFilter(value, out minFilter, out mipmapMode))
+            {
+                warnings.Add($"{context} sampler minFilter '{value}' is unsupported; the default minification filter is used.");
+                minFilter = defaults.MinFilter;
+                mipmapMode = defaults.MipmapMode;
+            }
+        }
+
+        if (sampler.TryGetProperty("magFilter", out var magFilterElement))
+        {
+            var value = magFilterElement.GetInt32();
+            if (!TryMapMagFilter(value, out magFilter))
+            {
+                warnings.Add($"{context} sampler magFilter '{value}' is unsupported; the default magnification filter is used.");
+                magFilter = defaults.MagFilter;
+            }
+        }
+
+        if (sampler.TryGetProperty("wrapS", out var wrapSElement))
+        {
+            var value = wrapSElement.GetInt32();
+            if (!TryMapWrapMode(value, out wrapU))
+            {
+                warnings.Add($"{context} sampler wrapS '{value}' is unsupported; the default U wrap mode is used.");
+                wrapU = defaults.WrapU;
+            }
+        }
+
+        if (sampler.TryGetProperty("wrapT", out var wrapTElement))
+        {
+            var value = wrapTElement.GetInt32();
+            if (!TryMapWrapMode(value, out wrapV))
+            {
+                warnings.Add($"{context} sampler wrapT '{value}' is unsupported; the default V wrap mode is used.");
+                wrapV = defaults.WrapV;
+            }
+        }
+
+        return new MaterialTextureSamplerSettings(minFilter, magFilter, mipmapMode, wrapU, wrapV);
+    }
+
+    private static MaterialTextureTransform ReadTextureTransform(
+        string sourcePath,
+        JsonElement textureInfo,
+        string context,
+        List<string> warnings)
+    {
+        var offset = Vector2.Zero;
+        var scale = Vector2.One;
+        var rotation = 0.0f;
+        var texCoord = ReadTextureCoordinate(textureInfo, "texCoord", 0, sourcePath, context);
+
+        if (textureInfo.TryGetProperty("extensions", out var extensions) &&
+            extensions.ValueKind == JsonValueKind.Object &&
+            extensions.TryGetProperty("KHR_texture_transform", out var transform) &&
+            transform.ValueKind == JsonValueKind.Object)
+        {
+            if (transform.TryGetProperty("offset", out var offsetElement))
+            {
+                offset = ReadVector2(sourcePath, offsetElement, $"{context}.extensions.KHR_texture_transform.offset");
+            }
+
+            if (transform.TryGetProperty("scale", out var scaleElement))
+            {
+                scale = ReadVector2(sourcePath, scaleElement, $"{context}.extensions.KHR_texture_transform.scale");
+            }
+
+            if (transform.TryGetProperty("rotation", out var rotationElement))
+            {
+                rotation = rotationElement.GetSingle();
+            }
+
+            texCoord = ReadTextureCoordinate(
+                transform,
+                "texCoord",
+                texCoord,
+                sourcePath,
+                $"{context}.extensions.KHR_texture_transform");
+        }
+
+        if (texCoord > 0)
+        {
+            warnings.Add($"{context} uses TEXCOORD_{texCoord}; metadata is preserved, but the current static mesh material path only samples TEXCOORD_0.");
+        }
+
+        return new MaterialTextureTransform(offset, scale, rotation, texCoord);
+    }
+
+    private static uint ReadTextureCoordinate(
+        JsonElement owner,
+        string propertyName,
+        uint defaultValue,
+        string sourcePath,
+        string context)
+    {
+        if (!owner.TryGetProperty(propertyName, out var texCoordElement))
+        {
+            return defaultValue;
+        }
+
+        if (!texCoordElement.TryGetInt32(out var texCoord) || texCoord < 0)
+        {
+            throw new InvalidOperationException(
+                $"[GltfModelImportPlanner] glTF source '{sourcePath}' {context}.{propertyName} must be a non-negative integer.");
+        }
+
+        return checked((uint)texCoord);
+    }
+
+    private static bool TryMapMinFilter(
+        int value,
+        out MaterialTextureFilter filter,
+        out MaterialTextureMipmapMode mipmapMode)
+    {
+        switch (value)
+        {
+            case 9728:
+            case 9984:
+                filter = MaterialTextureFilter.Nearest;
+                mipmapMode = MaterialTextureMipmapMode.Nearest;
+                return true;
+            case 9729:
+            case 9985:
+                filter = MaterialTextureFilter.Linear;
+                mipmapMode = MaterialTextureMipmapMode.Nearest;
+                return true;
+            case 9986:
+                filter = MaterialTextureFilter.Nearest;
+                mipmapMode = MaterialTextureMipmapMode.Linear;
+                return true;
+            case 9987:
+                filter = MaterialTextureFilter.Linear;
+                mipmapMode = MaterialTextureMipmapMode.Linear;
+                return true;
+            default:
+                filter = default;
+                mipmapMode = default;
+                return false;
+        }
+    }
+
+    private static bool TryMapMagFilter(int value, out MaterialTextureFilter filter)
+    {
+        switch (value)
+        {
+            case 9728:
+                filter = MaterialTextureFilter.Nearest;
+                return true;
+            case 9729:
+                filter = MaterialTextureFilter.Linear;
+                return true;
+            default:
+                filter = default;
+                return false;
+        }
+    }
+
+    private static bool TryMapWrapMode(int value, out MaterialTextureWrapMode wrapMode)
+    {
+        switch (value)
+        {
+            case 10497:
+                wrapMode = MaterialTextureWrapMode.Repeat;
+                return true;
+            case 33648:
+                wrapMode = MaterialTextureWrapMode.MirroredRepeat;
+                return true;
+            case 33071:
+                wrapMode = MaterialTextureWrapMode.ClampToEdge;
+                return true;
+            default:
+                wrapMode = default;
+                return false;
+        }
     }
 
     private static void AddUnsupportedFeatureWarnings(JsonElement root, List<string> warnings)
@@ -389,6 +652,61 @@ public static class GltfModelImportPlanner
                 }
             }
         }
+    }
+
+    private static GltfMaterialAlphaMode ReadAlphaMode(
+        JsonElement material,
+        string context,
+        List<string> warnings)
+    {
+        if (!material.TryGetProperty("alphaMode", out var alphaModeElement))
+        {
+            return GltfMaterialAlphaMode.Opaque;
+        }
+
+        var alphaMode = alphaModeElement.GetString();
+        if (string.Equals(alphaMode, "OPAQUE", StringComparison.OrdinalIgnoreCase))
+        {
+            return GltfMaterialAlphaMode.Opaque;
+        }
+
+        if (string.Equals(alphaMode, "MASK", StringComparison.OrdinalIgnoreCase))
+        {
+            return GltfMaterialAlphaMode.Mask;
+        }
+
+        if (string.Equals(alphaMode, "BLEND", StringComparison.OrdinalIgnoreCase))
+        {
+            warnings.Add($"{context}.alphaMode 'BLEND' requires the transparent render pass and remains unsupported; the generated material is emitted without blending.");
+            return GltfMaterialAlphaMode.Blend;
+        }
+
+        warnings.Add($"{context}.alphaMode '{alphaMode}' is unsupported; the generated material is emitted as opaque.");
+        return GltfMaterialAlphaMode.Unsupported;
+    }
+
+    private static float ReadOcclusionStrength(JsonElement material)
+    {
+        if (!material.TryGetProperty("occlusionTexture", out var occlusionTexture) ||
+            occlusionTexture.ValueKind != JsonValueKind.Object ||
+            !occlusionTexture.TryGetProperty("strength", out var strength))
+        {
+            return MaterialPbrDefaults.OcclusionStrength;
+        }
+
+        return strength.GetSingle();
+    }
+
+    private static Vector2 ReadVector2(string sourcePath, JsonElement element, string context)
+    {
+        if (element.ValueKind != JsonValueKind.Array || element.GetArrayLength() != 2)
+        {
+            throw new InvalidOperationException($"[GltfModelImportPlanner] glTF source '{sourcePath}' {context} must contain two numeric values.");
+        }
+
+        return new Vector2(
+            element[0].GetSingle(),
+            element[1].GetSingle());
     }
 
     private static Vector4 ReadVector4(string sourcePath, JsonElement element, string context)

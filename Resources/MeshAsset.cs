@@ -112,7 +112,8 @@ public static class MeshAssetCooker
         var outputPath = assetDatabase.GetCookedArtifactPath(mesh.Guid, variant, ".mesh");
         var sourceWriteTimeUtc = GetSourceDependencyWriteTimeUtc(sourceAsset.SourcePath, mesh.SourceFormat);
 
-        if (!File.Exists(outputPath) ||
+        if (!assetDatabase.TryGetCookedArtifact(mesh.Guid, variant, out _) ||
+            !File.Exists(outputPath) ||
             File.GetLastWriteTimeUtc(outputPath) < sourceWriteTimeUtc ||
             !IsCurrentCookedMesh(outputPath))
         {

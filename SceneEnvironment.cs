@@ -1,17 +1,24 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using ArisenEngine.Core.ECS;
 
 namespace ArisenEngine.Rendering;
 
 [StructLayout(LayoutKind.Sequential)]
 public struct SceneEnvironment
 {
+    public const float DefaultExposure = SceneEnvironmentComponent.DefaultExposure;
+    public const float MinimumExposure = SceneEnvironmentComponent.MinimumExposure;
+    public const float MaximumExposure = SceneEnvironmentComponent.MaximumExposure;
+
+    public Guid EnvironmentTextureGuid;
     public Vector3 SkyColor;
     public Vector3 HorizonColor;
     public Vector3 GroundColor;
     public Vector3 AmbientColor;
     public float SkyIntensity;
     public float AmbientIntensity;
+    public float Exposure;
 
     public bool IsValid => SkyIntensity > 0.0f || AmbientIntensity > 0.0f;
 
@@ -29,17 +36,26 @@ public struct SceneEnvironment
         Vector3 groundColor,
         Vector3 ambientColor,
         float skyIntensity,
-        float ambientIntensity)
+        float ambientIntensity,
+        Guid environmentTextureGuid = default,
+        float exposure = DefaultExposure)
     {
         return new SceneEnvironment
         {
+            EnvironmentTextureGuid = environmentTextureGuid,
             SkyColor = Vector3.Max(Vector3.Zero, skyColor),
             HorizonColor = Vector3.Max(Vector3.Zero, horizonColor),
             GroundColor = Vector3.Max(Vector3.Zero, groundColor),
             AmbientColor = Vector3.Max(Vector3.Zero, ambientColor),
             SkyIntensity = MathF.Max(0.0f, skyIntensity),
-            AmbientIntensity = MathF.Max(0.0f, ambientIntensity)
+            AmbientIntensity = MathF.Max(0.0f, ambientIntensity),
+            Exposure = NormalizeExposure(exposure)
         };
+    }
+
+    public static float NormalizeExposure(float exposure)
+    {
+        return SceneEnvironmentComponent.NormalizeExposure(exposure);
     }
 
     public static SceneEnvironment CreateFlatFallback(

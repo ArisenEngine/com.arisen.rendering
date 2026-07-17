@@ -1,9 +1,11 @@
 using System.Buffers.Binary;
+using System.Numerics;
 using System.Text;
 using ArisenEngine.Core.Assets;
 using ArisenEngine.Core.Diagnostics;
 using ArisenEngine.Core.Serialization;
 using Arisen.Native.RHI;
+using YamlDotNet.Serialization;
 
 namespace ArisenEngine.Rendering.Resources;
 
@@ -12,6 +14,8 @@ public static class MaterialTextureSlots
     public const string BaseColor = "BaseColor";
     public const string Normal = "Normal";
     public const string Emissive = "Emissive";
+    public const string MetallicRoughness = "MetallicRoughness";
+    public const string Occlusion = "Occlusion";
 }
 
 public static class MaterialPropertySlots
@@ -20,12 +24,83 @@ public static class MaterialPropertySlots
     public const string EmissiveFactor = "EmissiveFactor";
     public const string MetallicFactor = "MetallicFactor";
     public const string RoughnessFactor = "RoughnessFactor";
+    public const string OcclusionStrength = "OcclusionStrength";
+    public const string AlphaCutoff = "AlphaCutoff";
+}
+
+public static class MaterialPbrTextureChannels
+{
+    public const int Occlusion = 0;
+    public const int Roughness = 1;
+    public const int Metallic = 2;
+}
+
+public static class MaterialPbrDefaults
+{
+    public const float OcclusionStrength = 1.0f;
+    public const float AlphaCutoff = 0.5f;
+}
+
+public enum MaterialTextureFilter
+{
+    Nearest,
+    Linear
+}
+
+public enum MaterialTextureMipmapMode
+{
+    Nearest,
+    Linear
+}
+
+public enum MaterialTextureWrapMode
+{
+    Repeat,
+    MirroredRepeat,
+    ClampToEdge
+}
+
+public readonly record struct MaterialTextureSamplerSettings(
+    MaterialTextureFilter MinFilter,
+    MaterialTextureFilter MagFilter,
+    MaterialTextureMipmapMode MipmapMode,
+    MaterialTextureWrapMode WrapU,
+    MaterialTextureWrapMode WrapV)
+{
+    public static MaterialTextureSamplerSettings Default { get; } = new(
+        MaterialTextureFilter.Linear,
+        MaterialTextureFilter.Linear,
+        MaterialTextureMipmapMode.Nearest,
+        MaterialTextureWrapMode.Repeat,
+        MaterialTextureWrapMode.Repeat);
+}
+
+public readonly record struct MaterialTextureTransform(
+    Vector2 Offset,
+    Vector2 Scale,
+    float Rotation,
+    uint TexCoord)
+{
+    public static MaterialTextureTransform Identity { get; } = new(
+        Vector2.Zero,
+        Vector2.One,
+        0.0f,
+        0);
 }
 
 public readonly record struct MaterialTexture2DRef(
     string Name,
     Texture2DAsset Texture,
-    uint Slot = 0);
+    uint Slot = 0,
+    MaterialTextureSamplerSettings? Sampler = null,
+    MaterialTextureTransform? Transform = null)
+{
+    public MaterialTextureSamplerSettings ResolvedSampler =>
+        Sampler ?? MaterialTextureSamplerSettings.Default;
+
+    public MaterialTextureTransform ResolvedTransform =>
+        Transform ?? MaterialTextureTransform.Identity;
+}
 
 public readonly record struct MaterialScalarProperty(
     string Name,
@@ -72,6 +147,25 @@ public sealed record MaterialAsset(
     IReadOnlyList<MaterialVector4Property> Vector4Properties,
     MaterialRenderState RenderState);
 
+public enum MaterialShaderContractBindingKind
+{
+    Texture2DRef,
+    ScalarProperty,
+    Vector4Property
+}
+
+public readonly record struct MaterialShaderContractDiagnostic(
+    MaterialShaderContractBindingKind BindingKind,
+    string BindingName,
+    string Message);
+
+public sealed record MaterialAssetInspection(
+    MaterialAsset Asset,
+    IReadOnlyList<MaterialShaderContractDiagnostic> ShaderContractDiagnostics)
+{
+    public bool IsShaderContractValid => ShaderContractDiagnostics.Count == 0;
+}
+
 public readonly record struct CookedMaterial(
     MaterialAsset Asset,
     string Variant,
@@ -91,6 +185,19 @@ public static class MaterialAssetLoader
 
     public static MaterialAsset LoadSource(IAssetDatabase assetDatabase, Guid materialGuid)
     {
+        var inspection = InspectSource(assetDatabase, materialGuid);
+        if (!inspection.IsShaderContractValid)
+        {
+            throw new InvalidOperationException(string.Join(
+                Environment.NewLine,
+                inspection.ShaderContractDiagnostics.Select(diagnostic => diagnostic.Message)));
+        }
+
+        return inspection.Asset;
+    }
+
+    public static MaterialAssetInspection InspectSource(IAssetDatabase assetDatabase, Guid materialGuid)
+    {
         if (assetDatabase == null)
         {
             throw new ArgumentNullException(nameof(assetDatabase));
@@ -107,10 +214,11 @@ public static class MaterialAssetLoader
                 $"[MaterialAssetLoader] Asset '{materialGuid}' has asset type '{sourceAsset.AssetType}', expected '{MaterialAssetType}'.");
         }
 
-        var source = SerializationUtil.Deserialize<SerializedMaterialAsset>(sourceAsset.SourcePath, serializeIfNotExist: false);
+        var source = DeserializeSource(sourceAsset.SourcePath);
         source.Shader.ApplyShaderSourceDefaults(assetDatabase, sourceAsset.SourcePath);
         var shaderSourceContract = source.LoadShaderSourceContract(assetDatabase);
-        source.Validate(sourceAsset.SourcePath, shaderSourceContract);
+        source.ValidateStructure(sourceAsset.SourcePath);
+        var shaderContractDiagnostics = source.InspectShaderContract(sourceAsset.SourcePath, shaderSourceContract);
 
         var shader = source.Shader.ToShaderAsset();
         var textureRefs = new MaterialTexture2DRef[source.Texture2DRefs.Count];
@@ -131,14 +239,25 @@ public static class MaterialAssetLoader
             vector4Properties[i] = source.Vector4Properties[i].ToProperty();
         }
 
-        return new MaterialAsset(
-            materialGuid,
-            string.IsNullOrWhiteSpace(source.Name) ? Path.GetFileNameWithoutExtension(sourceAsset.SourcePath) : source.Name,
-            shader,
-            textureRefs,
-            scalarProperties,
-            vector4Properties,
-            source.ResolveRenderState(assetDatabase, sourceAsset.SourcePath));
+        return new MaterialAssetInspection(
+            new MaterialAsset(
+                materialGuid,
+                string.IsNullOrWhiteSpace(source.Name) ? Path.GetFileNameWithoutExtension(sourceAsset.SourcePath) : source.Name,
+                shader,
+                textureRefs,
+                scalarProperties,
+                vector4Properties,
+                source.ResolveRenderState(assetDatabase, sourceAsset.SourcePath)),
+            shaderContractDiagnostics);
+    }
+
+    private static SerializedMaterialAsset DeserializeSource(string sourcePath)
+    {
+        using var reader = File.OpenText(sourcePath);
+        return new DeserializerBuilder()
+            .IgnoreUnmatchedProperties()
+            .Build()
+            .Deserialize<SerializedMaterialAsset>(reader);
     }
 
     private sealed class SerializedMaterialAsset
@@ -151,7 +270,7 @@ public static class MaterialAssetLoader
         public List<SerializedMaterialVector4Property> Vector4Properties { get; set; } = new();
         public SerializedMaterialRenderState? RenderState { get; set; }
 
-        public void Validate(string sourcePath, MaterialShaderContract shaderSourceContract)
+        public void ValidateStructure(string sourcePath)
         {
             if (Shader.Guid == Guid.Empty)
             {
@@ -180,8 +299,14 @@ public static class MaterialAssetLoader
             ValidateUniqueNames(sourcePath, "Texture2DRefs", Texture2DRefs.Select(texture => texture.Name));
             ValidateUniqueNames(sourcePath, "ScalarProperties", ScalarProperties.Select(property => property.Name));
             ValidateUniqueNames(sourcePath, "Vector4Properties", Vector4Properties.Select(property => property.Name));
+        }
+
+        public IReadOnlyList<MaterialShaderContractDiagnostic> InspectShaderContract(
+            string sourcePath,
+            MaterialShaderContract shaderSourceContract)
+        {
             var effectiveContract = SerializedMaterialShaderContract.Merge(shaderSourceContract, Shader.Contract, ShaderContract);
-            effectiveContract.ValidateMaterialBindings(
+            return effectiveContract.InspectMaterialBindings(
                 sourcePath,
                 Texture2DRefs.Select(texture => texture.Name),
                 ScalarProperties.Select(property => property.Name),
@@ -535,15 +660,35 @@ public static class MaterialAssetLoader
             ValidateRequiredNames(sourcePath, contractPath, nameof(RequiredVector4Properties), RequiredVector4Properties);
         }
 
-        public void ValidateMaterialBindings(
+        public IReadOnlyList<MaterialShaderContractDiagnostic> InspectMaterialBindings(
             string sourcePath,
             IEnumerable<string> textureNames,
             IEnumerable<string> scalarNames,
             IEnumerable<string> vector4Names)
         {
-            ValidateRequiredBindings(sourcePath, "Texture2DRefs", RequiredTexture2DRefs, textureNames);
-            ValidateRequiredBindings(sourcePath, "ScalarProperties", RequiredScalarProperties, scalarNames);
-            ValidateRequiredBindings(sourcePath, "Vector4Properties", RequiredVector4Properties, vector4Names);
+            var diagnostics = new List<MaterialShaderContractDiagnostic>();
+            InspectRequiredBindings(
+                sourcePath,
+                "Texture2DRefs",
+                MaterialShaderContractBindingKind.Texture2DRef,
+                RequiredTexture2DRefs,
+                textureNames,
+                diagnostics);
+            InspectRequiredBindings(
+                sourcePath,
+                "ScalarProperties",
+                MaterialShaderContractBindingKind.ScalarProperty,
+                RequiredScalarProperties,
+                scalarNames,
+                diagnostics);
+            InspectRequiredBindings(
+                sourcePath,
+                "Vector4Properties",
+                MaterialShaderContractBindingKind.Vector4Property,
+                RequiredVector4Properties,
+                vector4Names,
+                diagnostics);
+            return diagnostics;
         }
 
         private static List<string> MergeRequiredNames(params IReadOnlyList<string>?[] sources)
@@ -607,11 +752,13 @@ public static class MaterialAssetLoader
             }
         }
 
-        private static void ValidateRequiredBindings(
+        private static void InspectRequiredBindings(
             string sourcePath,
             string materialSectionName,
+            MaterialShaderContractBindingKind bindingKind,
             IReadOnlyList<string> requiredNames,
-            IEnumerable<string> providedNames)
+            IEnumerable<string> providedNames,
+            List<MaterialShaderContractDiagnostic> diagnostics)
         {
             if (requiredNames.Count == 0)
             {
@@ -624,8 +771,9 @@ public static class MaterialAssetLoader
                 var requiredName = requiredNames[i];
                 if (!provided.Contains(requiredName))
                 {
-                    throw new InvalidOperationException(
-                        $"[MaterialAssetLoader] Material '{sourcePath}' is missing required {materialSectionName} binding '{requiredName}' declared by Shader.Contract or ShaderContract.");
+                    var message =
+                        $"[MaterialAssetLoader] Material '{sourcePath}' is missing required {materialSectionName} binding '{requiredName}' declared by Shader.Contract or ShaderContract.";
+                    diagnostics.Add(new MaterialShaderContractDiagnostic(bindingKind, requiredName, message));
                 }
             }
         }
@@ -636,6 +784,8 @@ public static class MaterialAssetLoader
         public string Name { get; set; } = string.Empty;
         public uint Slot { get; set; }
         public SerializedTexture2DRef Texture { get; set; } = new();
+        public SerializedMaterialTextureSampler? Sampler { get; set; }
+        public SerializedMaterialTextureTransform? Transform { get; set; }
 
         public void Validate(string sourcePath, int index)
         {
@@ -648,11 +798,77 @@ public static class MaterialAssetLoader
             {
                 throw new InvalidOperationException($"[MaterialAssetLoader] Material '{sourcePath}' Texture2D ref '{Name}' is missing a texture GUID.");
             }
+
+            Sampler?.Validate(sourcePath, Name);
+            Transform?.Validate(sourcePath, Name);
         }
 
         public MaterialTexture2DRef ToTextureRef()
         {
-            return new MaterialTexture2DRef(Name, Texture.ToTextureAsset(), Slot);
+            return new MaterialTexture2DRef(
+                Name,
+                Texture.ToTextureAsset(),
+                Slot,
+                Sampler?.ToSamplerSettings(),
+                Transform?.ToTextureTransform());
+        }
+    }
+
+    private sealed class SerializedMaterialTextureSampler
+    {
+        public MaterialTextureFilter MinFilter { get; set; } = MaterialTextureFilter.Linear;
+        public MaterialTextureFilter MagFilter { get; set; } = MaterialTextureFilter.Linear;
+        public MaterialTextureMipmapMode MipmapMode { get; set; } = MaterialTextureMipmapMode.Nearest;
+        public MaterialTextureWrapMode WrapU { get; set; } = MaterialTextureWrapMode.Repeat;
+        public MaterialTextureWrapMode WrapV { get; set; } = MaterialTextureWrapMode.Repeat;
+
+        public void Validate(string sourcePath, string bindingName)
+        {
+            if (!Enum.IsDefined(MinFilter) ||
+                !Enum.IsDefined(MagFilter) ||
+                !Enum.IsDefined(MipmapMode) ||
+                !Enum.IsDefined(WrapU) ||
+                !Enum.IsDefined(WrapV))
+            {
+                throw new InvalidOperationException(
+                    $"[MaterialAssetLoader] Material '{sourcePath}' Texture2D ref '{bindingName}' has unsupported sampler settings.");
+            }
+        }
+
+        public MaterialTextureSamplerSettings ToSamplerSettings()
+        {
+            return new MaterialTextureSamplerSettings(
+                MinFilter,
+                MagFilter,
+                MipmapMode,
+                WrapU,
+                WrapV);
+        }
+    }
+
+    private sealed class SerializedMaterialTextureTransform
+    {
+        public SerializedVector2 Offset { get; set; } = SerializedVector2.Zero;
+        public SerializedVector2 Scale { get; set; } = SerializedVector2.One;
+        public float Rotation { get; set; }
+        public uint TexCoord { get; set; }
+
+        public void Validate(string sourcePath, string bindingName)
+        {
+            if (!Offset.IsFinite || !Scale.IsFinite || !float.IsFinite(Rotation))
+            {
+                throw new InvalidOperationException(
+                    $"[MaterialAssetLoader] Material '{sourcePath}' Texture2D ref '{bindingName}' has a non-finite texture transform.");
+            }
+        }
+
+        public MaterialTextureTransform ToTextureTransform()
+        {
+            return new MaterialTextureTransform(
+                Offset.ToVector2(),
+                Scale.ToVector2(),
+                Rotation,
+                TexCoord);
         }
     }
 
@@ -706,6 +922,22 @@ public static class MaterialAssetLoader
         public Vector4 ToVector4()
         {
             return new Vector4(X, Y, Z, W);
+        }
+    }
+
+    private sealed class SerializedVector2
+    {
+        public static SerializedVector2 Zero => new();
+        public static SerializedVector2 One => new() { X = 1.0f, Y = 1.0f };
+
+        public float X { get; set; }
+        public float Y { get; set; }
+
+        public bool IsFinite => float.IsFinite(X) && float.IsFinite(Y);
+
+        public Vector2 ToVector2()
+        {
+            return new Vector2(X, Y);
         }
     }
 
@@ -854,7 +1086,7 @@ public static class MaterialAssetCooker
 {
     private const string MaterialAssetType = "Material";
     private const string Variant = "material.runtime";
-    private const int CurrentVersion = 5;
+    private const int CurrentVersion = 6;
     private const int MaxStringByteCount = 16 * 1024;
     private const int MaxCollectionCount = 1024;
     private static readonly byte[] s_Magic = Encoding.ASCII.GetBytes("ARISMATL");
@@ -883,9 +1115,10 @@ public static class MaterialAssetCooker
         }
 
         var outputPath = assetDatabase.GetCookedArtifactPath(materialGuid, Variant, ".material");
-        var newestSourceWriteTimeUtc = GetNewestSourceWriteTimeUtc(assetDatabase, materialGuid, sourceAsset);
+        var newestSourceWriteTimeUtc = GetNewestSourceWriteTimeUtc(assetDatabase, materialGuid);
 
-        if (!File.Exists(outputPath) ||
+        if (!assetDatabase.TryGetCookedArtifact(materialGuid, Variant, out _) ||
+            !File.Exists(outputPath) ||
             File.GetLastWriteTimeUtc(outputPath) < newestSourceWriteTimeUtc ||
             !IsCurrentCookedMaterial(outputPath))
         {
@@ -928,31 +1161,10 @@ public static class MaterialAssetCooker
 
     private static DateTime GetNewestSourceWriteTimeUtc(
         IAssetDatabase assetDatabase,
-        Guid materialGuid,
-        AssetRecord sourceAsset)
+        Guid materialGuid)
     {
-        var newest = File.GetLastWriteTimeUtc(sourceAsset.SourcePath);
-        if (File.Exists(sourceAsset.MetaPath))
-        {
-            var metaWriteTimeUtc = File.GetLastWriteTimeUtc(sourceAsset.MetaPath);
-            if (metaWriteTimeUtc > newest)
-            {
-                newest = metaWriteTimeUtc;
-            }
-        }
-
         var material = MaterialAssetLoader.LoadSource(assetDatabase, materialGuid);
-        var materialStamp = AssetDependencyTracker.GetMaterialStamp(assetDatabase, material);
-        if (materialStamp.IsValid)
-        {
-            var dependencyWriteTimeUtc = new DateTime(materialStamp.Value, DateTimeKind.Utc);
-            if (dependencyWriteTimeUtc > newest)
-            {
-                newest = dependencyWriteTimeUtc;
-            }
-        }
-
-        return newest;
+        return AssetDependencyTracker.GetMaterialDependencyWriteTimeUtc(assetDatabase, material);
     }
 
     private static void CookMaterial(
@@ -1062,6 +1274,21 @@ public static class MaterialAssetCooker
         WriteInt32(stream, (int)textureRef.Texture.Variant.ColorSpace);
         WriteInt32(stream, textureRef.Texture.Variant.GenerateMipMaps ? 1 : 0);
         WriteInt32(stream, (int)textureRef.Texture.SourceFormat);
+
+        var sampler = textureRef.ResolvedSampler;
+        WriteInt32(stream, (int)sampler.MinFilter);
+        WriteInt32(stream, (int)sampler.MagFilter);
+        WriteInt32(stream, (int)sampler.MipmapMode);
+        WriteInt32(stream, (int)sampler.WrapU);
+        WriteInt32(stream, (int)sampler.WrapV);
+
+        var transform = textureRef.ResolvedTransform;
+        WriteSingle(stream, transform.Offset.X);
+        WriteSingle(stream, transform.Offset.Y);
+        WriteSingle(stream, transform.Scale.X);
+        WriteSingle(stream, transform.Scale.Y);
+        WriteSingle(stream, transform.Rotation);
+        WriteUInt32(stream, transform.TexCoord);
     }
 
     private static void WriteScalarProperty(Stream stream, MaterialScalarProperty property)
@@ -1110,7 +1337,7 @@ public static class MaterialAssetCooker
         var textureRefs = new MaterialTexture2DRef[textureCount];
         for (int i = 0; i < textureRefs.Length; i++)
         {
-            textureRefs[i] = ReadTextureRef(ref reader);
+            textureRefs[i] = ReadTextureRef(ref reader, version);
         }
 
         MaterialScalarProperty[] scalarProperties;
@@ -1187,7 +1414,7 @@ public static class MaterialAssetCooker
             keywords.Length == 0 ? null : keywords);
     }
 
-    private static MaterialTexture2DRef ReadTextureRef(ref MaterialPayloadReader reader)
+    private static MaterialTexture2DRef ReadTextureRef(ref MaterialPayloadReader reader, int materialVersion)
     {
         var name = reader.ReadString();
         var slot = reader.ReadUInt32();
@@ -1198,11 +1425,28 @@ public static class MaterialAssetCooker
             (Texture2DColorSpace)reader.ReadInt32(),
             reader.ReadInt32() != 0);
         var sourceFormat = (Texture2DSourceFormat)reader.ReadInt32();
+        var sampler = materialVersion >= 6
+            ? new MaterialTextureSamplerSettings(
+                (MaterialTextureFilter)reader.ReadInt32(),
+                (MaterialTextureFilter)reader.ReadInt32(),
+                (MaterialTextureMipmapMode)reader.ReadInt32(),
+                (MaterialTextureWrapMode)reader.ReadInt32(),
+                (MaterialTextureWrapMode)reader.ReadInt32())
+            : MaterialTextureSamplerSettings.Default;
+        var transform = materialVersion >= 6
+            ? new MaterialTextureTransform(
+                new Vector2(reader.ReadSingle(), reader.ReadSingle()),
+                new Vector2(reader.ReadSingle(), reader.ReadSingle()),
+                reader.ReadSingle(),
+                reader.ReadUInt32())
+            : MaterialTextureTransform.Identity;
 
         return new MaterialTexture2DRef(
             name,
             new Texture2DAsset(textureGuid, textureName, textureVariant, sourceFormat),
-            slot);
+            slot,
+            sampler,
+            transform);
     }
 
     private static MaterialScalarProperty ReadScalarProperty(ref MaterialPayloadReader reader)

@@ -65,6 +65,7 @@ public static class GltfModelImportEmitter
         var scenePaths = new List<string>();
         var meshPaths = new List<string>();
         var warnings = new List<string>(plan.Warnings);
+        var emittedTextureAssets = new Dictionary<int, EmittedTextureAsset>();
         var safeOutputName = SanitizePathSegment(settings.OutputName);
         var materialDirectory = Path.Combine(outputDirectory, safeOutputName, "Materials");
         var textureDirectory = Path.Combine(outputDirectory, safeOutputName, "Textures");
@@ -86,7 +87,8 @@ public static class GltfModelImportEmitter
                     material,
                     textureDirectory,
                     texturePaths,
-                    warnings)
+                    warnings,
+                    emittedTextureAssets)
                 : Array.Empty<EmittedTextureRef>();
 
             var materialName = string.IsNullOrWhiteSpace(material.Name)
@@ -738,12 +740,15 @@ public static class GltfModelImportEmitter
         GltfImportedMaterial material,
         string textureDirectory,
         List<string> texturePaths,
-        List<string> warnings)
+        List<string> warnings,
+        Dictionary<int, EmittedTextureAsset> emittedTextureAssets)
     {
-        var emitted = new List<EmittedTextureRef>(capacity: 3);
-        TryEmitTexture(sourcePath, plan, material.BaseColorTexture, MaterialTextureSlots.BaseColor, 0, textureDirectory, texturePaths, warnings, emitted);
-        TryEmitTexture(sourcePath, plan, material.NormalTexture, MaterialTextureSlots.Normal, 1, textureDirectory, texturePaths, warnings, emitted);
-        TryEmitTexture(sourcePath, plan, material.EmissiveTexture, MaterialTextureSlots.Emissive, 2, textureDirectory, texturePaths, warnings, emitted);
+        var emitted = new List<EmittedTextureRef>(capacity: 5);
+        TryEmitTexture(sourcePath, plan, material.BaseColorTexture, MaterialTextureSlots.BaseColor, 0, textureDirectory, texturePaths, warnings, emittedTextureAssets, emitted);
+        TryEmitTexture(sourcePath, plan, material.NormalTexture, MaterialTextureSlots.Normal, 1, textureDirectory, texturePaths, warnings, emittedTextureAssets, emitted);
+        TryEmitTexture(sourcePath, plan, material.EmissiveTexture, MaterialTextureSlots.Emissive, 2, textureDirectory, texturePaths, warnings, emittedTextureAssets, emitted);
+        TryEmitTexture(sourcePath, plan, material.MetallicRoughnessTexture, MaterialTextureSlots.MetallicRoughness, 3, textureDirectory, texturePaths, warnings, emittedTextureAssets, emitted);
+        TryEmitTexture(sourcePath, plan, material.OcclusionTexture, MaterialTextureSlots.Occlusion, 4, textureDirectory, texturePaths, warnings, emittedTextureAssets, emitted);
         return emitted;
     }
 
@@ -756,6 +761,7 @@ public static class GltfModelImportEmitter
         string textureDirectory,
         List<string> texturePaths,
         List<string> warnings,
+        Dictionary<int, EmittedTextureAsset> emittedTextureAssets,
         List<EmittedTextureRef> emitted)
     {
         if (textureRef == null)
@@ -770,6 +776,12 @@ public static class GltfModelImportEmitter
         }
 
         var textureChild = FindChild(plan, "texture2d", $"images/{textureRef.ImageIndex}");
+        if (emittedTextureAssets.TryGetValue(textureRef.ImageIndex, out var existingTextureAsset))
+        {
+            emitted.Add(CreateEmittedTextureRef(slotName, slot, textureRef, existingTextureAsset));
+            return;
+        }
+
         var textureName = $"{slotName}_{textureRef.ImageIndex}";
 
         if (!string.IsNullOrWhiteSpace(textureRef.Uri) &&
@@ -781,17 +793,16 @@ public static class GltfModelImportEmitter
                 return;
             }
 
-            EmitTexturePayload(
+            var textureAsset = EmitTexturePayload(
                 textureDirectory,
                 textureName,
                 extension,
                 payload,
                 textureChild,
                 plan,
-                texturePaths,
-                emitted,
-                slotName,
-                slot);
+                texturePaths);
+            emittedTextureAssets.Add(textureRef.ImageIndex, textureAsset);
+            emitted.Add(CreateEmittedTextureRef(slotName, slot, textureRef, textureAsset));
             return;
         }
 
@@ -816,7 +827,12 @@ public static class GltfModelImportEmitter
             File.Copy(sourceTexturePath, texturePath, overwrite: true);
             WriteMetadata(texturePath + ".meta", textureChild.Metadata, plan.SourceGuid);
             texturePaths.Add(texturePath);
-            emitted.Add(new EmittedTextureRef(slotName, slot, textureChild.Metadata.Guid, textureName, sourceFormat));
+            var textureAsset = new EmittedTextureAsset(
+                textureChild.Metadata.Guid,
+                textureName,
+                sourceFormat);
+            emittedTextureAssets.Add(textureRef.ImageIndex, textureAsset);
+            emitted.Add(CreateEmittedTextureRef(slotName, slot, textureRef, textureAsset));
             return;
         }
 
@@ -832,17 +848,16 @@ public static class GltfModelImportEmitter
             {
                 using var source = LoadGltfSourceData(sourcePath);
                 var payload = ExtractGltfBufferViewPayload(sourcePath, source.Root, source.BinaryChunk, textureRef.BufferView);
-                EmitTexturePayload(
+                var textureAsset = EmitTexturePayload(
                     textureDirectory,
                     textureName,
                     extension,
                     payload,
                     textureChild,
                     plan,
-                    texturePaths,
-                    emitted,
-                    slotName,
-                    slot);
+                    texturePaths);
+                emittedTextureAssets.Add(textureRef.ImageIndex, textureAsset);
+                emitted.Add(CreateEmittedTextureRef(slotName, slot, textureRef, textureAsset));
             }
             catch (Exception ex)
             {
@@ -854,17 +869,14 @@ public static class GltfModelImportEmitter
         warnings.Add($"images/{textureRef.ImageIndex} has no supported uri or bufferView; {slotName} texture was not emitted.");
     }
 
-    private static void EmitTexturePayload(
+    private static EmittedTextureAsset EmitTexturePayload(
         string textureDirectory,
         string textureName,
         string extension,
         byte[] payload,
         GltfGeneratedChildAsset textureChild,
         GltfModelImportPlan plan,
-        List<string> texturePaths,
-        List<EmittedTextureRef> emitted,
-        string slotName,
-        uint slot)
+        List<string> texturePaths)
     {
         if (!TryGetTextureSourceFormat(extension, out var sourceFormat))
         {
@@ -876,12 +888,38 @@ public static class GltfModelImportEmitter
         File.WriteAllBytes(texturePath, payload);
         WriteMetadata(texturePath + ".meta", textureChild.Metadata, plan.SourceGuid);
         texturePaths.Add(texturePath);
-        emitted.Add(new EmittedTextureRef(slotName, slot, textureChild.Metadata.Guid, textureName, sourceFormat));
+        return new EmittedTextureAsset(textureChild.Metadata.Guid, textureName, sourceFormat);
+    }
+
+    private static EmittedTextureRef CreateEmittedTextureRef(
+        string slotName,
+        uint slot,
+        GltfImportedTextureRef textureRef,
+        EmittedTextureAsset textureAsset)
+    {
+        return new EmittedTextureRef(
+            slotName,
+            slot,
+            textureAsset.Guid,
+            textureAsset.AssetName,
+            textureAsset.SourceFormat,
+            ResolveGeneratedTextureColorSpace(slotName),
+            textureRef.Sampler,
+            textureRef.Transform);
     }
 
     private static string BuildTexturePath(string textureDirectory, string textureName, string extension)
     {
         return Path.Combine(textureDirectory, $"{SanitizePathSegment(textureName)}{extension.ToLowerInvariant()}");
+    }
+
+    private static Texture2DColorSpace ResolveGeneratedTextureColorSpace(string slotName)
+    {
+        return string.Equals(slotName, MaterialTextureSlots.Normal, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(slotName, MaterialTextureSlots.MetallicRoughness, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(slotName, MaterialTextureSlots.Occlusion, StringComparison.OrdinalIgnoreCase)
+            ? Texture2DColorSpace.Linear
+            : Texture2DColorSpace.SRgb;
     }
 
     private static string BuildMaterialSource(
@@ -895,6 +933,33 @@ public static class GltfModelImportEmitter
         builder.AppendLine("Shader:");
         builder.AppendLine(CultureInfo.InvariantCulture, $"  Guid: {settings.ShaderGuid:D}");
         builder.AppendLine(CultureInfo.InvariantCulture, $"  Name: {EscapeScalar(settings.ShaderName)}");
+        bool usesNormalMap = false;
+        for (int textureIndex = 0; textureIndex < emittedTextures.Count; textureIndex++)
+        {
+            if (string.Equals(
+                    emittedTextures[textureIndex].Name,
+                    MaterialTextureSlots.Normal,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                usesNormalMap = true;
+                break;
+            }
+        }
+
+        if (usesNormalMap || material.AlphaMode == GltfMaterialAlphaMode.Mask)
+        {
+            builder.AppendLine("  Keywords:");
+            if (usesNormalMap)
+            {
+                builder.AppendLine("  - USE_NORMAL_MAP");
+            }
+
+            if (material.AlphaMode == GltfMaterialAlphaMode.Mask)
+            {
+                builder.AppendLine("  - ALPHA_TEST");
+            }
+        }
+
         builder.AppendLine("  Variant:");
         builder.AppendLine("    Backend: Vulkan");
         builder.AppendLine("    TargetEnvironment: vulkan1.3");
@@ -914,9 +979,24 @@ public static class GltfModelImportEmitter
                 builder.AppendLine(CultureInfo.InvariantCulture, $"    Name: {EscapeScalar(texture.AssetName)}");
                 builder.AppendLine("    Variant:");
                 builder.AppendLine("      Format: R8G8B8A8UNorm");
-                builder.AppendLine("      ColorSpace: SRgb");
+                builder.AppendLine(CultureInfo.InvariantCulture, $"      ColorSpace: {texture.ColorSpace}");
                 builder.AppendLine("      GenerateMipMaps: false");
                 builder.AppendLine(CultureInfo.InvariantCulture, $"    SourceFormat: {texture.SourceFormat}");
+                builder.AppendLine("  Sampler:");
+                builder.AppendLine(CultureInfo.InvariantCulture, $"    MinFilter: {texture.Sampler.MinFilter}");
+                builder.AppendLine(CultureInfo.InvariantCulture, $"    MagFilter: {texture.Sampler.MagFilter}");
+                builder.AppendLine(CultureInfo.InvariantCulture, $"    MipmapMode: {texture.Sampler.MipmapMode}");
+                builder.AppendLine(CultureInfo.InvariantCulture, $"    WrapU: {texture.Sampler.WrapU}");
+                builder.AppendLine(CultureInfo.InvariantCulture, $"    WrapV: {texture.Sampler.WrapV}");
+                builder.AppendLine("  Transform:");
+                builder.AppendLine("    Offset:");
+                builder.AppendLine(CultureInfo.InvariantCulture, $"      X: {FormatFloat(texture.Transform.Offset.X)}");
+                builder.AppendLine(CultureInfo.InvariantCulture, $"      Y: {FormatFloat(texture.Transform.Offset.Y)}");
+                builder.AppendLine("    Scale:");
+                builder.AppendLine(CultureInfo.InvariantCulture, $"      X: {FormatFloat(texture.Transform.Scale.X)}");
+                builder.AppendLine(CultureInfo.InvariantCulture, $"      Y: {FormatFloat(texture.Transform.Scale.Y)}");
+                builder.AppendLine(CultureInfo.InvariantCulture, $"    Rotation: {FormatFloat(texture.Transform.Rotation)}");
+                builder.AppendLine(CultureInfo.InvariantCulture, $"    TexCoord: {texture.Transform.TexCoord}");
             }
         }
 
@@ -925,6 +1005,10 @@ public static class GltfModelImportEmitter
         builder.AppendLine(CultureInfo.InvariantCulture, $"  Value: {FormatFloat(material.MetallicFactor)}");
         builder.AppendLine("- Name: RoughnessFactor");
         builder.AppendLine(CultureInfo.InvariantCulture, $"  Value: {FormatFloat(material.RoughnessFactor)}");
+        builder.AppendLine("- Name: OcclusionStrength");
+        builder.AppendLine(CultureInfo.InvariantCulture, $"  Value: {FormatFloat(material.OcclusionStrength)}");
+        builder.AppendLine("- Name: AlphaCutoff");
+        builder.AppendLine(CultureInfo.InvariantCulture, $"  Value: {FormatFloat(material.AlphaCutoff)}");
         builder.AppendLine("Vector4Properties:");
         builder.AppendLine("- Name: BaseColorFactor");
         builder.AppendLine("  Value:");
@@ -961,10 +1045,30 @@ public static class GltfModelImportEmitter
         if (File.Exists(metaPath))
         {
             var existing = SerializationUtil.Deserialize<AssetMetadata>(metaPath, serializeIfNotExist: false);
-            if (existing.Generated != null && existing.Generated.SourceGuid != expectedSourceGuid)
+            if (existing.Generated == null)
+            {
+                throw new InvalidOperationException(
+                    $"[GltfModelImportEmitter] Refusing to overwrite non-generated metadata '{metaPath}'.");
+            }
+
+            var generated = metadata.Generated;
+            if (generated == null)
+            {
+                throw new InvalidOperationException(
+                    $"[GltfModelImportEmitter] Refusing to overwrite generated metadata '{metaPath}' with metadata that has no generated provenance.");
+            }
+
+            if (existing.Generated.SourceGuid != expectedSourceGuid)
             {
                 throw new InvalidOperationException(
                     $"[GltfModelImportEmitter] Refusing to overwrite generated metadata '{metaPath}' from source '{existing.Generated.SourceGuid}'.");
+            }
+
+            if (!string.Equals(existing.Generated.ChildKind, generated.ChildKind, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(existing.Generated.ChildKey, generated.ChildKey, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"[GltfModelImportEmitter] Refusing to overwrite generated metadata '{metaPath}' for child '{existing.Generated.ChildKind}:{existing.Generated.ChildKey}' with '{generated.ChildKind}:{generated.ChildKey}'.");
             }
         }
 
@@ -1333,6 +1437,14 @@ public static class GltfModelImportEmitter
     private readonly record struct EmittedTextureRef(
         string Name,
         uint Slot,
+        Guid Guid,
+        string AssetName,
+        Texture2DSourceFormat SourceFormat,
+        Texture2DColorSpace ColorSpace,
+        MaterialTextureSamplerSettings Sampler,
+        MaterialTextureTransform Transform);
+
+    private readonly record struct EmittedTextureAsset(
         Guid Guid,
         string AssetName,
         Texture2DSourceFormat SourceFormat);

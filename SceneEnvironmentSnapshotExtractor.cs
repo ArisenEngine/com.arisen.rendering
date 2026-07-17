@@ -53,7 +53,9 @@ public static class SceneEnvironmentSnapshotExtractor
                 component.GroundColor,
                 component.AmbientColor,
                 component.SkyIntensity,
-                component.AmbientIntensity);
+                component.AmbientIntensity,
+                component.EnvironmentTextureGuid,
+                component.Exposure);
             acceptedCount++;
         }
 
