@@ -4,33 +4,6 @@ using ArisenEngine.Core.RHI;
 
 namespace ArisenEngine.Rendering;
 
-public readonly record struct RenderGraphTextureDescriptor(
-    string DebugName,
-    uint Width,
-    uint Height,
-    EFormat Format,
-    uint Usage,
-    EImageAspectFlagBits AspectMask,
-    bool RegisterBindlessSampled)
-{
-    public static RenderGraphTextureDescriptor ColorAttachmentSampled2D(
-        string debugName,
-        uint width,
-        uint height,
-        EFormat format)
-    {
-        return new RenderGraphTextureDescriptor(
-            debugName,
-            width,
-            height,
-            format,
-            (uint)EImageUsageFlagBits.IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-            (uint)EImageUsageFlagBits.IMAGE_USAGE_SAMPLED_BIT,
-            EImageAspectFlagBits.IMAGE_ASPECT_COLOR_BIT,
-            RegisterBindlessSampled: true);
-    }
-}
-
 public sealed class RenderGraphTexture : IDisposable
 {
     private const uint InvalidBindlessIndex = 0xFFFFFFFFu;
@@ -53,6 +26,7 @@ public sealed class RenderGraphTexture : IDisposable
     public uint Width => m_Descriptor.Width;
     public uint Height => m_Descriptor.Height;
     public EFormat Format => m_Descriptor.Format;
+    public uint Usage => m_Descriptor.Usage;
     public EImageAspectFlagBits AspectMask => m_Descriptor.AspectMask;
     public bool IsValid => m_Allocation is { IsValid: true };
 
@@ -88,7 +62,7 @@ public sealed class RenderGraphTexture : IDisposable
         CurrentState = RenderResourceState.Unknown;
 
         Logger.Log(
-            $"[RenderGraphTexture] Created transient texture | Name: {descriptor.DebugName} | Size: {descriptor.Width}x{descriptor.Height} | Format: {descriptor.Format} | Image: {Image.Index}:{Image.Generation} | View: {ImageView.Index}:{ImageView.Generation} | BindlessImage: {BindlessImageIndex} | BindlessSampler: {BindlessSamplerIndex}");
+            $"[RenderGraphTexture] Created transient texture | Name: {descriptor.DebugName} | Size: {descriptor.Width}x{descriptor.Height} | Format: {descriptor.Format} | Usage: 0x{descriptor.Usage:X} | Aspect: {descriptor.AspectMask} | Sampled: {descriptor.RegisterBindlessSampled} | Image: {Image.Index}:{Image.Generation} | View: {ImageView.Index}:{ImageView.Generation} | BindlessImage: {BindlessImageIndex} | BindlessSampler: {BindlessSamplerIndex}");
     }
 
     internal void DisposeDeferred(

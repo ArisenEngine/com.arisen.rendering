@@ -146,6 +146,25 @@ public readonly struct RenderCommandList
         m_CommandBuffer.DrawIndexed(indexCount, instanceCount, firstIndex, vertexOffset, firstInstance, firstBinding);
     }
 
+    public void CopyImageToBuffer2D(
+        RHIImageHandle source,
+        EImageLayout sourceLayout,
+        EImageAspectFlagBits sourceAspect,
+        RHIBufferHandle destination,
+        ulong destinationOffset,
+        uint width,
+        uint height)
+    {
+        m_CommandBuffer.CopyImageToBuffer2D(
+            source,
+            sourceLayout,
+            sourceAspect,
+            destination,
+            destinationOffset,
+            width,
+            height);
+    }
+
     public void TransitionImageLayout(RHIImageHandle image, EImageLayout targetLayout)
     {
         m_CommandBuffer.TransitionImageLayout(image, targetLayout);

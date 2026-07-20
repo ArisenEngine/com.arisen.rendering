@@ -4,6 +4,7 @@ using System.Numerics;
 using System.Text;
 using System.Text.Json;
 using ArisenEngine.Core.Assets;
+using ArisenEngine.Core.Diagnostics;
 using ArisenEngine.Core.Serialization;
 
 namespace ArisenEngine.Rendering.Resources;
@@ -60,6 +61,7 @@ public static class GltfModelImportEmitter
             throw new ArgumentException("Generated materials require a stable shader GUID.", nameof(settings));
         }
 
+        using var _ = Profiler.Zone("GltfModelImportEmitter.Emit");
         var materialPaths = new List<string>();
         var texturePaths = new List<string>();
         var scenePaths = new List<string>();
@@ -104,6 +106,11 @@ public static class GltfModelImportEmitter
             materialPaths.Add(materialPath);
         }
 
+        Profiler.PlotValue("ModelImport.EmittedSceneCount", scenePaths.Count);
+        Profiler.PlotValue("ModelImport.EmittedMeshCount", meshPaths.Count);
+        Profiler.PlotValue("ModelImport.EmittedMaterialCount", materialPaths.Count);
+        Profiler.PlotValue("ModelImport.EmittedTextureCount", texturePaths.Count);
+        Profiler.PlotValue("ModelImport.EmissionWarningCount", warnings.Count);
         return new GltfModelImportEmissionResult(materialPaths, texturePaths, scenePaths, meshPaths, warnings);
     }
 
@@ -1022,6 +1029,18 @@ public static class GltfModelImportEmitter
         builder.AppendLine(CultureInfo.InvariantCulture, $"    Y: {FormatFloat(material.EmissiveFactor.Y)}");
         builder.AppendLine(CultureInfo.InvariantCulture, $"    Z: {FormatFloat(material.EmissiveFactor.Z)}");
         builder.AppendLine(CultureInfo.InvariantCulture, $"    W: {FormatFloat(material.EmissiveFactor.W)}");
+        if (material.AlphaMode == GltfMaterialAlphaMode.Blend)
+        {
+            builder.AppendLine("RenderState:");
+            builder.AppendLine("  CullMode: Back");
+            builder.AppendLine("  FrontFace: CounterClockwise");
+            builder.AppendLine("  Blend:");
+            builder.AppendLine("    Enabled: true");
+            builder.AppendLine("    SrcColor: SrcAlpha");
+            builder.AppendLine("    DstColor: OneMinusSrcAlpha");
+            builder.AppendLine("    ColorOp: Add");
+        }
+
         return builder.ToString();
     }
 

@@ -51,6 +51,7 @@ public class RenderSubsystem : ITickableSubsystem
 
     private RenderPipeline? m_CurrentPipeline;
     private RenderPipelineAsset? m_CurrentAsset;
+    private IRenderPipelineProvider? m_RenderPipelineProvider;
     private IWindowProvider? m_WindowProvider;
     private IntPtr m_RuntimeWindowHost;
 
@@ -63,8 +64,18 @@ public class RenderSubsystem : ITickableSubsystem
         using var _ = Profiler.Zone("RenderSubsystem.Initialize");
         Logger.Log("[RenderSubsystem] Initializing...");
 
-#if !ARISEN_ENGINE_EDITOR
         var services = EngineKernel.Instance.Services;
+        var project = services.GetService<ProjectSubsystem>().ActiveProject
+            ?? throw new InvalidOperationException(
+                "[RenderSubsystem] No active workspace manifest is available for render-pipeline selection.");
+        m_RenderPipelineProvider = services.GetService<IRenderPipelineProvider>();
+        RenderPipelineProviderSelection.Activate(project, m_RenderPipelineProvider);
+        KernelLog.InfoFormat(
+            "[RenderSubsystem] Activated render-pipeline provider '{0}' with settings type '{1}'.",
+            m_RenderPipelineProvider.ProviderPackageId,
+            m_RenderPipelineProvider.SettingsAssetType);
+
+#if !ARISEN_ENGINE_EDITOR
         if (services.TryGetService<IWindowProvider>(out m_WindowProvider) && m_WindowProvider != null)
         {
             var windowInfo = m_WindowProvider.GetWindowInfo();
@@ -618,12 +629,22 @@ public class RenderSubsystem : ITickableSubsystem
         }
     }
 
-    public void ReportConsumedFrameIndex(IntPtr host, uint frameIndex)
+    public bool ReportConsumedFrameIndex(IntPtr host, uint frameIndex)
     {
         if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
         {
             surfaceInfo.Surface.ReportConsumedFrameIndex(frameIndex);
+            return true;
         }
+
+        return false;
+    }
+
+    public uint GetLastConsumedFrameIndex(IntPtr host)
+    {
+        return s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo)
+            ? surfaceInfo.Surface.GetLastConsumedFrameIndex()
+            : 0;
     }
 
     public uint GetLastRenderWidth(IntPtr host)
@@ -698,6 +719,8 @@ public class RenderSubsystem : ITickableSubsystem
         m_CurrentPipeline?.Dispose();
         m_CurrentPipeline = null;
         m_CurrentAsset = null;
+        m_RenderPipelineProvider?.Deactivate();
+        m_RenderPipelineProvider = null;
     }
 
     public void Dispose()

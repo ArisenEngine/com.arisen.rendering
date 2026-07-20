@@ -23,16 +23,24 @@ public static class StaticMeshFrustumCuller
             return false;
         }
 
-        var bounds = ResolveLocalBounds(item, meshBounds);
-        var localCenter = (bounds.Min + bounds.Max) * 0.5f;
-        var localExtents = Vector3.Abs((bounds.Max - bounds.Min) * 0.5f);
-        if (!HasUsableBounds(localExtents))
+        if (!TryGetWorldBounds(item, meshBounds, out var worldBounds))
         {
             return true;
         }
 
-        var worldCenter = Vector3.Transform(localCenter, item.LocalToWorld);
-        var worldExtents = TransformExtents(localExtents, item.LocalToWorld);
+        return IsVisible(worldBounds, viewProjection);
+    }
+
+    public static bool IsVisible(
+        in MeshBounds worldBounds,
+        in Matrix4x4 viewProjection)
+    {
+        var worldCenter = (worldBounds.Min + worldBounds.Max) * 0.5f;
+        var worldExtents = Vector3.Abs((worldBounds.Max - worldBounds.Min) * 0.5f);
+        if (!HasUsableBounds(worldExtents))
+        {
+            return true;
+        }
 
         return !OutsidePlane(CreateLeftPlane(viewProjection), worldCenter, worldExtents) &&
                !OutsidePlane(CreateRightPlane(viewProjection), worldCenter, worldExtents) &&
@@ -40,6 +48,38 @@ public static class StaticMeshFrustumCuller
                !OutsidePlane(CreateTopPlane(viewProjection), worldCenter, worldExtents) &&
                !OutsidePlane(CreateNearPlane(viewProjection), worldCenter, worldExtents) &&
                !OutsidePlane(CreateFarPlane(viewProjection), worldCenter, worldExtents);
+    }
+
+    public static bool TryGetWorldBounds(
+        in StaticMeshRenderItem item,
+        in MeshBounds meshBounds,
+        out MeshBounds worldBounds)
+    {
+        worldBounds = MeshBounds.Empty;
+        if (!item.IsValid)
+        {
+            return false;
+        }
+
+        var bounds = ResolveLocalBounds(item, meshBounds);
+        var localCenter = (bounds.Min + bounds.Max) * 0.5f;
+        var localExtents = Vector3.Abs((bounds.Max - bounds.Min) * 0.5f);
+        if (!HasUsableBounds(localExtents))
+        {
+            return false;
+        }
+
+        var worldCenter = Vector3.Transform(localCenter, item.LocalToWorld);
+        var worldExtents = TransformExtents(localExtents, item.LocalToWorld);
+        if (!IsFinite(worldCenter) || !IsFinite(worldExtents))
+        {
+            return false;
+        }
+
+        worldBounds = new MeshBounds(
+            worldCenter - worldExtents,
+            worldCenter + worldExtents);
+        return true;
     }
 
     private static MeshBounds ResolveLocalBounds(in StaticMeshRenderItem item, in MeshBounds meshBounds)
@@ -55,9 +95,17 @@ public static class StaticMeshFrustumCuller
 
     private static bool HasUsableBounds(Vector3 extents)
     {
-        return extents.X > BoundsEpsilon ||
-               extents.Y > BoundsEpsilon ||
-               extents.Z > BoundsEpsilon;
+        return IsFinite(extents) &&
+               (extents.X > BoundsEpsilon ||
+                extents.Y > BoundsEpsilon ||
+                extents.Z > BoundsEpsilon);
+    }
+
+    private static bool IsFinite(Vector3 value)
+    {
+        return float.IsFinite(value.X) &&
+               float.IsFinite(value.Y) &&
+               float.IsFinite(value.Z);
     }
 
     private static Vector3 TransformExtents(Vector3 extents, Matrix4x4 transform)

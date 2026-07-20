@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using ArisenEngine.Core.Assets;
+using ArisenEngine.Core.Diagnostics;
 using ArisenEngine.Core.Serialization;
 
 namespace ArisenEngine.Rendering.Resources;
@@ -57,6 +58,7 @@ public static class ModelSourceReimporter
             throw new ArgumentNullException(nameof(sourceAsset));
         }
 
+        using var _ = Profiler.Zone("ModelSourceReimporter.Reimport");
         var model = ModelSourceAssetLoader.LoadSource(sourceAsset);
         var plan = ModelSourceAssetLoader.CreateGltfPlan(sourceAsset, model);
         var outputRoot = ValidateOutputRoot(sourceAsset, model);
@@ -80,6 +82,8 @@ public static class ModelSourceReimporter
             outputDirectory,
             ModelSourceAssetLoader.CreateEmissionSettings(model));
         var inspection = InspectGeneratedOutput(outputRoot, sourceAsset.Guid, plan);
+        Profiler.PlotValue("ModelImport.OrphanedChildCount", inspection.OrphanedGeneratedChildren.Count);
+        Profiler.PlotValue("ModelImport.ForeignChildCount", inspection.ForeignGeneratedChildren.Count);
 
         return new ModelSourceReimportResult(
             model,
@@ -118,6 +122,7 @@ public static class ModelSourceReimporter
                 "[ModelSourceReimporter] Reimport invalidation result does not belong to the selected model source asset.");
         }
 
+        using var _ = Profiler.Zone("ModelSourceReimporter.InvalidateCookedOutputs");
         var invalidatedAssets = new List<AssetRecord>(result.Plan.GeneratedChildren.Count + 1);
         var visitedGuids = new HashSet<Guid>();
         AddInvalidatedAsset(sourceAsset, invalidatedAssets, visitedGuids);
@@ -162,6 +167,7 @@ public static class ModelSourceReimporter
             invalidatedGuids[i] = asset.Guid;
         }
 
+        Profiler.PlotValue("ModelImport.InvalidatedAssetCount", invalidatedGuids.Length);
         return invalidatedGuids;
     }
 

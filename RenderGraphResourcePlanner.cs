@@ -10,7 +10,8 @@ internal readonly record struct RenderGraphResourceAccess(
     uint ResourceId,
     uint PassNodeId,
     RenderGraphResourceAccessKind Kind,
-    RenderResourceState State);
+    RenderResourceState State,
+    RenderAttachmentIntent AttachmentIntent = default);
 
 internal readonly record struct RenderGraphResourceTransition(
     uint ResourceId,
@@ -40,7 +41,7 @@ internal static class RenderGraphResourcePlanner
             var resource = resources[resourceIndex];
             var currentState = resource.InitialState;
             var hasKnownState = currentState != RenderResourceState.Unknown;
-            var hasWriter = resource.IsImported;
+            var hasStoredContent = resource.IsImported;
 
             for (int nodeIndex = 0; nodeIndex < sortedNodeIds.Count; nodeIndex++)
             {
@@ -52,7 +53,8 @@ internal static class RenderGraphResourcePlanner
                         resource.ToString(),
                         passNameResolver,
                         out var desiredState,
-                        out var accessMask))
+                        out var accessMask,
+                        out var attachmentIntent))
                 {
                     continue;
                 }
@@ -60,8 +62,22 @@ internal static class RenderGraphResourcePlanner
                 var hasRead = (accessMask & ReadMask) != 0;
                 var hasWrite = (accessMask & WriteMask) != 0;
                 var passName = passNameResolver(nodeId);
+                ValidateAttachmentIntent(
+                    resource,
+                    passName,
+                    desiredState,
+                    hasRead,
+                    hasWrite,
+                    attachmentIntent);
 
-                if (hasRead && !hasWrite && !hasWriter)
+                if (RequiresExistingAttachmentContent(attachmentIntent) && !hasStoredContent)
+                {
+                    throw new InvalidOperationException(
+                        $"Render pass '{passName}' loads resource '{resource}' before any graph pass stores it. " +
+                        "Import the resource, add a stored producing pass, or initialize it with Clear/Don'tCare.");
+                }
+
+                if (hasRead && !hasWrite && !hasStoredContent)
                 {
                     throw new InvalidOperationException(
                         $"Render pass '{passName}' reads resource '{resource}' before any graph pass writes it. " +
@@ -94,9 +110,13 @@ internal static class RenderGraphResourcePlanner
                     currentState = desiredState;
                 }
 
-                if (hasWrite)
+                if (attachmentIntent.IsDeclared)
                 {
-                    hasWriter = true;
+                    hasStoredContent = attachmentIntent.Store == RenderAttachmentStoreIntent.Store;
+                }
+                else if (hasWrite)
+                {
+                    hasStoredContent = true;
                 }
             }
         }
@@ -113,8 +133,31 @@ internal static class RenderGraphResourcePlanner
         out RenderResourceState state,
         out int accessMask)
     {
+        return TryGetAccessState(
+            accessEvents,
+            resourceId,
+            nodeId,
+            resourceName,
+            passNameResolver,
+            out state,
+            out accessMask,
+            out _);
+    }
+
+    public static bool TryGetAccessState(
+        IReadOnlyList<RenderGraphResourceAccess> accessEvents,
+        uint resourceId,
+        uint nodeId,
+        string resourceName,
+        Func<uint, string> passNameResolver,
+        out RenderResourceState state,
+        out int accessMask,
+        out RenderAttachmentIntent attachmentIntent)
+    {
         state = RenderResourceState.Unknown;
         accessMask = 0;
+        attachmentIntent = default;
+        var hasAccess = false;
         for (int i = 0; i < accessEvents.Count; i++)
         {
             var access = accessEvents[i];
@@ -123,10 +166,19 @@ internal static class RenderGraphResourcePlanner
                 continue;
             }
 
+            if (hasAccess && attachmentIntent != access.AttachmentIntent)
+            {
+                throw new InvalidOperationException(
+                    $"Render pass '{passNameResolver(nodeId)}' declares incompatible attachment intents for resource '{resourceName}': " +
+                    $"{FormatAttachmentIntent(attachmentIntent)} and {FormatAttachmentIntent(access.AttachmentIntent)}.");
+            }
+
             accessMask |= access.Kind == RenderGraphResourceAccessKind.Read ? ReadMask : WriteMask;
-            if (state == RenderResourceState.Unknown)
+            if (!hasAccess)
             {
                 state = access.State;
+                attachmentIntent = access.AttachmentIntent;
+                hasAccess = true;
                 continue;
             }
 
@@ -138,6 +190,107 @@ internal static class RenderGraphResourcePlanner
         }
 
         return accessMask != 0;
+    }
+
+    private static void ValidateAttachmentIntent(
+        RenderResource resource,
+        string passName,
+        RenderResourceState state,
+        bool hasRead,
+        bool hasWrite,
+        RenderAttachmentIntent intent)
+    {
+        if (!intent.IsDeclared)
+        {
+            return;
+        }
+
+        if (!IsAttachmentState(state))
+        {
+            throw new InvalidOperationException(
+                $"Render pass '{passName}' declares attachment intent {FormatAttachmentIntent(intent)} " +
+                $"for non-attachment state {state} on resource '{resource}'.");
+        }
+
+        if (intent.Load == RenderAttachmentLoadIntent.None ||
+            intent.Store == RenderAttachmentStoreIntent.None)
+        {
+            throw new InvalidOperationException(
+                $"Render pass '{passName}' must declare both load and store intent for attachment resource '{resource}'.");
+        }
+
+        if (state == RenderResourceState.DepthReadAttachment && hasWrite)
+        {
+            throw new InvalidOperationException(
+                $"Render pass '{passName}' declares write access for read-only depth attachment '{resource}'.");
+        }
+
+        switch (intent.Load)
+        {
+            case RenderAttachmentLoadIntent.Clear:
+                if (!hasWrite)
+                {
+                    throw new InvalidOperationException(
+                        $"Render pass '{passName}' clears attachment '{resource}' without write access.");
+                }
+
+                if (hasRead)
+                {
+                    throw new InvalidOperationException(
+                        $"Render pass '{passName}' declares read access while clearing attachment '{resource}'. " +
+                        "Use ClearThenLoad for a pass whose later work items load the cleared result.");
+                }
+                break;
+
+            case RenderAttachmentLoadIntent.DontCare:
+                if (!hasWrite || hasRead)
+                {
+                    throw new InvalidOperationException(
+                        $"Render pass '{passName}' uses Don'tCare load intent for attachment '{resource}' without write-only access.");
+                }
+                break;
+
+            case RenderAttachmentLoadIntent.Load:
+                if (!hasRead || !hasWrite)
+                {
+                    throw new InvalidOperationException(
+                        $"Render pass '{passName}' loads attachment '{resource}' without read/write access.");
+                }
+                break;
+
+            case RenderAttachmentLoadIntent.ReadOnlyLoad:
+                if (!hasRead || hasWrite || state != RenderResourceState.DepthReadAttachment)
+                {
+                    throw new InvalidOperationException(
+                        $"Render pass '{passName}' uses read-only load intent for '{resource}' without read-only depth access.");
+                }
+                break;
+
+            case RenderAttachmentLoadIntent.ClearThenLoad:
+                if (!hasRead || !hasWrite)
+                {
+                    throw new InvalidOperationException(
+                        $"Render pass '{passName}' uses ClearThenLoad for attachment '{resource}' without read/write access.");
+                }
+                break;
+        }
+    }
+
+    private static bool RequiresExistingAttachmentContent(RenderAttachmentIntent intent)
+    {
+        return intent.Load is RenderAttachmentLoadIntent.Load or RenderAttachmentLoadIntent.ReadOnlyLoad;
+    }
+
+    private static bool IsAttachmentState(RenderResourceState state)
+    {
+        return state is RenderResourceState.ColorAttachment or
+            RenderResourceState.DepthAttachment or
+            RenderResourceState.DepthReadAttachment;
+    }
+
+    private static string FormatAttachmentIntent(RenderAttachmentIntent intent)
+    {
+        return intent.IsDeclared ? $"{intent.Load}/{intent.Store}" : "None";
     }
 
     public static int GetAccessMask(
