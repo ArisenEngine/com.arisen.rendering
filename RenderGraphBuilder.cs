@@ -37,38 +37,61 @@ public sealed class RenderGraphBuilder
         return this;
     }
 
-    public RenderGraphBuilder Read(RenderResource resource, RenderResourceState state)
+    private RenderGraphBuilder Read(
+        RenderResource resource,
+        RenderResourceState state,
+        RenderAttachmentIntent attachmentIntent = default)
     {
         ArgumentNullException.ThrowIfNull(resource);
-        m_Graph.RegisterRead(m_Pass, resource, state);
+        m_Graph.RegisterRead(m_Pass, resource, state, attachmentIntent);
         return this;
     }
 
-    public RenderGraphBuilder Write(RenderResource resource, RenderResourceState state)
+    private RenderGraphBuilder Write(
+        RenderResource resource,
+        RenderResourceState state,
+        RenderAttachmentIntent attachmentIntent = default)
     {
         ArgumentNullException.ThrowIfNull(resource);
-        m_Graph.RegisterWrite(m_Pass, resource, state);
+        m_Graph.RegisterWrite(m_Pass, resource, state, attachmentIntent);
         return this;
     }
 
-    public RenderGraphBuilder ReadColorAttachment(RenderResource resource)
+    public RenderGraphBuilder WriteColorAttachment(
+        RenderResource resource,
+        RenderAttachmentIntent attachmentIntent)
     {
-        return Read(resource, RenderResourceState.ColorAttachment);
+        return Write(resource, RenderResourceState.ColorAttachment, attachmentIntent);
     }
 
-    public RenderGraphBuilder WriteColorAttachment(RenderResource resource)
+    public RenderGraphBuilder ReadWriteColorAttachment(
+        RenderResource resource,
+        RenderAttachmentIntent attachmentIntent)
     {
-        return Write(resource, RenderResourceState.ColorAttachment);
+        Read(resource, RenderResourceState.ColorAttachment, attachmentIntent);
+        return Write(resource, RenderResourceState.ColorAttachment, attachmentIntent);
     }
 
-    public RenderGraphBuilder ReadDepthAttachment(RenderResource resource)
+    public RenderGraphBuilder ReadDepthAttachment(
+        RenderResource resource,
+        RenderAttachmentIntent attachmentIntent)
     {
-        return Read(resource, RenderResourceState.DepthAttachment);
+        return Read(resource, RenderResourceState.DepthReadAttachment, attachmentIntent);
     }
 
-    public RenderGraphBuilder WriteDepthAttachment(RenderResource resource)
+    public RenderGraphBuilder WriteDepthAttachment(
+        RenderResource resource,
+        RenderAttachmentIntent attachmentIntent)
     {
-        return Write(resource, RenderResourceState.DepthAttachment);
+        return Write(resource, RenderResourceState.DepthAttachment, attachmentIntent);
+    }
+
+    public RenderGraphBuilder ReadWriteDepthAttachment(
+        RenderResource resource,
+        RenderAttachmentIntent attachmentIntent)
+    {
+        Read(resource, RenderResourceState.DepthAttachment, attachmentIntent);
+        return Write(resource, RenderResourceState.DepthAttachment, attachmentIntent);
     }
 
     public RenderGraphBuilder ReadShader(RenderResource resource)

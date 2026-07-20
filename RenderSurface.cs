@@ -16,6 +16,7 @@ public class RenderSurface : IRenderSurface
     internal List<RenderSurface> Surfaces = new();
 
     private readonly object m_OutputLock = new();
+    private readonly object m_LifetimeLock = new();
     private IntPtr m_Host;
     private uint m_SurfaceId;
     private IntPtr m_Handle;
@@ -34,6 +35,9 @@ public class RenderSurface : IRenderSurface
     private RHISwapChain? m_LastRenderSwapChain;
     private Core.RHI.RHISurface? m_NativeSurface;
     private RHISwapChain? m_CachedSwapChain;
+    private int m_ActiveTicketWaitCount;
+    private bool m_DisposeStarted;
+    private bool m_IsDisposed;
 
     private WindowProcessor m_Processor = null!;
     private bool m_Hosted = true;
@@ -173,18 +177,58 @@ public class RenderSurface : IRenderSurface
 
     public void DisposeSurface()
     {
-        if ((m_SurfaceId & RHISystem.VirtualSurfaceIDMask) == 0)
+        lock (m_LifetimeLock)
         {
-            NativeHAL.RenderWindowAPI.RemoveRenderSurface(m_SurfaceId);
+            if (m_IsDisposed)
+            {
+                return;
+            }
+
+            if (m_DisposeStarted)
+            {
+                while (!m_IsDisposed)
+                {
+                    Monitor.Wait(m_LifetimeLock);
+                }
+                return;
+            }
+
+            m_DisposeStarted = true;
+            while (m_ActiveTicketWaitCount != 0)
+            {
+                Monitor.Wait(m_LifetimeLock);
+            }
         }
-        else
+
+        try
         {
-            RHISystem.RemoveDevice(m_SurfaceId);
+            lock (m_OutputLock)
+            {
+                m_LastTicket = 0;
+                m_LastRenderSwapChain = null;
+                m_CachedSwapChain = null;
+                m_NativeSurface = null;
+                m_FramePacing.Reset();
+
+                if ((m_SurfaceId & RHISystem.VirtualSurfaceIDMask) == 0)
+                {
+                    NativeHAL.RenderWindowAPI.RemoveRenderSurface(m_SurfaceId);
+                }
+                else
+                {
+                    RHISystem.RemoveDevice(m_SurfaceId);
+                }
+            }
+
+            Surfaces.Remove(this);
         }
-        Surfaces.Remove(this);
-        if (Surfaces.Count <= 0)
+        finally
         {
-            // ArisenEngine.Core.Lifecycle.ArisenApplication.AllSurfacesDestroyed?.Invoke();
+            lock (m_LifetimeLock)
+            {
+                m_IsDisposed = true;
+                Monitor.PulseAll(m_LifetimeLock);
+            }
         }
     }
 
@@ -286,25 +330,58 @@ public class RenderSurface : IRenderSurface
 
     public async Task WaitForRenderTicketAsync(ulong ticket)
     {
-        if (ticket == 0) return;
+        if (ticket == 0 || !TryBeginTicketWait()) return;
 
-        var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
-        if (!device.IsValid) return;
-
-        var completedBefore = device.GetCompletedTicket();
-        if (completedBefore >= ticket) return;
-
-        // GetCompletedTicket() is only a cached value. In the Vulkan backend that cache is
-        // refreshed by RHIVkQueue::Update(), or by the native WaitForTicket path after waiting
-        // on the timeline semaphore. A pure managed poll here can therefore spin forever even
-        // while the GPU has already completed the work, leaving the editor viewport black before
-        // the first ImportImage/UpdateAsync call.
-        await Task.Run(() => device.WaitQueueTicket(ticket));
-
-        var completedAfter = device.GetCompletedTicket();
-        if (completedAfter < ticket)
+        try
         {
-            KernelLog.Warning($"[RenderSurface] WaitForRenderTicketAsync returned before ticket completion. Surface=0x{m_SurfaceId:X}, Ticket={ticket}, CompletedBefore={completedBefore}, CompletedAfter={completedAfter}");
+            var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
+            if (!device.IsValid) return;
+
+            var completedBefore = device.GetCompletedTicket();
+            if (completedBefore >= ticket) return;
+
+            // GetCompletedTicket() is only a cached value. In the Vulkan backend that cache is
+            // refreshed by RHIVkQueue::Update(), or by the native WaitForTicket path after waiting
+            // on the timeline semaphore. A pure managed poll here can therefore spin forever even
+            // while the GPU has already completed the work, leaving the editor viewport black before
+            // the first ImportImage/UpdateAsync call.
+            await Task.Run(() => device.WaitQueueTicket(ticket)).ConfigureAwait(false);
+
+            var completedAfter = device.GetCompletedTicket();
+            if (completedAfter < ticket)
+            {
+                KernelLog.Warning($"[RenderSurface] WaitForRenderTicketAsync returned before ticket completion. Surface=0x{m_SurfaceId:X}, Ticket={ticket}, CompletedBefore={completedBefore}, CompletedAfter={completedAfter}");
+            }
+        }
+        finally
+        {
+            EndTicketWait();
+        }
+    }
+
+    private bool TryBeginTicketWait()
+    {
+        lock (m_LifetimeLock)
+        {
+            if (m_DisposeStarted)
+            {
+                return false;
+            }
+
+            m_ActiveTicketWaitCount++;
+            return true;
+        }
+    }
+
+    private void EndTicketWait()
+    {
+        lock (m_LifetimeLock)
+        {
+            m_ActiveTicketWaitCount--;
+            if (m_ActiveTicketWaitCount == 0)
+            {
+                Monitor.PulseAll(m_LifetimeLock);
+            }
         }
     }
 

@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Numerics;
 using System.Text.Json;
 using ArisenEngine.Core.Assets;
+using ArisenEngine.Core.Diagnostics;
 
 namespace ArisenEngine.Rendering.Resources;
 
@@ -77,6 +78,7 @@ public static class GltfModelImportPlanner
             throw new ArgumentException("Model import planning requires a stable source GUID.", nameof(sourceGuid));
         }
 
+        using var _ = Profiler.Zone("GltfModelImportPlanner.CreatePlan");
         var normalizedPackageId = NormalizePackageId(packageId);
         using var document = LoadGltfDocument(sourcePath);
         var root = document.RootElement;
@@ -96,13 +98,18 @@ public static class GltfModelImportPlanner
         AddTextureChildren(sourceGuid, normalizedPackageId, materials, children);
         AddUnsupportedFeatureWarnings(root, warnings);
 
-        return new GltfModelImportPlan(
+        var plan = new GltfModelImportPlan(
             sourceGuid,
             normalizedPackageId,
             children,
             materials,
             images,
             warnings);
+        Profiler.PlotValue("ModelImport.PlannedChildCount", plan.GeneratedChildren.Count);
+        Profiler.PlotValue("ModelImport.PlannedMaterialCount", plan.Materials.Count);
+        Profiler.PlotValue("ModelImport.PlannedImageCount", plan.Images.Count);
+        Profiler.PlotValue("ModelImport.PlanningWarningCount", plan.Warnings.Count);
+        return plan;
     }
 
     private static JsonDocument LoadGltfDocument(string sourcePath)
@@ -677,7 +684,6 @@ public static class GltfModelImportPlanner
 
         if (string.Equals(alphaMode, "BLEND", StringComparison.OrdinalIgnoreCase))
         {
-            warnings.Add($"{context}.alphaMode 'BLEND' requires the transparent render pass and remains unsupported; the generated material is emitted without blending.");
             return GltfMaterialAlphaMode.Blend;
         }
 
