@@ -12,6 +12,7 @@ using ArisenEngine.Core.Lifecycle;
 using ArisenEngine.ECS.Lifecycle;
 using ArisenKernel.Contracts;
 using ArisenKernel.Diagnostics;
+using ArisenEngine.Resources.Serialization;
 
 namespace ArisenEngine.Rendering;
 
@@ -53,6 +54,7 @@ public class RenderSubsystem : ITickableSubsystem
     private RenderPipelineAsset? m_CurrentAsset;
     private IRenderPipelineProvider? m_RenderPipelineProvider;
     private IWindowProvider? m_WindowProvider;
+    private IWorldOriginService? m_WorldOriginService;
     private IntPtr m_RuntimeWindowHost;
 
     // Rendering should typically happen last in the frame
@@ -69,6 +71,7 @@ public class RenderSubsystem : ITickableSubsystem
             ?? throw new InvalidOperationException(
                 "[RenderSubsystem] No active workspace manifest is available for render-pipeline selection.");
         m_RenderPipelineProvider = services.GetService<IRenderPipelineProvider>();
+        m_WorldOriginService = services.GetService<IWorldOriginService>();
         RenderPipelineProviderSelection.Activate(project, m_RenderPipelineProvider);
         KernelLog.InfoFormat(
             "[RenderSubsystem] Activated render-pipeline provider '{0}' with settings type '{1}'.",
@@ -144,6 +147,7 @@ public class RenderSubsystem : ITickableSubsystem
             if (m_CurrentPipeline == null) return;
 
             // 2. Prepare Context and Render per Surface
+            WorldPosition renderOrigin = m_WorldOriginService?.CurrentOrigin ?? default;
             foreach (var surfaceInfo in s_GlobalSurfaces.Values)
             {
             var surface = surfaceInfo.Surface;
@@ -256,10 +260,14 @@ public class RenderSubsystem : ITickableSubsystem
                         Entity entity = cameraEntities[i];
                         if (transformPool.Has(entity))
                         {
-                            ref var camComp = ref cameraComponents[i];
-                            ref var transComp = ref transformPool.GetRef(entity);
+                             ref var camComp = ref cameraComponents[i];
+                             ref var transComp = ref transformPool.GetRef(entity);
+                             if (!IsFiniteCamera(camComp, transComp))
+                             {
+                                 continue;
+                             }
 
-                            ref Camera cam = ref frameCameras[cameraCount];
+                             ref Camera cam = ref frameCameras[cameraCount];
                             cam.FieldOfView = camComp.VerticalFov;
                             cam.NearClip = camComp.NearPlane;
                             cam.FarClip = camComp.FarPlane;
@@ -355,9 +363,10 @@ public class RenderSubsystem : ITickableSubsystem
                         outputKind,
                         frameIndex,
                         deltaTime,
-                        surface.Width,
-                        surface.Height,
-                        pCameras,
+                         surface.Width,
+                         surface.Height,
+                         renderOrigin,
+                         pCameras,
                         cameraCount,
                         pDirectionalLights,
                         directionalLightCount,
@@ -379,23 +388,29 @@ public class RenderSubsystem : ITickableSubsystem
                     Profiler.PlotValue("Render.DirectionalLightCount", snapshot.DirectionalLightCount);
                     Profiler.PlotValue("Render.DirectionalLightSourceCount", directionalLightStats.SourceCount);
                     Profiler.PlotValue("Render.DirectionalLightEnabledCount", directionalLightStats.EnabledCount);
-                    Profiler.PlotValue("Render.DirectionalLightDroppedCount", directionalLightStats.DroppedCount);
+                     Profiler.PlotValue("Render.DirectionalLightDroppedCount", directionalLightStats.DroppedCount);
+                     Profiler.PlotValue("Render.DirectionalLightInvalidInputCount", directionalLightStats.InvalidInputCount);
                     Profiler.PlotValue("Render.PointLightCount", snapshot.PointLightCount);
                     Profiler.PlotValue("Render.PointLightSourceCount", pointLightStats.SourceCount);
                     Profiler.PlotValue("Render.PointLightEnabledCount", pointLightStats.EnabledCount);
                     Profiler.PlotValue("Render.PointLightDroppedCount", pointLightStats.DroppedCount);
-                    Profiler.PlotValue("Render.PointLightMissingTransformCount", pointLightStats.MissingTransformCount);
+                     Profiler.PlotValue("Render.PointLightMissingTransformCount", pointLightStats.MissingTransformCount);
+                     Profiler.PlotValue("Render.PointLightInvalidInputCount", pointLightStats.InvalidInputCount);
                     Profiler.PlotValue("Render.SpotLightCount", snapshot.SpotLightCount);
                     Profiler.PlotValue("Render.SpotLightSourceCount", spotLightStats.SourceCount);
                     Profiler.PlotValue("Render.SpotLightEnabledCount", spotLightStats.EnabledCount);
                     Profiler.PlotValue("Render.SpotLightDroppedCount", spotLightStats.DroppedCount);
-                    Profiler.PlotValue("Render.SpotLightMissingTransformCount", spotLightStats.MissingTransformCount);
+                     Profiler.PlotValue("Render.SpotLightMissingTransformCount", spotLightStats.MissingTransformCount);
+                     Profiler.PlotValue("Render.SpotLightInvalidInputCount", spotLightStats.InvalidInputCount);
                     Profiler.PlotValue("Render.SceneEnvironmentCount", snapshot.SceneEnvironmentCount);
                     Profiler.PlotValue("Render.SceneEnvironmentSourceCount", sceneEnvironmentStats.SourceCount);
                     Profiler.PlotValue("Render.SceneEnvironmentEnabledCount", sceneEnvironmentStats.EnabledCount);
                     Profiler.PlotValue("Render.SceneEnvironmentDroppedCount", sceneEnvironmentStats.DroppedCount);
-                    Profiler.PlotValue("Render.OutputWidth", snapshot.Width);
-                    Profiler.PlotValue("Render.OutputHeight", snapshot.Height);
+                     Profiler.PlotValue("Render.OutputWidth", snapshot.Width);
+                     Profiler.PlotValue("Render.OutputHeight", snapshot.Height);
+                     Profiler.PlotValue("Render.OriginX", snapshot.RenderOrigin.X);
+                     Profiler.PlotValue("Render.OriginY", snapshot.RenderOrigin.Y);
+                     Profiler.PlotValue("Render.OriginZ", snapshot.RenderOrigin.Z);
 
                     if (frameIndex % 60 == 0)
                     {
@@ -411,14 +426,14 @@ public class RenderSubsystem : ITickableSubsystem
                         {
                             Logger.Warning(
                                 $"[RenderSubsystem] Point light frame limit or transform requirement exceeded for surface 0x{snapshot.SurfaceId:X}. " +
-                                $"Accepted the first {PointLightSnapshotExtractor.MaxPointLightsPerFrame} enabled light(s), dropped {pointLightStats.DroppedCount}, missing transforms {pointLightStats.MissingTransformCount}.");
+                                 $"Accepted the first {PointLightSnapshotExtractor.MaxPointLightsPerFrame} enabled light(s), dropped {pointLightStats.DroppedCount}, missing transforms {pointLightStats.MissingTransformCount}, invalid inputs {pointLightStats.InvalidInputCount}.");
                         }
 
                         if (spotLightStats.DroppedCount > 0)
                         {
                             Logger.Warning(
                                 $"[RenderSubsystem] Spot light frame limit or transform requirement exceeded for surface 0x{snapshot.SurfaceId:X}. " +
-                                $"Accepted the first {SpotLightSnapshotExtractor.MaxSpotLightsPerFrame} enabled light(s), dropped {spotLightStats.DroppedCount}, missing transforms {spotLightStats.MissingTransformCount}.");
+                                 $"Accepted the first {SpotLightSnapshotExtractor.MaxSpotLightsPerFrame} enabled light(s), dropped {spotLightStats.DroppedCount}, missing transforms {spotLightStats.MissingTransformCount}, invalid inputs {spotLightStats.InvalidInputCount}.");
                         }
 
                         if (sceneEnvironmentStats.DroppedCount > 0)
@@ -719,6 +734,7 @@ public class RenderSubsystem : ITickableSubsystem
         m_CurrentPipeline?.Dispose();
         m_CurrentPipeline = null;
         m_CurrentAsset = null;
+        m_RenderPipelineProvider?.ReleaseDeviceResources();
         m_RenderPipelineProvider?.Deactivate();
         m_RenderPipelineProvider = null;
     }
@@ -757,5 +773,25 @@ public class RenderSubsystem : ITickableSubsystem
         }
 
         return submission;
+    }
+
+    private static bool IsFiniteCamera(
+        in CameraComponent camera,
+        in TransformComponent transform)
+    {
+        return
+            float.IsFinite(camera.VerticalFov) &&
+            camera.VerticalFov > 0.0f &&
+            float.IsFinite(camera.NearPlane) &&
+            camera.NearPlane > 0.0f &&
+            float.IsFinite(camera.FarPlane) &&
+            camera.FarPlane > camera.NearPlane &&
+            float.IsFinite(transform.Position.X) &&
+            float.IsFinite(transform.Position.Y) &&
+            float.IsFinite(transform.Position.Z) &&
+            float.IsFinite(transform.Rotation.X) &&
+            float.IsFinite(transform.Rotation.Y) &&
+            float.IsFinite(transform.Rotation.Z) &&
+            float.IsFinite(transform.Rotation.W);
     }
 }

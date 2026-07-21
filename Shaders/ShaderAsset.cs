@@ -135,6 +135,7 @@ public readonly record struct CookedShaderStage(
 public static class ShaderAssetCooker
 {
     public const string ShaderSourceAssetType = "ShaderSource";
+    public const int CookedFormatVersion = 1;
 
     public static CookedShaderStage LoadOrCookStage(
         IAssetDatabase assetDatabase,
@@ -152,6 +153,12 @@ public static class ShaderAssetCooker
         }
 
         var stage = FindStage(shader, stageName);
+        var variant = shader.Variant.GetCookedVariant(stage.EntryPoint, shader.VariantKeywords);
+        if (!assetDatabase.CanReadSourceAssets)
+        {
+            return LoadCookedStage(assetDatabase, shader, stage, variant);
+        }
+
         if (!assetDatabase.TryGetAsset(shader.Guid, out var sourceAsset))
         {
             throw new InvalidOperationException($"[ShaderAssetCooker] Shader asset '{shader.Guid}' was not found.");
@@ -163,7 +170,6 @@ public static class ShaderAssetCooker
                 $"[ShaderAssetCooker] Shader asset '{shader.Guid}' has asset type '{sourceAsset.AssetType}', expected '{ShaderSourceAssetType}'.");
         }
 
-        var variant = shader.Variant.GetCookedVariant(stage.EntryPoint, shader.VariantKeywords);
         var outputPath = assetDatabase.GetCookedArtifactPath(shader.Guid, variant, GetCookedExtension(shader.Variant.Backend));
         var newestSourceWriteTimeUtc = GetNewestSourceWriteTimeUtc(sourceAsset.SourcePath, shader.Includes);
 
@@ -189,10 +195,20 @@ public static class ShaderAssetCooker
             outputInfo.Length,
             outputInfo.LastWriteTimeUtc));
 
+        return LoadCookedStage(assetDatabase, shader, stage, variant);
+    }
+
+    private static CookedShaderStage LoadCookedStage(
+        IAssetDatabase assetDatabase,
+        ShaderAsset shader,
+        ShaderStageAsset stage,
+        string variant)
+    {
         if (!assetDatabase.TryLoadCookedAsset(shader.Guid, variant, ShaderSourceAssetType, out var handle))
         {
             throw new InvalidOperationException(
-                $"[ShaderAssetCooker] Failed to load cooked shader asset '{shader.Guid}' stage '{stage.Name}'.");
+                $"[ShaderAssetCooker] Cooked shader asset '{shader.Guid}' stage '{stage.Name}' " +
+                $"variant '{variant}' is unavailable.");
         }
 
         return new CookedShaderStage(stage, variant, handle);

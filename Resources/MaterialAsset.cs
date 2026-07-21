@@ -1085,8 +1085,8 @@ public static class MaterialAssetLoader
 public static class MaterialAssetCooker
 {
     private const string MaterialAssetType = "Material";
-    private const string Variant = "material.runtime";
-    private const int CurrentVersion = 6;
+    public const string RuntimeVariant = "material.runtime";
+    public const int CookedFormatVersion = 6;
     private const int MaxStringByteCount = 16 * 1024;
     private const int MaxCollectionCount = 1024;
     private static readonly byte[] s_Magic = Encoding.ASCII.GetBytes("ARISMATL");
@@ -1103,6 +1103,11 @@ public static class MaterialAssetCooker
             throw new ArgumentException("[MaterialAssetCooker] Material GUID cannot be empty.", nameof(materialGuid));
         }
 
+        if (!assetDatabase.CanReadSourceAssets)
+        {
+            return LoadCooked(assetDatabase, materialGuid);
+        }
+
         if (!assetDatabase.TryGetAsset(materialGuid, out var sourceAsset))
         {
             throw new InvalidOperationException($"[MaterialAssetCooker] Material asset '{materialGuid}' was not found.");
@@ -1114,10 +1119,10 @@ public static class MaterialAssetCooker
                 $"[MaterialAssetCooker] Material asset '{materialGuid}' has asset type '{sourceAsset.AssetType}', expected '{MaterialAssetType}'.");
         }
 
-        var outputPath = assetDatabase.GetCookedArtifactPath(materialGuid, Variant, ".material");
+        var outputPath = assetDatabase.GetCookedArtifactPath(materialGuid, RuntimeVariant, ".material");
         var newestSourceWriteTimeUtc = GetNewestSourceWriteTimeUtc(assetDatabase, materialGuid);
 
-        if (!assetDatabase.TryGetCookedArtifact(materialGuid, Variant, out _) ||
+        if (!assetDatabase.TryGetCookedArtifact(materialGuid, RuntimeVariant, out _) ||
             !File.Exists(outputPath) ||
             File.GetLastWriteTimeUtc(outputPath) < newestSourceWriteTimeUtc ||
             !IsCurrentCookedMaterial(outputPath))
@@ -1135,22 +1140,30 @@ public static class MaterialAssetCooker
         assetDatabase.RegisterCookedArtifact(new CookedAssetRecord(
             materialGuid,
             sourceAsset.AssetType,
-            Variant,
+            RuntimeVariant,
             outputInfo.FullName,
             outputInfo.Length,
             outputInfo.LastWriteTimeUtc));
 
-        if (!assetDatabase.TryLoadCookedAsset(materialGuid, Variant, MaterialAssetType, out var handle))
+        return LoadCooked(assetDatabase, materialGuid);
+    }
+
+    private static CookedMaterial LoadCooked(
+        IAssetDatabase assetDatabase,
+        Guid materialGuid)
+    {
+        if (!assetDatabase.TryLoadCookedAsset(materialGuid, RuntimeVariant, MaterialAssetType, out var handle))
         {
             throw new InvalidOperationException(
-                $"[MaterialAssetCooker] Failed to load cooked material asset '{materialGuid}'.");
+                $"[MaterialAssetCooker] Cooked material asset '{materialGuid}' variant " +
+                $"'{RuntimeVariant}' is unavailable.");
         }
 
         try
         {
             var bytes = assetDatabase.GetCookedAssetBytes(handle);
             var material = ReadMaterial(bytes.Span);
-            return new CookedMaterial(material, Variant, handle);
+            return new CookedMaterial(material, RuntimeVariant, handle);
         }
         catch
         {
@@ -1178,7 +1191,7 @@ public static class MaterialAssetCooker
         var material = MaterialAssetLoader.LoadSource(assetDatabase, materialGuid);
         using var stream = File.Create(outputPath);
         stream.Write(s_Magic);
-        WriteInt32(stream, CurrentVersion);
+        WriteInt32(stream, CookedFormatVersion);
         WriteGuid(stream, material.Guid);
         WriteString(stream, material.Name);
         WriteShader(stream, material.Shader);
@@ -1207,7 +1220,7 @@ public static class MaterialAssetCooker
         WriteRenderState(stream, material.RenderState);
 
         Logger.Log(
-            $"[MaterialAssetCooker] Cooked material asset {sourceAsset.Guid} | Textures: {textureRefs.Count} | ScalarProperties: {scalarProperties.Count} | Vector4Properties: {vector4Properties.Count} | RenderState: Cull={material.RenderState.CullMode}, Blend={material.RenderState.BlendEnabled} | Variant: {Variant} | Output: {outputPath}");
+            $"[MaterialAssetCooker] Cooked material asset {sourceAsset.Guid} | Textures: {textureRefs.Count} | ScalarProperties: {scalarProperties.Count} | Vector4Properties: {vector4Properties.Count} | RenderState: Cull={material.RenderState.CullMode}, Blend={material.RenderState.BlendEnabled} | Variant: {RuntimeVariant} | Output: {outputPath}");
     }
 
     private static bool IsCurrentCookedMaterial(string outputPath)
@@ -1227,7 +1240,7 @@ public static class MaterialAssetCooker
             }
 
             var version = BinaryPrimitives.ReadInt32LittleEndian(header.Slice(s_Magic.Length, sizeof(int)));
-            return version == CurrentVersion;
+            return version == CookedFormatVersion;
         }
         catch
         {
@@ -1325,7 +1338,7 @@ public static class MaterialAssetCooker
         }
 
         var version = reader.ReadInt32();
-        if (version < 1 || version > CurrentVersion)
+        if (version < 1 || version > CookedFormatVersion)
         {
             throw new InvalidOperationException($"[MaterialAssetCooker] Cooked material version '{version}' is not supported.");
         }

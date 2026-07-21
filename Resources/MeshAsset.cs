@@ -72,6 +72,7 @@ public static class MeshAssetCooker
 {
     public const uint StaticMeshVertexStride = 60;
     public const uint SubmeshStride = 16;
+    public const int CookedFormatVersion = 4;
 
     private const string MeshAssetType = "Mesh";
     private const uint GltfBinaryMagic = 0x46546C67;
@@ -79,7 +80,6 @@ public static class MeshAssetCooker
     private const uint GltfBinaryBinChunkType = 0x004E4942;
     private const int GltfBinaryHeaderSize = 12;
     private const int GltfBinaryChunkHeaderSize = 8;
-    private const int CurrentCookedVersion = 4;
     private const int HeaderSize = 80;
     private static readonly Vector3 s_DefaultNormal = new(0.0f, 0.0f, 1.0f);
     private static readonly Vector4 s_DefaultTangent = new(1.0f, 0.0f, 0.0f, 1.0f);
@@ -97,6 +97,12 @@ public static class MeshAssetCooker
             throw new ArgumentNullException(nameof(mesh));
         }
 
+        var variant = mesh.Variant.GetCookedVariant();
+        if (!assetDatabase.CanReadSourceAssets)
+        {
+            return LoadCooked(assetDatabase, mesh, variant);
+        }
+
         if (!assetDatabase.TryGetAsset(mesh.Guid, out var sourceAsset))
         {
             throw new InvalidOperationException($"[MeshAssetCooker] Mesh asset '{mesh.Guid}' was not found.");
@@ -108,7 +114,6 @@ public static class MeshAssetCooker
                 $"[MeshAssetCooker] Mesh asset '{mesh.Guid}' has asset type '{sourceAsset.AssetType}', expected '{MeshAssetType}'.");
         }
 
-        var variant = mesh.Variant.GetCookedVariant();
         var outputPath = assetDatabase.GetCookedArtifactPath(mesh.Guid, variant, ".mesh");
         var sourceWriteTimeUtc = GetSourceDependencyWriteTimeUtc(sourceAsset.SourcePath, mesh.SourceFormat);
 
@@ -134,9 +139,18 @@ public static class MeshAssetCooker
             outputInfo.Length,
             outputInfo.LastWriteTimeUtc));
 
+        return LoadCooked(assetDatabase, mesh, variant);
+    }
+
+    private static CookedMesh LoadCooked(
+        IAssetDatabase assetDatabase,
+        MeshAsset mesh,
+        string variant)
+    {
         if (!assetDatabase.TryLoadCookedAsset(mesh.Guid, variant, MeshAssetType, out var handle))
         {
-            throw new InvalidOperationException($"[MeshAssetCooker] Failed to load cooked mesh asset '{mesh.Guid}'.");
+            throw new InvalidOperationException(
+                $"[MeshAssetCooker] Cooked mesh asset '{mesh.Guid}' variant '{variant}' is unavailable.");
         }
 
         try
@@ -190,7 +204,7 @@ public static class MeshAssetCooker
 
         using var stream = File.Create(outputPath);
         stream.Write(s_Magic);
-        WriteInt32(stream, CurrentCookedVersion);
+        WriteInt32(stream, CookedFormatVersion);
         WriteInt32(stream, source.Vertices.Length);
         WriteInt32(stream, checked((int)StaticMeshVertexStride));
         WriteInt32(stream, vertexDataSize);
@@ -259,7 +273,7 @@ public static class MeshAssetCooker
         }
 
         var version = ReadInt32(bytes, 8);
-        if (version != CurrentCookedVersion)
+        if (version != CookedFormatVersion)
         {
             throw new InvalidOperationException($"[MeshAssetCooker] Cooked mesh version '{version}' is not supported.");
         }
@@ -366,7 +380,7 @@ public static class MeshAssetCooker
             var read = stream.Read(headerPrefix);
             return read == headerPrefix.Length &&
                    headerPrefix.Slice(0, s_Magic.Length).SequenceEqual(s_Magic) &&
-                   ReadInt32(headerPrefix, 8) == CurrentCookedVersion;
+                   ReadInt32(headerPrefix, 8) == CookedFormatVersion;
         }
         catch
         {

@@ -1,5 +1,6 @@
 using Arisen.Native.RHI;
 using ArisenEngine.Core.RHI;
+using ArisenEngine.Resources.Serialization;
 
 namespace ArisenEngine.Rendering;
 
@@ -19,6 +20,7 @@ public readonly unsafe struct RenderFrameSnapshot
         float deltaTime,
         uint width,
         uint height,
+        WorldPosition renderOrigin,
         Camera* cameraPtr,
         int cameraCount,
         DirectionalLight* directionalLightPtr,
@@ -43,6 +45,7 @@ public readonly unsafe struct RenderFrameSnapshot
         DeltaTime = deltaTime;
         Width = width;
         Height = height;
+        RenderOrigin = renderOrigin;
         CameraPtr = cameraPtr;
         CameraCount = cameraCount;
         DirectionalLightPtr = directionalLightPtr;
@@ -68,6 +71,7 @@ public readonly unsafe struct RenderFrameSnapshot
     public float DeltaTime { get; }
     public uint Width { get; }
     public uint Height { get; }
+    public WorldPosition RenderOrigin { get; }
     public Camera* CameraPtr { get; }
     public int CameraCount { get; }
     public DirectionalLight* DirectionalLightPtr { get; }

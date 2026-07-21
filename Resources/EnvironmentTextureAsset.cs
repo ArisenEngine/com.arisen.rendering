@@ -65,6 +65,29 @@ public static class EnvironmentTextureAssetLoader
     public const string EnvironmentTextureAssetType = "EnvironmentTexture";
     public const string Texture2DAssetType = "Texture2D";
 
+    public static EnvironmentTextureAsset Load(
+        IAssetDatabase assetDatabase,
+        Guid environmentTextureGuid)
+    {
+        ArgumentNullException.ThrowIfNull(assetDatabase);
+        if (assetDatabase.CanReadSourceAssets)
+        {
+            return LoadSource(assetDatabase, environmentTextureGuid);
+        }
+
+        CookedEnvironmentTexture cooked = EnvironmentTextureAssetCooker.LoadCooked(
+            assetDatabase,
+            environmentTextureGuid);
+        try
+        {
+            return cooked.Asset;
+        }
+        finally
+        {
+            assetDatabase.Release(cooked.Handle);
+        }
+    }
+
     public static EnvironmentTextureAsset LoadSource(
         IAssetDatabase assetDatabase,
         Guid environmentTextureGuid)
@@ -203,6 +226,8 @@ public static class EnvironmentTextureAssetLoader
 
 public static class EnvironmentTextureAssetCooker
 {
+    public const int CookedFormatVersion = 1;
+
     private const int HeaderSize = 64;
     private const int BytesPerPixel = 8;
     private static readonly byte[] s_Magic = Encoding.ASCII.GetBytes("ARIENVTX");
@@ -211,7 +236,7 @@ public static class EnvironmentTextureAssetCooker
         IAssetDatabase assetDatabase,
         Guid environmentTextureGuid)
     {
-        var asset = EnvironmentTextureAssetLoader.LoadSource(assetDatabase, environmentTextureGuid);
+        var asset = EnvironmentTextureAssetLoader.Load(assetDatabase, environmentTextureGuid);
         return LoadOrCook(assetDatabase, asset);
     }
 
@@ -229,13 +254,18 @@ public static class EnvironmentTextureAssetCooker
             throw new ArgumentNullException(nameof(asset));
         }
 
+        var variant = asset.Variant.GetCookedVariant();
+        if (!assetDatabase.CanReadSourceAssets)
+        {
+            return LoadCooked(assetDatabase, asset, variant);
+        }
+
         if (!assetDatabase.TryGetAsset(asset.Guid, out var sourceAsset))
         {
             throw new InvalidOperationException(
                 $"[EnvironmentTextureAssetCooker] Environment texture asset '{asset.Guid}' was not found.");
         }
 
-        var variant = asset.Variant.GetCookedVariant();
         var outputPath = assetDatabase.GetCookedArtifactPath(asset.Guid, variant, ".environment");
         var dependencyWriteTimeUtc = AssetDependencyTracker.GetEnvironmentTextureDependencyWriteTimeUtc(
             assetDatabase,
@@ -263,25 +293,85 @@ public static class EnvironmentTextureAssetCooker
             outputInfo.Length,
             outputInfo.LastWriteTimeUtc));
 
+        return LoadCooked(assetDatabase, asset, variant);
+    }
+
+    public static CookedEnvironmentTexture LoadCooked(
+        IAssetDatabase assetDatabase,
+        Guid environmentTextureGuid)
+    {
+        ArgumentNullException.ThrowIfNull(assetDatabase);
+        if (environmentTextureGuid == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "[EnvironmentTextureAssetCooker] Environment texture GUID cannot be empty.",
+                nameof(environmentTextureGuid));
+        }
+
+        string variant = EnvironmentTextureVariantKey.DefaultLatLong.GetCookedVariant();
+        return LoadCooked(assetDatabase, asset: null, environmentTextureGuid, variant);
+    }
+
+    private static CookedEnvironmentTexture LoadCooked(
+        IAssetDatabase assetDatabase,
+        EnvironmentTextureAsset asset,
+        string variant)
+    {
+        return LoadCooked(assetDatabase, asset, asset.Guid, variant);
+    }
+
+    private static CookedEnvironmentTexture LoadCooked(
+        IAssetDatabase assetDatabase,
+        EnvironmentTextureAsset? asset,
+        Guid environmentTextureGuid,
+        string variant)
+    {
         if (!assetDatabase.TryLoadCookedAsset(
-                asset.Guid,
+                environmentTextureGuid,
                 variant,
                 EnvironmentTextureAssetLoader.EnvironmentTextureAssetType,
                 out var handle))
         {
             throw new InvalidOperationException(
-                $"[EnvironmentTextureAssetCooker] Failed to load cooked environment texture asset '{asset.Guid}'.");
+                $"[EnvironmentTextureAssetCooker] Cooked environment texture " +
+                $"'{environmentTextureGuid}' variant '{variant}' is unavailable.");
         }
 
         try
         {
             var bytes = assetDatabase.GetCookedAssetBytes(handle);
             var header = ReadHeader(bytes.Span);
-            if (header.SourceTextureGuid != asset.SourceTexture.Guid)
+            string headerVariant = new EnvironmentTextureVariantKey(
+                header.Layout,
+                header.Format,
+                GenerateMipMaps: header.MipCount > 1).GetCookedVariant();
+            if (!string.Equals(headerVariant, variant, StringComparison.Ordinal))
             {
                 throw new InvalidOperationException(
-                    $"[EnvironmentTextureAssetCooker] Cooked environment texture '{asset.Guid}' references stale source texture '{header.SourceTextureGuid}', expected '{asset.SourceTexture.Guid}'.");
+                    $"[EnvironmentTextureAssetCooker] Cooked environment texture " +
+                    $"'{environmentTextureGuid}' encodes variant '{headerVariant}', expected '{variant}'.");
             }
+
+            if (asset != null && header.SourceTextureGuid != asset.SourceTexture.Guid)
+            {
+                throw new InvalidOperationException(
+                    $"[EnvironmentTextureAssetCooker] Cooked environment texture '{asset.Guid}' references " +
+                    $"stale source texture '{header.SourceTextureGuid}', expected '{asset.SourceTexture.Guid}'.");
+            }
+
+            asset ??= new EnvironmentTextureAsset(
+                environmentTextureGuid,
+                $"RuntimeEnvironment/{environmentTextureGuid:N}",
+                new AssetRef<Texture2DSourceAsset>(
+                    header.SourceTextureGuid,
+                    EnvironmentTextureAssetLoader.Texture2DAssetType),
+                new EnvironmentTextureVariantKey(
+                    header.Layout,
+                    header.Format,
+                    GenerateMipMaps: header.MipCount > 1),
+                Texture2DColorSpace.Linear,
+                header.RotationDegrees,
+                header.Intensity);
 
             return new CookedEnvironmentTexture(
                 asset,
@@ -346,7 +436,7 @@ public static class EnvironmentTextureAssetCooker
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
         using var stream = File.Create(outputPath);
         stream.Write(s_Magic);
-        WriteInt32(stream, 1);
+        WriteInt32(stream, CookedFormatVersion);
         WriteInt32(stream, checked((int)source.Width));
         WriteInt32(stream, checked((int)source.Height));
         WriteInt32(stream, 1);
@@ -461,7 +551,7 @@ public static class EnvironmentTextureAssetCooker
         }
 
         var version = ReadInt32(bytes, 8);
-        if (version != 1)
+        if (version != CookedFormatVersion)
         {
             throw new InvalidOperationException(
                 $"[EnvironmentTextureAssetCooker] Cooked environment texture version '{version}' is not supported.");

@@ -68,6 +68,8 @@ public readonly record struct CookedTexture2D(
 
 public static class Texture2DAssetCooker
 {
+    public const int CookedFormatVersion = 1;
+
     private const string TextureAssetType = "Texture2D";
     private const int HeaderSize = 36;
     private static readonly byte[] s_Magic = Encoding.ASCII.GetBytes("ARISTX2D");
@@ -86,6 +88,12 @@ public static class Texture2DAssetCooker
             throw new ArgumentNullException(nameof(texture));
         }
 
+        var variant = texture.Variant.GetCookedVariant();
+        if (!assetDatabase.CanReadSourceAssets)
+        {
+            return LoadCooked(assetDatabase, texture, variant);
+        }
+
         if (!assetDatabase.TryGetAsset(texture.Guid, out var sourceAsset))
         {
             throw new InvalidOperationException($"[Texture2DAssetCooker] Texture asset '{texture.Guid}' was not found.");
@@ -97,7 +105,6 @@ public static class Texture2DAssetCooker
                 $"[Texture2DAssetCooker] Texture asset '{texture.Guid}' has asset type '{sourceAsset.AssetType}', expected '{TextureAssetType}'.");
         }
 
-        var variant = texture.Variant.GetCookedVariant();
         var outputPath = assetDatabase.GetCookedArtifactPath(texture.Guid, variant, ".texture2d");
         var sourceWriteTimeUtc = File.GetLastWriteTimeUtc(sourceAsset.SourcePath);
 
@@ -123,10 +130,18 @@ public static class Texture2DAssetCooker
             outputInfo.Length,
             outputInfo.LastWriteTimeUtc));
 
+        return LoadCooked(assetDatabase, texture, variant);
+    }
+
+    private static CookedTexture2D LoadCooked(
+        IAssetDatabase assetDatabase,
+        Texture2DAsset texture,
+        string variant)
+    {
         if (!assetDatabase.TryLoadCookedAsset(texture.Guid, variant, TextureAssetType, out var handle))
         {
             throw new InvalidOperationException(
-                $"[Texture2DAssetCooker] Failed to load cooked texture asset '{texture.Guid}'.");
+                $"[Texture2DAssetCooker] Cooked texture asset '{texture.Guid}' variant '{variant}' is unavailable.");
         }
 
         try
@@ -187,7 +202,7 @@ public static class Texture2DAssetCooker
 
         using var stream = File.Create(outputPath);
         stream.Write(s_Magic);
-        WriteInt32(stream, 1);
+        WriteInt32(stream, CookedFormatVersion);
         WriteInt32(stream, checked((int)source.Width));
         WriteInt32(stream, checked((int)source.Height));
         WriteInt32(stream, 1);
@@ -208,7 +223,7 @@ public static class Texture2DAssetCooker
         }
 
         var version = ReadInt32(bytes, 8);
-        if (version != 1)
+        if (version != CookedFormatVersion)
         {
             throw new InvalidOperationException($"[Texture2DAssetCooker] Cooked texture version '{version}' is not supported.");
         }

@@ -1,6 +1,7 @@
 using Arisen.Native.RHI;
 using ArisenEngine.Core.RHI;
 using ArisenEngine.Core.Memory;
+using ArisenEngine.Resources.Serialization;
 
 namespace ArisenEngine.Rendering;
 
@@ -19,6 +20,7 @@ public struct RenderContext
     public float DeltaTime => Snapshot.DeltaTime;
     public uint Width => Snapshot.Width;
     public uint Height => Snapshot.Height;
+    public WorldPosition RenderOrigin => Snapshot.RenderOrigin;
     public uint SurfaceId => Snapshot.SurfaceId;
     public RenderOutputKind OutputKind => Snapshot.OutputKind;
     public RHIImageHandle TargetImage => Snapshot.TargetImage;

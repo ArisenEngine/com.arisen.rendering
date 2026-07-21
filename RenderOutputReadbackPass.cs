@@ -26,6 +26,7 @@ internal sealed class RenderOutputReadbackPass : RenderPassNode, IDisposable
     private uint m_FrameIndex;
     private uint m_SurfaceId;
     private RenderOutputKind m_OutputKind;
+    private RuntimeVisualSummaryCapture m_Capture;
     private bool m_CapturePending;
     private bool m_Disposed;
 
@@ -42,12 +43,12 @@ internal sealed class RenderOutputReadbackPass : RenderPassNode, IDisposable
         ThrowIfDisposed();
         if (!m_Service.IsEnabled ||
             context.OutputKind != RenderOutputKind.NativeSwapchain ||
-            context.FrameIndex != m_Service.CaptureFrameIndex ||
-            !m_Service.TryBeginCapture(context.FrameIndex))
+            !m_Service.TryBeginCapture(context.FrameIndex, out RuntimeVisualSummaryCapture capture))
         {
             return false;
         }
 
+        m_Capture = capture;
         try
         {
             if (frameDepth == null || !frameDepth.IsValid)
@@ -107,14 +108,15 @@ internal sealed class RenderOutputReadbackPass : RenderPassNode, IDisposable
 
             Logger.Log(
                 $"[VisualSummary] Prepared readback | Profile: {m_Service.ProfileName} | " +
-                $"Frame: {m_FrameIndex} | Size: {m_Width}x{m_Height} | Format: {m_Format} | " +
+                $"Capture: {m_Capture.Name} | Frame: {m_FrameIndex} | " +
+                $"Size: {m_Width}x{m_Height} | Format: {m_Format} | " +
                 $"DepthFormat: {m_DepthFormat} | ColorBytes: {m_ColorReadbackByteCount} | " +
                 $"DepthBytes: {m_DepthReadbackByteCount} | TotalBytes: {m_TotalReadbackByteCount}");
             return true;
         }
         catch (Exception ex)
         {
-            m_Service.ReportFailure(ex.Message);
+            m_Service.ReportFailure(m_Capture, ex.Message);
             throw;
         }
     }
@@ -193,14 +195,14 @@ internal sealed class RenderOutputReadbackPass : RenderPassNode, IDisposable
                 m_OutputKind,
                 m_SurfaceId,
                 m_FrameIndex);
-            RenderOutputImageSummaryWriter.WriteAtomic(m_Service.OutputPath, artifact);
+            RenderOutputImageSummaryWriter.WriteAtomic(m_Capture.OutputPath, artifact);
 
             if (artifact.Passed)
             {
-                m_Service.ReportSuccess();
+                m_Service.ReportSuccess(m_Capture);
                 KernelLog.InfoFormat(
                     "[VisualSummary] Passed. Output={0}, NonBlank={1}/{2}, LuminanceRange={3:F6}",
-                    m_Service.OutputPath,
+                    m_Capture.OutputPath,
                     artifact.NonBlankPixelCount,
                     artifact.PixelCount,
                     artifact.MaximumLuminance - artifact.MinimumLuminance);
@@ -221,19 +223,20 @@ internal sealed class RenderOutputReadbackPass : RenderPassNode, IDisposable
                     $"{artifact.Depth.WrittenDepthPixelCount}/" +
                     $"{artifact.Depth.Checks.RequiredWrittenDepthPixelCount}, DepthRange=" +
                     $"{artifact.Depth.MaximumDepth - artifact.Depth.MinimumDepth:F6}/" +
-                    $"{artifact.Depth.Checks.RequiredDepthRange:F6}. Artifact: {m_Service.OutputPath}";
-                m_Service.ReportFailure(failure);
+                    $"{artifact.Depth.Checks.RequiredDepthRange:F6}. Artifact: {m_Capture.OutputPath}";
+                m_Service.ReportFailure(m_Capture, failure);
                 KernelLog.WarningFormat("[VisualSummary] {0}", failure);
             }
         }
         catch (Exception ex)
         {
-            m_Service.ReportFailure(ex.Message);
+            m_Service.ReportFailure(m_Capture, ex.Message);
             throw;
         }
         finally
         {
             m_CapturePending = false;
+            m_Capture = default;
         }
     }
 

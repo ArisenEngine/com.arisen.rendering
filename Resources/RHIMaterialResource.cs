@@ -12,6 +12,22 @@ public readonly record struct MaterialTexture2DBinding(
     uint SamplerIndex,
     MaterialTextureTransform Transform);
 
+public interface IRHITexture2DLease : IDisposable
+{
+    bool IsValid { get; }
+    uint BindlessImageIndex { get; }
+    uint BindlessSamplerIndex { get; }
+}
+
+public interface IRHITexture2DResourceCache
+{
+    IRHITexture2DLease Acquire(
+        RHIDevice device,
+        IAssetDatabase assetDatabase,
+        Texture2DAsset asset,
+        MaterialTextureSamplerSettings samplerSettings);
+}
+
 [StructLayout(LayoutKind.Sequential)]
 public readonly struct MaterialTexture2DBindlessConstants
 {
@@ -30,7 +46,7 @@ public sealed class RHIMaterialResource : IDisposable
     private const uint InvalidBindlessIndex = 0xFFFFFFFFu;
 
     private readonly MaterialAsset m_Asset;
-    private readonly RHITexture2DResource[] m_Textures;
+    private readonly IRHITexture2DLease[] m_Textures;
     private readonly MaterialTexture2DBinding[] m_TextureBindings;
     private readonly MaterialScalarProperty[] m_ScalarProperties;
     private readonly MaterialVector4Property[] m_Vector4Properties;
@@ -50,7 +66,8 @@ public sealed class RHIMaterialResource : IDisposable
         RHIDevice device,
         IAssetDatabase assetDatabase,
         MaterialAsset asset,
-        CookedAssetHandle cookedMaterialHandle = default)
+        CookedAssetHandle cookedMaterialHandle = default,
+        IRHITexture2DResourceCache? textureCache = null)
     {
         if (!device.IsValid)
         {
@@ -70,7 +87,7 @@ public sealed class RHIMaterialResource : IDisposable
         ShaderDependencyStamp = AssetDependencyTracker.GetShaderStamp(m_AssetDatabase, m_Asset.Shader);
 
         var textureRefs = m_Asset.Texture2DRefs ?? Array.Empty<MaterialTexture2DRef>();
-        m_Textures = new RHITexture2DResource[textureRefs.Count];
+        m_Textures = new IRHITexture2DLease[textureRefs.Count];
         m_TextureBindings = new MaterialTexture2DBinding[textureRefs.Count];
         m_ScalarProperties = (m_Asset.ScalarProperties ?? Array.Empty<MaterialScalarProperty>()).ToArray();
         m_Vector4Properties = (m_Asset.Vector4Properties ?? Array.Empty<MaterialVector4Property>()).ToArray();
@@ -85,11 +102,16 @@ public sealed class RHIMaterialResource : IDisposable
                     throw new InvalidOperationException($"[RHIMaterialResource] Material '{m_Asset.Name}' has an unnamed Texture2D binding at index {i}.");
                 }
 
-                var texture = new RHITexture2DResource(
-                    device,
-                    m_AssetDatabase,
-                    textureRef.Texture,
-                    textureRef.ResolvedSampler);
+                IRHITexture2DLease texture = textureCache?.Acquire(
+                        device,
+                        m_AssetDatabase,
+                        textureRef.Texture,
+                        textureRef.ResolvedSampler)
+                    ?? new OwnedTextureLease(new RHITexture2DResource(
+                        device,
+                        m_AssetDatabase,
+                        textureRef.Texture,
+                        textureRef.ResolvedSampler));
                 if (!texture.IsValid ||
                     texture.BindlessImageIndex == InvalidBindlessIndex ||
                     texture.BindlessSamplerIndex == InvalidBindlessIndex)
@@ -228,5 +250,26 @@ public sealed class RHIMaterialResource : IDisposable
 
         IsValid = false;
         m_Disposed = true;
+    }
+
+    private sealed class OwnedTextureLease : IRHITexture2DLease
+    {
+        private RHITexture2DResource? m_Resource;
+
+        public OwnedTextureLease(RHITexture2DResource resource)
+        {
+            m_Resource = resource;
+        }
+
+        public bool IsValid => m_Resource is { IsValid: true };
+        public uint BindlessImageIndex =>
+            m_Resource?.BindlessImageIndex ?? InvalidBindlessIndex;
+        public uint BindlessSamplerIndex =>
+            m_Resource?.BindlessSamplerIndex ?? InvalidBindlessIndex;
+
+        public void Dispose()
+        {
+            Interlocked.Exchange(ref m_Resource, null)?.Dispose();
+        }
     }
 }
