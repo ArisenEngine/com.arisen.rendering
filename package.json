@@ -10,7 +10,13 @@
     "class": "ArisenEngine.Rendering.RenderingPackage"
   },
   "services": {
+    "provides": [
+      "ArisenEngine.Rendering.IRuntimeShaderCookRecipeRegistry"
+    ],
     "requires": [
+      "ArisenEngine.Core.Assets.IAssetDatabase",
+      "ArisenEngine.Core.Assets.IRuntimeAssetCookerRegistry",
+      "ArisenEngine.Resources.Serialization.IWorldOriginService",
       "ArisenKernel.Contracts.IWindowProvider",
       "ArisenKernel.Contracts.IRHIBackend",
       {
@@ -36,7 +42,8 @@
     "com.arisen.ecs": "1.0.0",
     "com.arisen.core.native": "1.0.0",
     "com.arisen.dag": "1.0.0",
-    "com.arisen.taskgraph": "1.0.0"
+    "com.arisen.taskgraph": "1.0.0",
+    "com.arisen.resources": "1.0.0"
   },
   "nugetDependencies": {
     "StbImageSharp": "2.30.15",

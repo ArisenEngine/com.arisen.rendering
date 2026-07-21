@@ -14,4 +14,10 @@ public interface IRenderPipelineProvider
     void Activate(ProjectAssetReference settings);
 
     void Deactivate();
+
+    /// <summary>
+    /// Releases provider-owned RHI resources before the selected backend shuts down.
+    /// The operation must be idempotent because package unload may invoke it again.
+    /// </summary>
+    void ReleaseDeviceResources();
 }

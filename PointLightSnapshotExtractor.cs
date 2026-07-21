@@ -8,12 +8,14 @@ public readonly struct PointLightExtractionStats
         int sourceCount,
         int enabledCount,
         int acceptedCount,
-        int missingTransformCount)
+        int missingTransformCount,
+        int invalidInputCount)
     {
         SourceCount = sourceCount;
         EnabledCount = enabledCount;
         AcceptedCount = acceptedCount;
         MissingTransformCount = missingTransformCount;
+        InvalidInputCount = invalidInputCount;
         DroppedCount = enabledCount - acceptedCount;
     }
 
@@ -21,6 +23,7 @@ public readonly struct PointLightExtractionStats
     public int EnabledCount { get; }
     public int AcceptedCount { get; }
     public int MissingTransformCount { get; }
+    public int InvalidInputCount { get; }
     public int DroppedCount { get; }
 }
 
@@ -39,6 +42,7 @@ public static class PointLightSnapshotExtractor
         int enabledCount = 0;
         int acceptedCount = 0;
         int missingTransformCount = 0;
+        int invalidInputCount = 0;
 
         for (int i = 0; i < sourceCount; i++)
         {
@@ -61,6 +65,14 @@ public static class PointLightSnapshotExtractor
             }
 
             ref var transform = ref transformPool.GetRef(entities[i]);
+            if (!IsFinite(transform.Position) ||
+                !IsFinite(component.Color) ||
+                !float.IsFinite(component.Intensity) ||
+                !float.IsFinite(component.Range))
+            {
+                invalidInputCount++;
+                continue;
+            }
             destination[acceptedCount] = PointLight.Create(
                 transform.Position,
                 component.Color,
@@ -73,6 +85,12 @@ public static class PointLightSnapshotExtractor
             source.Length,
             enabledCount,
             acceptedCount,
-            missingTransformCount);
+            missingTransformCount,
+            invalidInputCount);
     }
+
+    private static bool IsFinite(System.Numerics.Vector3 value) =>
+        float.IsFinite(value.X) &&
+        float.IsFinite(value.Y) &&
+        float.IsFinite(value.Z);
 }

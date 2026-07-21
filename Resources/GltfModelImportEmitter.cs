@@ -6,6 +6,7 @@ using System.Text.Json;
 using ArisenEngine.Core.Assets;
 using ArisenEngine.Core.Diagnostics;
 using ArisenEngine.Core.Serialization;
+using ArisenEngine.Resources.Serialization;
 
 namespace ArisenEngine.Rendering.Resources;
 
@@ -192,6 +193,7 @@ public static class GltfModelImportEmitter
                         nodes,
                         meshes,
                         plan,
+                        i,
                         rootNode.GetInt32(),
                         Matrix4x4.Identity,
                         stack,
@@ -219,6 +221,7 @@ public static class GltfModelImportEmitter
         JsonElement nodes,
         JsonElement meshes,
         GltfModelImportPlan plan,
+        int sceneIndex,
         int nodeIndex,
         Matrix4x4 parentTransform,
         HashSet<int> stack,
@@ -249,6 +252,7 @@ public static class GltfModelImportEmitter
                 {
                     EmitSceneMeshEntities(
                         node,
+                        sceneIndex,
                         nodeIndex,
                         meshes[meshIndex],
                         meshIndex,
@@ -277,6 +281,7 @@ public static class GltfModelImportEmitter
                         nodes,
                         meshes,
                         plan,
+                        sceneIndex,
                         child.GetInt32(),
                         worldTransform,
                         stack,
@@ -293,6 +298,7 @@ public static class GltfModelImportEmitter
 
     private static void EmitSceneMeshEntities(
         JsonElement node,
+        int sceneIndex,
         int nodeIndex,
         JsonElement mesh,
         int meshIndex,
@@ -324,6 +330,11 @@ public static class GltfModelImportEmitter
                 ? baseEntityName
                 : $"{baseEntityName}_Primitive_{i}";
             entities.Add(CreateSceneEntity(
+                GeneratedAssetIdentity.CreateChildGuid(
+                    plan.SourceGuid,
+                    plan.PackageId,
+                    "scene-entity",
+                    $"scenes/{sceneIndex}/nodes/{nodeIndex}/primitives/{i}"),
                 entityName,
                 worldTransform,
                 meshChild.Metadata.Guid,
@@ -344,6 +355,7 @@ public static class GltfModelImportEmitter
     }
 
     private static EmittedSceneEntity CreateSceneEntity(
+        Guid authoringGuid,
         string name,
         Matrix4x4 transform,
         Guid meshGuid,
@@ -368,6 +380,7 @@ public static class GltfModelImportEmitter
         }
 
         return new EmittedSceneEntity(
+            authoringGuid,
             name,
             translation,
             rotation,
@@ -491,7 +504,17 @@ public static class GltfModelImportEmitter
         IReadOnlyList<EmittedSceneEntity> entities)
     {
         var builder = new StringBuilder();
+        builder.AppendLine(CultureInfo.InvariantCulture, $"Version: {SceneComponentSchemas.CurrentSceneVersion}");
         builder.AppendLine(CultureInfo.InvariantCulture, $"Name: {EscapeScalar(sceneName)}");
+        builder.AppendLine("ComponentSchemas:");
+        builder.AppendLine(CultureInfo.InvariantCulture, $"- TypeId: {SceneComponentSchemas.TransformTypeId}");
+        builder.AppendLine("  Name: Transform");
+        builder.AppendLine("  Version: 1");
+        builder.AppendLine("  Required: true");
+        builder.AppendLine(CultureInfo.InvariantCulture, $"- TypeId: {SceneComponentSchemas.MeshRendererTypeId}");
+        builder.AppendLine("  Name: MeshRenderer");
+        builder.AppendLine("  Version: 1");
+        builder.AppendLine("  Required: true");
         if (entities.Count == 0)
         {
             builder.AppendLine("Entities: []");
@@ -502,7 +525,8 @@ public static class GltfModelImportEmitter
         for (int i = 0; i < entities.Count; i++)
         {
             var entity = entities[i];
-            builder.AppendLine(CultureInfo.InvariantCulture, $"- Name: {EscapeScalar(entity.Name)}");
+            builder.AppendLine(CultureInfo.InvariantCulture, $"- Guid: {entity.AuthoringGuid:D}");
+            builder.AppendLine(CultureInfo.InvariantCulture, $"  Name: {EscapeScalar(entity.Name)}");
             builder.AppendLine("  Transform:");
             AppendVector3(builder, "    Position", entity.Position);
             AppendQuaternion(builder, "    Rotation", entity.Rotation);
@@ -1444,6 +1468,7 @@ public static class GltfModelImportEmitter
     }
 
     private readonly record struct EmittedSceneEntity(
+        Guid AuthoringGuid,
         string Name,
         Vector3 Position,
         Quaternion Rotation,

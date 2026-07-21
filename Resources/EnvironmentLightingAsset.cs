@@ -42,6 +42,7 @@ public static class EnvironmentLightingAssetCooker
     public const int SpecularSampleCount = 64;
     public const int BrdfSampleCount = 128;
     public const string CookedVariant = "ibl.latlong.rgba16f.v1";
+    public const int CookedFormatVersion = 1;
 
     private const int HeaderSize = 96;
     private const int BytesPerPixel = 8;
@@ -52,7 +53,7 @@ public static class EnvironmentLightingAssetCooker
         IAssetDatabase assetDatabase,
         Guid environmentTextureGuid)
     {
-        var asset = EnvironmentTextureAssetLoader.LoadSource(assetDatabase, environmentTextureGuid);
+        var asset = EnvironmentTextureAssetLoader.Load(assetDatabase, environmentTextureGuid);
         return LoadOrCook(assetDatabase, asset);
     }
 
@@ -62,6 +63,11 @@ public static class EnvironmentLightingAssetCooker
     {
         ArgumentNullException.ThrowIfNull(assetDatabase);
         ArgumentNullException.ThrowIfNull(asset);
+
+        if (!assetDatabase.CanReadSourceAssets)
+        {
+            return LoadCooked(assetDatabase, asset);
+        }
 
         if (!assetDatabase.TryGetAsset(asset.Guid, out var sourceAsset))
         {
@@ -99,6 +105,13 @@ public static class EnvironmentLightingAssetCooker
             outputInfo.Length,
             outputInfo.LastWriteTimeUtc));
 
+        return LoadCooked(assetDatabase, asset);
+    }
+
+    private static CookedEnvironmentLighting LoadCooked(
+        IAssetDatabase assetDatabase,
+        EnvironmentTextureAsset asset)
+    {
         if (!assetDatabase.TryLoadCookedAsset(
                 asset.Guid,
                 CookedVariant,
@@ -106,7 +119,8 @@ public static class EnvironmentLightingAssetCooker
                 out var handle))
         {
             throw new InvalidOperationException(
-                $"[EnvironmentLightingAssetCooker] Failed to load cooked IBL resources for environment '{asset.Guid}'.");
+                $"[EnvironmentLightingAssetCooker] Cooked IBL resources for environment " +
+                $"'{asset.Guid}' variant '{CookedVariant}' are unavailable.");
         }
 
         try
@@ -211,7 +225,7 @@ public static class EnvironmentLightingAssetCooker
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
         using var stream = File.Create(outputPath);
         stream.Write(s_Magic);
-        WriteInt32(stream, 1);
+        WriteInt32(stream, CookedFormatVersion);
         WriteInt32(stream, checked((int)IrradianceWidth));
         WriteInt32(stream, checked((int)IrradianceHeight));
         WriteInt32(stream, 1);
@@ -579,7 +593,7 @@ public static class EnvironmentLightingAssetCooker
         }
 
         var version = ReadInt32(bytes, 8);
-        if (version != 1)
+        if (version != CookedFormatVersion)
         {
             throw new InvalidOperationException(
                 $"[EnvironmentLightingAssetCooker] Cooked IBL version '{version}' is not supported.");
