@@ -861,16 +861,18 @@ public sealed class RenderGraph : IDisposable
         RenderResourceState state,
         bool isSource)
     {
+        bool initializeTarget = isSource && context.TargetImageRequiresInitialization;
         return state switch
         {
             RenderResourceState.OutputOwnership => new RenderFrameColorRhiState(
-                isSource && context.OutputKind != RenderOutputKind.EditorSharedTexture
+                isSource &&
+                (context.OutputKind != RenderOutputKind.EditorSharedTexture || initializeTarget)
                     ? EImageLayout.IMAGE_LAYOUT_UNDEFINED
                     : EImageLayout.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 isSource || context.OutputKind == RenderOutputKind.EditorSharedTexture
                     ? EAccessFlag.ACCESS_NONE
                     : EAccessFlag.ACCESS_TRANSFER_READ_BIT,
-                context.OutputKind == RenderOutputKind.EditorSharedTexture
+                context.OutputKind == RenderOutputKind.EditorSharedTexture && !initializeTarget
                     ? RHIQueueFamily.External
                     : RHIQueueFamily.Ignored,
                 isSource

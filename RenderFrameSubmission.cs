@@ -24,6 +24,7 @@ internal sealed class RenderFrameSubmission
     private bool m_FrameCompleteSignaled;
     private int m_SubmitCount;
     private ulong m_LastTicket;
+    private readonly RenderTargetImageStateTracker m_TargetImageState = new();
 
     public uint SurfaceId => m_SurfaceId;
     public uint FrameIndex => m_FrameIndex;
@@ -31,6 +32,7 @@ internal sealed class RenderFrameSubmission
     public uint Height => m_Height;
     public RenderOutputKind OutputKind => m_OutputKind;
     public RHIImageHandle TargetImage { get; private set; } = RHIImageHandle.Invalid;
+    public bool TargetImageRequiresInitialization { get; private set; }
     public RHISwapChain SwapChain => m_SwapChain;
     public ulong LastTicket => m_LastTicket;
     public int SubmitCount => m_SubmitCount;
@@ -59,6 +61,7 @@ internal sealed class RenderFrameSubmission
         m_FrameCompleteSignaled = false;
         m_Acquired = false;
         TargetImage = RHIImageHandle.Invalid;
+        TargetImageRequiresInitialization = false;
 
         if (!m_Device.IsValid)
         {
@@ -74,6 +77,7 @@ internal sealed class RenderFrameSubmission
 
         TargetImage = m_SwapChain.BeginFrame(frameIndex);
         m_Acquired = TargetImage.IsValid;
+        TargetImageRequiresInitialization = m_TargetImageState.RequiresInitialization(TargetImage);
         Profiler.PlotValue("RenderSubmission.AcquireSucceeded", m_Acquired ? 1 : 0);
 
         if (!m_Acquired)
@@ -150,6 +154,7 @@ internal sealed class RenderFrameSubmission
         }
 
         m_SwapChain.EndFrame(m_FrameIndex);
+        m_TargetImageState.MarkInitialized(TargetImage);
         Profiler.PlotValue("RenderSubmission.Presented", 1);
 
         if (ShouldLogDiagnostics())

@@ -24,6 +24,7 @@ public struct RenderContext
     public uint SurfaceId => Snapshot.SurfaceId;
     public RenderOutputKind OutputKind => Snapshot.OutputKind;
     public RHIImageHandle TargetImage => Snapshot.TargetImage;
+    public bool TargetImageRequiresInitialization => Snapshot.TargetImageRequiresInitialization;
     public int CameraCount => Snapshot.CameraCount;
     public int DirectionalLightCount => Snapshot.DirectionalLightCount;
     public int PointLightCount => Snapshot.PointLightCount;

@@ -72,7 +72,10 @@ public static class Texture2DAssetCooker
 
     private const string TextureAssetType = "Texture2D";
     private const int HeaderSize = 36;
+    private const int LinearToSrgbTableResolution = 4096;
     private static readonly byte[] s_Magic = Encoding.ASCII.GetBytes("ARISTX2D");
+    private static readonly float[] s_SrgbToLinear = CreateSrgbToLinearTable();
+    private static readonly byte[] s_LinearToSrgb = CreateLinearToSrgbTable();
 
     public static CookedTexture2D LoadOrCook(
         IAssetDatabase assetDatabase,
@@ -110,7 +113,8 @@ public static class Texture2DAssetCooker
 
         if (!assetDatabase.TryGetCookedArtifact(texture.Guid, variant, out _) ||
             !File.Exists(outputPath) ||
-            File.GetLastWriteTimeUtc(outputPath) < sourceWriteTimeUtc)
+            File.GetLastWriteTimeUtc(outputPath) < sourceWriteTimeUtc ||
+            !HasCompatibleCookedArtifact(outputPath, texture.Variant))
         {
             CookTexture(sourceAsset, texture, variant, outputPath);
         }
@@ -199,20 +203,244 @@ public static class Texture2DAssetCooker
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
         var source = DecodeSource(sourceAsset.SourcePath, texture.SourceFormat);
+        CookedMipChain mipChain = texture.Variant.GenerateMipMaps
+            ? GenerateMipChain(source, texture.Variant.ColorSpace)
+            : new CookedMipChain(1, source.RgbaPixels);
 
         using var stream = File.Create(outputPath);
         stream.Write(s_Magic);
         WriteInt32(stream, CookedFormatVersion);
         WriteInt32(stream, checked((int)source.Width));
         WriteInt32(stream, checked((int)source.Height));
-        WriteInt32(stream, 1);
+        WriteInt32(stream, mipChain.MipCount);
         WriteInt32(stream, (int)texture.Variant.Format);
         WriteInt32(stream, (int)texture.Variant.ColorSpace);
-        WriteInt32(stream, source.RgbaPixels.Length);
-        stream.Write(source.RgbaPixels);
+        WriteInt32(stream, mipChain.Pixels.Length);
+        stream.Write(mipChain.Pixels);
 
         Logger.Log(
-            $"[Texture2DAssetCooker] Cooked texture asset {texture.Guid} | Size: {source.Width}x{source.Height} | Variant: {variant} | Output: {outputPath}");
+            $"[Texture2DAssetCooker] Cooked texture asset {texture.Guid} | Size: {source.Width}x{source.Height} | Mips: {mipChain.MipCount} | Variant: {variant} | Output: {outputPath}");
+    }
+
+    private static CookedMipChain GenerateMipChain(
+        DecodedTexture2DSource source,
+        Texture2DColorSpace colorSpace)
+    {
+        int mipCount = GetMipCount(source.Width, source.Height);
+        int packedByteCount = GetPackedMipByteCount(source.Width, source.Height, mipCount);
+        var packedPixels = new byte[packedByteCount];
+        source.RgbaPixels.CopyTo(packedPixels, 0);
+
+        uint sourceWidth = source.Width;
+        uint sourceHeight = source.Height;
+        int sourceOffset = 0;
+        int destinationOffset = source.RgbaPixels.Length;
+        while (sourceWidth > 1 || sourceHeight > 1)
+        {
+            uint destinationWidth = Math.Max(1u, sourceWidth >> 1);
+            uint destinationHeight = Math.Max(1u, sourceHeight >> 1);
+            int sourceByteCount = checked((int)(sourceWidth * sourceHeight * 4u));
+            int destinationByteCount = checked((int)(destinationWidth * destinationHeight * 4u));
+            DownsampleMip(
+                packedPixels.AsSpan(sourceOffset, sourceByteCount),
+                sourceWidth,
+                sourceHeight,
+                packedPixels.AsSpan(destinationOffset, destinationByteCount),
+                destinationWidth,
+                destinationHeight,
+                colorSpace);
+
+            sourceOffset = destinationOffset;
+            destinationOffset = checked(destinationOffset + destinationByteCount);
+            sourceWidth = destinationWidth;
+            sourceHeight = destinationHeight;
+        }
+
+        return new CookedMipChain(mipCount, packedPixels);
+    }
+
+    private static bool HasCompatibleCookedArtifact(
+        string path,
+        Texture2DVariantKey variant)
+    {
+        try
+        {
+            using var stream = File.OpenRead(path);
+            if (stream.Length < HeaderSize)
+            {
+                return false;
+            }
+
+            Span<byte> header = stackalloc byte[HeaderSize];
+            stream.ReadExactly(header);
+            if (!header.Slice(0, s_Magic.Length).SequenceEqual(s_Magic) ||
+                ReadInt32(header, 8) != CookedFormatVersion)
+            {
+                return false;
+            }
+
+            int width = ReadInt32(header, 12);
+            int height = ReadInt32(header, 16);
+            int mipCount = ReadInt32(header, 20);
+            int pixelDataSize = ReadInt32(header, 32);
+            if (width <= 0 ||
+                height <= 0 ||
+                (Texture2DCookedFormat)ReadInt32(header, 24) != variant.Format ||
+                (Texture2DColorSpace)ReadInt32(header, 28) != variant.ColorSpace)
+            {
+                return false;
+            }
+
+            int expectedMipCount = variant.GenerateMipMaps
+                ? GetMipCount(checked((uint)width), checked((uint)height))
+                : 1;
+            int expectedPixelDataSize = GetPackedMipByteCount(
+                checked((uint)width),
+                checked((uint)height),
+                expectedMipCount);
+            return mipCount == expectedMipCount &&
+                   pixelDataSize == expectedPixelDataSize &&
+                   stream.Length == HeaderSize + (long)pixelDataSize;
+        }
+        catch (Exception exception) when (
+            exception is IOException or
+            UnauthorizedAccessException or
+            OverflowException)
+        {
+            return false;
+        }
+    }
+
+    private static void DownsampleMip(
+        ReadOnlySpan<byte> source,
+        uint sourceWidth,
+        uint sourceHeight,
+        Span<byte> destination,
+        uint destinationWidth,
+        uint destinationHeight,
+        Texture2DColorSpace colorSpace)
+    {
+        for (uint destinationY = 0; destinationY < destinationHeight; destinationY++)
+        {
+            uint sourceYBegin = destinationY * sourceHeight / destinationHeight;
+            uint sourceYEnd = (destinationY + 1u) * sourceHeight / destinationHeight;
+            for (uint destinationX = 0; destinationX < destinationWidth; destinationX++)
+            {
+                uint sourceXBegin = destinationX * sourceWidth / destinationWidth;
+                uint sourceXEnd = (destinationX + 1u) * sourceWidth / destinationWidth;
+                int sampleCount = checked((int)((sourceXEnd - sourceXBegin) * (sourceYEnd - sourceYBegin)));
+                int destinationIndex = checked((int)((destinationY * destinationWidth + destinationX) * 4u));
+
+                if (colorSpace == Texture2DColorSpace.SRgb)
+                {
+                    float red = 0.0f;
+                    float green = 0.0f;
+                    float blue = 0.0f;
+                    int alpha = 0;
+                    for (uint sourceY = sourceYBegin; sourceY < sourceYEnd; sourceY++)
+                    {
+                        for (uint sourceX = sourceXBegin; sourceX < sourceXEnd; sourceX++)
+                        {
+                            int sourceIndex = checked((int)((sourceY * sourceWidth + sourceX) * 4u));
+                            red += s_SrgbToLinear[source[sourceIndex]];
+                            green += s_SrgbToLinear[source[sourceIndex + 1]];
+                            blue += s_SrgbToLinear[source[sourceIndex + 2]];
+                            alpha += source[sourceIndex + 3];
+                        }
+                    }
+
+                    float inverseSampleCount = 1.0f / sampleCount;
+                    destination[destinationIndex] = EncodeSrgb(red * inverseSampleCount);
+                    destination[destinationIndex + 1] = EncodeSrgb(green * inverseSampleCount);
+                    destination[destinationIndex + 2] = EncodeSrgb(blue * inverseSampleCount);
+                    destination[destinationIndex + 3] = checked((byte)((alpha + sampleCount / 2) / sampleCount));
+                    continue;
+                }
+
+                for (int channel = 0; channel < 4; channel++)
+                {
+                    int sum = 0;
+                    for (uint sourceY = sourceYBegin; sourceY < sourceYEnd; sourceY++)
+                    {
+                        for (uint sourceX = sourceXBegin; sourceX < sourceXEnd; sourceX++)
+                        {
+                            int sourceIndex = checked((int)((sourceY * sourceWidth + sourceX) * 4u));
+                            sum += source[sourceIndex + channel];
+                        }
+                    }
+
+                    destination[destinationIndex + channel] =
+                        checked((byte)((sum + sampleCount / 2) / sampleCount));
+                }
+            }
+        }
+    }
+
+    private static int GetMipCount(uint width, uint height)
+    {
+        int mipCount = 1;
+        while (width > 1 || height > 1)
+        {
+            width = Math.Max(1u, width >> 1);
+            height = Math.Max(1u, height >> 1);
+            mipCount++;
+        }
+
+        return mipCount;
+    }
+
+    private static int GetPackedMipByteCount(uint width, uint height, int mipCount)
+    {
+        ulong byteCount = 0;
+        for (int mipLevel = 0; mipLevel < mipCount; mipLevel++)
+        {
+            byteCount = checked(byteCount + (ulong)width * height * 4u);
+            width = Math.Max(1u, width >> 1);
+            height = Math.Max(1u, height >> 1);
+        }
+
+        return checked((int)byteCount);
+    }
+
+    private static float[] CreateSrgbToLinearTable()
+    {
+        var table = new float[256];
+        for (int value = 0; value < table.Length; value++)
+        {
+            float encoded = value / 255.0f;
+            table[value] = encoded <= 0.04045f
+                ? encoded / 12.92f
+                : MathF.Pow((encoded + 0.055f) / 1.055f, 2.4f);
+        }
+
+        return table;
+    }
+
+    private static byte[] CreateLinearToSrgbTable()
+    {
+        var table = new byte[LinearToSrgbTableResolution + 1];
+        for (int value = 0; value < table.Length; value++)
+        {
+            float linear = value / (float)LinearToSrgbTableResolution;
+            float encoded = linear <= 0.0031308f
+                ? linear * 12.92f
+                : 1.055f * MathF.Pow(linear, 1.0f / 2.4f) - 0.055f;
+            table[value] = checked((byte)Math.Clamp(
+                (int)MathF.Round(encoded * 255.0f),
+                0,
+                255));
+        }
+
+        return table;
+    }
+
+    private static byte EncodeSrgb(float linear)
+    {
+        int index = Math.Clamp(
+            (int)MathF.Round(linear * LinearToSrgbTableResolution),
+            0,
+            LinearToSrgbTableResolution);
+        return s_LinearToSrgb[index];
     }
 
     private static CookedTexture2DHeader ReadHeader(ReadOnlySpan<byte> bytes)
@@ -332,6 +560,8 @@ public static class Texture2DAssetCooker
         Texture2DCookedFormat Format,
         Texture2DColorSpace ColorSpace,
         int PixelDataSize);
+
+    private readonly record struct CookedMipChain(int MipCount, byte[] Pixels);
 
     private ref struct PpmTokenizer
     {

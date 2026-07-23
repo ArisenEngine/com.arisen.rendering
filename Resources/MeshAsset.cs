@@ -142,6 +142,52 @@ public static class MeshAssetCooker
         return LoadCooked(assetDatabase, mesh, variant);
     }
 
+    public static bool TryReadCookedBounds(
+        IAssetDatabase assetDatabase,
+        Guid meshGuid,
+        out MeshBounds bounds)
+    {
+        ArgumentNullException.ThrowIfNull(assetDatabase);
+
+        bounds = default;
+        if (meshGuid == Guid.Empty ||
+            !assetDatabase.TryLoadCookedAsset(
+                meshGuid,
+                MeshVariantKey.Default.GetCookedVariant(),
+                MeshAssetType,
+                out CookedAssetHandle handle))
+        {
+            return false;
+        }
+
+        try
+        {
+            if (!assetDatabase.TryGetCookedAssetBytes(handle, out ReadOnlyMemory<byte> bytes))
+            {
+                return false;
+            }
+
+            try
+            {
+                bounds = ReadHeader(bytes.Span).Bounds;
+                return IsValidBounds(bounds);
+            }
+            catch (Exception exception) when (
+                exception is InvalidOperationException or
+                NotSupportedException or
+                OverflowException or
+                ArgumentOutOfRangeException)
+            {
+                bounds = default;
+                return false;
+            }
+        }
+        finally
+        {
+            assetDatabase.Release(handle);
+        }
+    }
+
     private static CookedMesh LoadCooked(
         IAssetDatabase assetDatabase,
         MeshAsset mesh,
@@ -386,6 +432,19 @@ public static class MeshAssetCooker
         {
             return false;
         }
+    }
+
+    private static bool IsValidBounds(MeshBounds bounds)
+    {
+        return float.IsFinite(bounds.Min.X) &&
+               float.IsFinite(bounds.Min.Y) &&
+               float.IsFinite(bounds.Min.Z) &&
+               float.IsFinite(bounds.Max.X) &&
+               float.IsFinite(bounds.Max.Y) &&
+               float.IsFinite(bounds.Max.Z) &&
+               bounds.Min.X <= bounds.Max.X &&
+               bounds.Min.Y <= bounds.Max.Y &&
+               bounds.Min.Z <= bounds.Max.Z;
     }
 
     private static void ValidateSubmeshPayload(ReadOnlySpan<byte> submeshBytes, uint indexCount)

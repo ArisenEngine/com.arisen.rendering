@@ -55,6 +55,7 @@ public class RenderSubsystem : ITickableSubsystem
     private IRenderPipelineProvider? m_RenderPipelineProvider;
     private IWindowProvider? m_WindowProvider;
     private IWorldOriginService? m_WorldOriginService;
+    private SceneViewCameraOverride? m_SceneViewCameraOverride;
     private IntPtr m_RuntimeWindowHost;
 
     // Rendering should typically happen last in the frame
@@ -224,6 +225,20 @@ public class RenderSubsystem : ITickableSubsystem
 
             Span<Camera> frameCameras = Span<Camera>.Empty;
             var cameraCount = 0;
+            float cameraAspectRatio = surface.Height == 0
+                ? 1.0f
+                : (float)surface.Width / surface.Height;
+            if (SurfaceCameraOverrideResolver.TryResolve(
+                    surfaceInfo.SurfaceType,
+                    System.Threading.Volatile.Read(ref m_SceneViewCameraOverride),
+                    renderOrigin,
+                    cameraAspectRatio,
+                    out Camera sceneViewCamera))
+            {
+                frameCameras = arena.Alloc<Camera>(1);
+                frameCameras[0] = sceneViewCamera;
+                cameraCount = 1;
+            }
             Span<DirectionalLight> frameDirectionalLights = Span<DirectionalLight>.Empty;
             var directionalLightCount = 0;
             DirectionalLightExtractionStats directionalLightStats = default;
@@ -250,10 +265,9 @@ public class RenderSubsystem : ITickableSubsystem
                 var cameraEntities = cameraPool.GetRawEntityArray();
                 int camCount = cameraPool.Count;
 
-                if (camCount > 0)
+                if (cameraCount == 0 && camCount > 0)
                 {
                     frameCameras = arena.Alloc<Camera>(camCount);
-                    var aspectRatio = surface.Height == 0 ? 1.0f : (float)surface.Width / surface.Height;
 
                     for (int i = 0; i < camCount; i++)
                     {
@@ -271,7 +285,7 @@ public class RenderSubsystem : ITickableSubsystem
                             cam.FieldOfView = camComp.VerticalFov;
                             cam.NearClip = camComp.NearPlane;
                             cam.FarClip = camComp.FarPlane;
-                            cam.AspectRatio = aspectRatio;
+                            cam.AspectRatio = cameraAspectRatio;
                             cam.ProjectionType = camComp.IsPerspective != 0 ? CameraProjectionType.Perspective : CameraProjectionType.Orthographic;
                             cam.Position = transComp.Position;
                             cam.Rotation = transComp.Rotation.QuaternionToEulerDegrees();
@@ -359,6 +373,7 @@ public class RenderSubsystem : ITickableSubsystem
                         device,
                         swapChain,
                         submission.TargetImage,
+                        submission.TargetImageRequiresInitialization,
                         surface.SurfaceId,
                         outputKind,
                         frameIndex,
@@ -511,6 +526,22 @@ public class RenderSubsystem : ITickableSubsystem
     public void RegisterSurface(IntPtr host, string name, SurfaceType surfaceType, int width = 0, int height = 0)
     {
         m_CommandQueue.Enqueue(new RegisterSurfaceCommand(host, name, surfaceType, width, height));
+    }
+
+    public void SetSceneViewCameraOverride(SceneViewCameraOverride camera)
+    {
+        ArgumentNullException.ThrowIfNull(camera);
+        if (!camera.IsValid)
+        {
+            throw new ArgumentException("SceneView camera override must contain finite camera data.", nameof(camera));
+        }
+
+        System.Threading.Volatile.Write(ref m_SceneViewCameraOverride, camera);
+    }
+
+    public void ClearSceneViewCameraOverride()
+    {
+        System.Threading.Volatile.Write(ref m_SceneViewCameraOverride, null);
     }
 
     private void NotifyOutputFrameReady(IntPtr host)
@@ -734,6 +765,7 @@ public class RenderSubsystem : ITickableSubsystem
         m_CurrentPipeline?.Dispose();
         m_CurrentPipeline = null;
         m_CurrentAsset = null;
+        ClearSceneViewCameraOverride();
         m_RenderPipelineProvider?.ReleaseDeviceResources();
         m_RenderPipelineProvider?.Deactivate();
         m_RenderPipelineProvider = null;

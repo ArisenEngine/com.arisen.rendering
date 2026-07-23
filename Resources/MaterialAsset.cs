@@ -70,7 +70,7 @@ public readonly record struct MaterialTextureSamplerSettings(
     public static MaterialTextureSamplerSettings Default { get; } = new(
         MaterialTextureFilter.Linear,
         MaterialTextureFilter.Linear,
-        MaterialTextureMipmapMode.Nearest,
+        MaterialTextureMipmapMode.Linear,
         MaterialTextureWrapMode.Repeat,
         MaterialTextureWrapMode.Repeat);
 }
