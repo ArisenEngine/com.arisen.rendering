@@ -936,6 +936,7 @@ public static class GltfModelImportEmitter
             textureAsset.SourceFormat,
             ResolveGeneratedTextureColorSpace(slotName),
             textureRef.Sampler,
+            textureRef.GenerateMipMaps,
             textureRef.Transform);
     }
 
@@ -1011,7 +1012,10 @@ public static class GltfModelImportEmitter
                 builder.AppendLine("    Variant:");
                 builder.AppendLine("      Format: R8G8B8A8UNorm");
                 builder.AppendLine(CultureInfo.InvariantCulture, $"      ColorSpace: {texture.ColorSpace}");
-                builder.AppendLine("      GenerateMipMaps: false");
+                builder.AppendLine(
+                    texture.GenerateMipMaps
+                        ? "      GenerateMipMaps: true"
+                        : "      GenerateMipMaps: false");
                 builder.AppendLine(CultureInfo.InvariantCulture, $"    SourceFormat: {texture.SourceFormat}");
                 builder.AppendLine("  Sampler:");
                 builder.AppendLine(CultureInfo.InvariantCulture, $"    MinFilter: {texture.Sampler.MinFilter}");
@@ -1486,6 +1490,7 @@ public static class GltfModelImportEmitter
         Texture2DSourceFormat SourceFormat,
         Texture2DColorSpace ColorSpace,
         MaterialTextureSamplerSettings Sampler,
+        bool GenerateMipMaps,
         MaterialTextureTransform Transform);
 
     private readonly record struct EmittedTextureAsset(

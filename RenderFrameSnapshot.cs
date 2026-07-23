@@ -14,6 +14,7 @@ public readonly unsafe struct RenderFrameSnapshot
         RHIDevice device,
         RHISwapChain swapChain,
         RHIImageHandle targetImage,
+        bool targetImageRequiresInitialization,
         uint surfaceId,
         RenderOutputKind outputKind,
         uint frameIndex,
@@ -39,6 +40,7 @@ public readonly unsafe struct RenderFrameSnapshot
         Device = device;
         SwapChain = swapChain;
         TargetImage = targetImage;
+        TargetImageRequiresInitialization = targetImageRequiresInitialization;
         SurfaceId = surfaceId;
         OutputKind = outputKind;
         FrameIndex = frameIndex;
@@ -65,6 +67,7 @@ public readonly unsafe struct RenderFrameSnapshot
     public RHIDevice Device { get; }
     public RHISwapChain SwapChain { get; }
     public RHIImageHandle TargetImage { get; }
+    public bool TargetImageRequiresInitialization { get; }
     public uint SurfaceId { get; }
     public RenderOutputKind OutputKind { get; }
     public uint FrameIndex { get; }

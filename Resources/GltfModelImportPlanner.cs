@@ -50,6 +50,7 @@ public sealed record GltfImportedTextureRef(
     int BufferView,
     string? MimeType,
     MaterialTextureSamplerSettings Sampler,
+    bool GenerateMipMaps,
     MaterialTextureTransform Transform);
 
 public sealed record GltfImportedImageSource(
@@ -378,11 +379,17 @@ public static class GltfModelImportPlanner
                 -1,
                 null,
                 MaterialTextureSamplerSettings.Default,
+                true,
                 transform);
         }
 
         var texture = textures[textureIndex];
-        var sampler = ReadTextureSamplerSettings(root, texture, context, warnings);
+        var sampler = ReadTextureSamplerSettings(
+            root,
+            texture,
+            context,
+            warnings,
+            out bool generateMipMaps);
         var imageIndex = texture.TryGetProperty("source", out var sourceElement)
             ? sourceElement.GetInt32()
             : -1;
@@ -415,6 +422,7 @@ public static class GltfModelImportPlanner
             bufferView,
             mimeType,
             sampler,
+            generateMipMaps,
             transform);
     }
 
@@ -422,9 +430,11 @@ public static class GltfModelImportPlanner
         JsonElement root,
         JsonElement texture,
         string context,
-        List<string> warnings)
+        List<string> warnings,
+        out bool generateMipMaps)
     {
         var defaults = MaterialTextureSamplerSettings.Default;
+        generateMipMaps = true;
         if (!texture.TryGetProperty("sampler", out var samplerIndexElement))
         {
             return defaults;
@@ -450,11 +460,16 @@ public static class GltfModelImportPlanner
         if (sampler.TryGetProperty("minFilter", out var minFilterElement))
         {
             var value = minFilterElement.GetInt32();
-            if (!TryMapMinFilter(value, out minFilter, out mipmapMode))
+            if (!TryMapMinFilter(
+                    value,
+                    out minFilter,
+                    out mipmapMode,
+                    out generateMipMaps))
             {
                 warnings.Add($"{context} sampler minFilter '{value}' is unsupported; the default minification filter is used.");
                 minFilter = defaults.MinFilter;
                 mipmapMode = defaults.MipmapMode;
+                generateMipMaps = true;
             }
         }
 
@@ -562,31 +577,45 @@ public static class GltfModelImportPlanner
     private static bool TryMapMinFilter(
         int value,
         out MaterialTextureFilter filter,
-        out MaterialTextureMipmapMode mipmapMode)
+        out MaterialTextureMipmapMode mipmapMode,
+        out bool generateMipMaps)
     {
         switch (value)
         {
             case 9728:
+                filter = MaterialTextureFilter.Nearest;
+                mipmapMode = MaterialTextureMipmapMode.Nearest;
+                generateMipMaps = false;
+                return true;
+            case 9729:
+                filter = MaterialTextureFilter.Linear;
+                mipmapMode = MaterialTextureMipmapMode.Nearest;
+                generateMipMaps = false;
+                return true;
             case 9984:
                 filter = MaterialTextureFilter.Nearest;
                 mipmapMode = MaterialTextureMipmapMode.Nearest;
+                generateMipMaps = true;
                 return true;
-            case 9729:
             case 9985:
                 filter = MaterialTextureFilter.Linear;
                 mipmapMode = MaterialTextureMipmapMode.Nearest;
+                generateMipMaps = true;
                 return true;
             case 9986:
                 filter = MaterialTextureFilter.Nearest;
                 mipmapMode = MaterialTextureMipmapMode.Linear;
+                generateMipMaps = true;
                 return true;
             case 9987:
                 filter = MaterialTextureFilter.Linear;
                 mipmapMode = MaterialTextureMipmapMode.Linear;
+                generateMipMaps = true;
                 return true;
             default:
                 filter = default;
                 mipmapMode = default;
+                generateMipMaps = default;
                 return false;
         }
     }
