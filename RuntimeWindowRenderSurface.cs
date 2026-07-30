@@ -50,6 +50,10 @@ internal sealed class RuntimeWindowRenderSurface : IRenderSurface
 
     public IntPtr CreateConsumedSemaphoreHandle(uint frameIndex) => IntPtr.Zero;
 
+    public void CompleteConsumedSemaphoreHandle(IntPtr handle)
+    {
+    }
+
     public void ReleaseConsumedSemaphoreHandle(IntPtr handle)
     {
     }

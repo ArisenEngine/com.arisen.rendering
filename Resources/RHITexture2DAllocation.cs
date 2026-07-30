@@ -51,6 +51,12 @@ internal sealed class RHITexture2DAllocation : IDisposable
                 "[RHITexture2DAllocation] Texture upload data, dimensions, mip count, and format must be valid.",
                 nameof(pixelBytes));
         }
+        if (!samplerSettings.IsValid)
+        {
+            throw new ArgumentException(
+                "[RHITexture2DAllocation] Texture sampler settings are invalid.",
+                nameof(samplerSettings));
+        }
 
         m_Device = device;
         m_Factory = device.GetFactory();
@@ -143,6 +149,15 @@ internal sealed class RHITexture2DAllocation : IDisposable
                     $"[RHITexture2DAllocation] Failed to create image view for '{name}'.");
             }
 
+            RHICapabilities capabilities = m_Device.GetCapabilities();
+            float supportedAnisotropy =
+                float.IsFinite(capabilities.MaxSamplerAnisotropy) &&
+                capabilities.MaxSamplerAnisotropy >= 1.0f
+                    ? capabilities.MaxSamplerAnisotropy
+                    : 1.0f;
+            float maxAnisotropy = Math.Min(
+                samplerSettings.MaxAnisotropy,
+                supportedAnisotropy);
             m_Sampler = m_Factory.CreateSampler(
                 ResolveRhiFilter(samplerSettings.MagFilter),
                 ResolveRhiFilter(samplerSettings.MinFilter),
@@ -151,7 +166,8 @@ internal sealed class RHITexture2DAllocation : IDisposable
                 ResolveRhiAddressMode(samplerSettings.WrapV),
                 ResolveRhiAddressMode(samplerSettings.WrapV),
                 0.0f,
-                MipCount - 1.0f);
+                MipCount - 1.0f,
+                maxAnisotropy);
             if (!m_Sampler.IsValid)
             {
                 throw new InvalidOperationException(

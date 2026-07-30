@@ -15,8 +15,10 @@ public struct RenderContext
     internal RenderFrameSubmission Submission { get; }
 
     public RHIDevice Device => Snapshot.Device;
+    public ulong DeviceGeneration => Snapshot.DeviceGeneration;
     public RHISwapChain SwapChain => Snapshot.SwapChain;
     public uint FrameIndex => Snapshot.FrameIndex;
+    public uint FrameResourceIndex => Snapshot.FrameResourceIndex;
     public float DeltaTime => Snapshot.DeltaTime;
     public uint Width => Snapshot.Width;
     public uint Height => Snapshot.Height;

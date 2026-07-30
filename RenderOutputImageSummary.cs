@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Arisen.Native.RHI;
@@ -20,6 +21,7 @@ internal sealed class RenderOutputImageSummaryArtifact
     public required string ColorSpace { get; init; }
     public int BytesPerPixel { get; init; }
     public long ByteCount { get; init; }
+    public required string PixelSha256 { get; init; }
     public long PixelCount { get; init; }
     public long FinitePixelCount { get; init; }
     public long NonBlankPixelCount { get; init; }
@@ -56,6 +58,7 @@ internal sealed class RenderDepthImageSummaryArtifact
     public required string Format { get; init; }
     public int BytesPerPixel { get; init; }
     public long ByteCount { get; init; }
+    public required string PixelSha256 { get; init; }
     public long PixelCount { get; init; }
     public long FiniteDepthPixelCount { get; init; }
     public long NormalizedDepthPixelCount { get; init; }
@@ -218,6 +221,7 @@ internal static class RenderDepthImageSummaryBuilder
             Format = format.ToString(),
             BytesPerPixel = BytesPerPixel,
             ByteCount = requiredByteCount,
+            PixelSha256 = Convert.ToHexString(SHA256.HashData(pixels)),
             PixelCount = pixelCount,
             FiniteDepthPixelCount = finiteDepthPixelCount,
             NormalizedDepthPixelCount = normalizedDepthPixelCount,
@@ -392,6 +396,7 @@ internal static class RenderOutputImageSummaryBuilder
             ColorSpace = formatInfo.IsSrgb ? "linearized-sRGB" : "linear",
             BytesPerPixel = BytesPerPixel,
             ByteCount = requiredByteCount,
+            PixelSha256 = Convert.ToHexString(SHA256.HashData(pixels)),
             PixelCount = pixelCount,
             FinitePixelCount = finitePixelCount,
             NonBlankPixelCount = nonBlankPixelCount,

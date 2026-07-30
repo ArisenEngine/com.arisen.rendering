@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using ArisenEngine.Core.Diagnostics;
 using ArisenKernel.Lifecycle;
 using ArisenEngine.Core.RHI;
@@ -49,10 +50,12 @@ public class RenderSubsystem : ITickableSubsystem
     
     private readonly RHICommandQueue m_CommandQueue = new();
     private readonly Dictionary<uint, RenderFrameSubmission> m_Submissions = new();
+    private readonly RenderFrameResourceSlotState m_FrameResourceSlots = new();
 
     private RenderPipeline? m_CurrentPipeline;
     private RenderPipelineAsset? m_CurrentAsset;
     private IRenderPipelineProvider? m_RenderPipelineProvider;
+    private IRHIDevice? m_RHIDevice;
     private IWindowProvider? m_WindowProvider;
     private IWorldOriginService? m_WorldOriginService;
     private SceneViewCameraOverride? m_SceneViewCameraOverride;
@@ -153,9 +156,21 @@ public class RenderSubsystem : ITickableSubsystem
             {
             var surface = surfaceInfo.Surface;
             var device = RHISystem.GetOrCreateDevice(surface.SurfaceId, surface.Width, surface.Height);
+            var deviceService = GetRHIDeviceService();
+            IntPtr serviceHandle = deviceService.NativeHandle;
+            ulong deviceGeneration = deviceService.Generation;
+            if (!deviceService.IsValid ||
+                deviceGeneration == 0 ||
+                serviceHandle != device.Handle)
+            {
+                throw new InvalidOperationException(
+                    $"RenderSubsystem RHI identity mismatch. ServiceGeneration={deviceGeneration}, " +
+                    $"ServiceHandle=0x{serviceHandle.ToInt64():X}, " +
+                    $"FrameHandle=0x{device.Handle.ToInt64():X}.");
+            }
             
             // Get the swapchain associated with this surface
-            var swapChain = device.GetSurface().GetSwapChain();
+            var swapChain = RHISystem.GetSurface(surface.SurfaceId).GetSwapChain();
             if (!swapChain.IsValid) continue;
 
             // 3. Render
@@ -202,6 +217,11 @@ public class RenderSubsystem : ITickableSubsystem
                 continue;
             }
 
+            RenderFrameResourceReservation frameResource = AcquireFrameResourceSlot(
+                device,
+                deviceGeneration);
+            try
+            {
             var arena = FrameArena.Instance;
             Span<MeshDrawCommand> frameDrawList = Span<MeshDrawCommand>.Empty;
             Span<StaticMeshRenderItem> frameStaticMeshItems = Span<StaticMeshRenderItem>.Empty;
@@ -371,12 +391,14 @@ public class RenderSubsystem : ITickableSubsystem
                 {
                     var snapshot = new RenderFrameSnapshot(
                         device,
+                        deviceGeneration,
                         swapChain,
                         submission.TargetImage,
                         submission.TargetImageRequiresInitialization,
                         surface.SurfaceId,
                         outputKind,
                         frameIndex,
+                        frameResource.SlotIndex,
                         deltaTime,
                          surface.Width,
                          surface.Height,
@@ -516,6 +538,11 @@ public class RenderSubsystem : ITickableSubsystem
                     NotifyOutputFrameReady(surfaceInfo.Parent);
                 }
             }
+            finally
+            {
+                m_FrameResourceSlots.Complete(frameResource, submission.LastTicket);
+            }
+            }
         }
         finally
         {
@@ -526,6 +553,25 @@ public class RenderSubsystem : ITickableSubsystem
     public void RegisterSurface(IntPtr host, string name, SurfaceType surfaceType, int width = 0, int height = 0)
     {
         m_CommandQueue.Enqueue(new RegisterSurfaceCommand(host, name, surfaceType, width, height));
+    }
+
+    public Task<bool> RegisterSurfaceAsync(
+        IntPtr host,
+        string name,
+        SurfaceType surfaceType,
+        int width = 0,
+        int height = 0)
+    {
+        var completion = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        m_CommandQueue.Enqueue(new RegisterSurfaceCommand(
+            host,
+            name,
+            surfaceType,
+            width,
+            height,
+            completion));
+        return completion.Task;
     }
 
     public void SetSceneViewCameraOverride(SceneViewCameraOverride camera)
@@ -603,7 +649,19 @@ public class RenderSubsystem : ITickableSubsystem
         m_CommandQueue.Enqueue(new ResizeSurfaceCommand(host, (uint)width, (uint)height));
     }
 
-    internal void InternalResizeSurface(IntPtr host, int width, int height)
+    public Task<bool> ResizeSurfaceAsync(IntPtr host, int width, int height)
+    {
+        var completion = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        m_CommandQueue.Enqueue(new ResizeSurfaceCommand(
+            host,
+            (uint)Math.Max(1, width),
+            (uint)Math.Max(1, height),
+            completion));
+        return completion.Task;
+    }
+
+    internal bool InternalResizeSurface(IntPtr host, int width, int height)
     {
         if (s_GlobalSurfaces.TryGetValue(host, out var surface))
         {
@@ -612,7 +670,7 @@ public class RenderSubsystem : ITickableSubsystem
             surface.Surface.Resize((uint)resizedWidth, (uint)resizedHeight);
             Logger.Log(
                 $"[RenderSubsystem] Processed surface resize | Host: 0x{host.ToInt64():X} | Name: {surface.Name} | Size: {resizedWidth}x{resizedHeight}");
-            return;
+            return true;
         }
 
         KernelLog.WarningFormat(
@@ -620,6 +678,7 @@ public class RenderSubsystem : ITickableSubsystem
             host.ToInt64(),
             width,
             height);
+        return false;
     }
 
     public IntPtr GetSurfaceSharedHandle(IntPtr host, uint frameIndex)
@@ -675,6 +734,14 @@ public class RenderSubsystem : ITickableSubsystem
         }
     }
 
+    public void CompleteConsumedSemaphoreHandle(IntPtr host, IntPtr handle)
+    {
+        if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
+        {
+            surfaceInfo.Surface.CompleteConsumedSemaphoreHandle(handle);
+        }
+    }
+
     public bool ReportConsumedFrameIndex(IntPtr host, uint frameIndex)
     {
         if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
@@ -725,7 +792,15 @@ public class RenderSubsystem : ITickableSubsystem
         m_CommandQueue.Enqueue(new UnregisterSurfaceCommand(host));
     }
 
-    internal void InternalUnregisterSurface(IntPtr host)
+    public Task<bool> UnregisterSurfaceAsync(IntPtr host)
+    {
+        var completion = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        m_CommandQueue.Enqueue(new UnregisterSurfaceCommand(host, completion));
+        return completion.Task;
+    }
+
+    internal bool InternalUnregisterSurface(IntPtr host)
     {
         if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
         {
@@ -737,10 +812,77 @@ public class RenderSubsystem : ITickableSubsystem
             {
                 AllSurfacesDestroyed?.Invoke();
             }
-            return;
+            return true;
         }
 
-        throw new Exception($"Surface of host {host} not exists");
+        KernelLog.WarningFormat(
+            "[RenderSubsystem] Ignored unregister for unknown surface. Host=0x{0:X}",
+            host.ToInt64());
+        return false;
+    }
+
+    public Task<ulong> RestartGraphicsBackendAsync(
+        IRHIBackend backend,
+        RHIBackendRestartOptions options)
+    {
+        var completion = new TaskCompletionSource<ulong>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        m_CommandQueue.Enqueue(new RestartGraphicsBackendCommand(
+            backend,
+            options,
+            completion));
+        return completion.Task;
+    }
+
+    internal ulong InternalRestartGraphicsBackend(
+        IRHIBackend backend,
+        RHIBackendRestartOptions options)
+    {
+        using var _ = Profiler.Zone("RenderSubsystem.RestartGraphicsBackend");
+        if (s_GlobalSurfaces.Count != 0)
+        {
+            throw new InvalidOperationException(
+                $"Graphics backend restart requires every render surface to be removed; {s_GlobalSurfaces.Count} remain.");
+        }
+        if (!backend.IsInitialized)
+        {
+            throw new InvalidOperationException(
+                $"Graphics backend '{backend.Name}' is not initialized.");
+        }
+
+        ulong previousGeneration = backend.Generation;
+        m_CurrentPipeline?.Dispose();
+        m_CurrentPipeline = null;
+        m_CurrentAsset = null;
+        m_Submissions.Clear();
+        m_FrameResourceSlots.Reset();
+        m_RenderPipelineProvider?.ReleaseDeviceResources();
+
+        if (!backend.Restart(EngineKernel.Instance.Services, options))
+        {
+            throw new InvalidOperationException(
+                $"Graphics backend '{backend.Name}' failed to recreate for diagnostic mode {options.DiagnosticMode}.");
+        }
+        if (backend.Generation <= previousGeneration)
+        {
+            throw new InvalidOperationException(
+                $"Graphics backend '{backend.Name}' did not advance its generation after restart.");
+        }
+        IRHIDevice deviceService = GetRHIDeviceService();
+        if (!deviceService.IsValid ||
+            deviceService.Generation != backend.Generation)
+        {
+            throw new InvalidOperationException(
+                $"Graphics backend '{backend.Name}' generation {backend.Generation} was not published through IRHIDevice.");
+        }
+
+        KernelLog.InfoFormat(
+            "[RenderSubsystem] Graphics backend restart completed. Backend={0}, PreviousGeneration={1}, CurrentGeneration={2}, DiagnosticMode={3}",
+            backend.Name,
+            previousGeneration,
+            backend.Generation,
+            options.DiagnosticMode);
+        return backend.Generation;
     }
 
     public void Shutdown()
@@ -761,6 +903,7 @@ public class RenderSubsystem : ITickableSubsystem
         }
         s_GlobalSurfaces.Clear();
         m_Submissions.Clear();
+        m_FrameResourceSlots.Reset();
 
         m_CurrentPipeline?.Dispose();
         m_CurrentPipeline = null;
@@ -769,6 +912,25 @@ public class RenderSubsystem : ITickableSubsystem
         m_RenderPipelineProvider?.ReleaseDeviceResources();
         m_RenderPipelineProvider?.Deactivate();
         m_RenderPipelineProvider = null;
+        m_RHIDevice = null;
+    }
+
+    private IRHIDevice GetRHIDeviceService()
+    {
+        if (m_RHIDevice != null)
+        {
+            return m_RHIDevice;
+        }
+
+        if (!EngineKernel.Instance.Services.TryGetService<IRHIDevice>(out var device) ||
+            device == null)
+        {
+            throw new InvalidOperationException(
+                "RenderSubsystem requires IRHIDevice after graphics backend initialization.");
+        }
+
+        m_RHIDevice = device;
+        return device;
     }
 
     public void Dispose()
@@ -805,6 +967,50 @@ public class RenderSubsystem : ITickableSubsystem
         }
 
         return submission;
+    }
+
+    private RenderFrameResourceReservation AcquireFrameResourceSlot(
+        RHIDevice device,
+        ulong deviceGeneration)
+    {
+        uint slotCount = device.GetInstance().MaxFramesInFlight;
+        if (slotCount == 0)
+        {
+            throw new InvalidOperationException(
+                "The active RHI device reported zero frame-resource slots.");
+        }
+
+        RenderFrameResourceReservation reservation = m_FrameResourceSlots.Reserve(
+            device.Handle,
+            deviceGeneration,
+            slotCount);
+        try
+        {
+            if (reservation.PreviousTicket != 0)
+            {
+                ulong completedTicket = device.GetCompletedTicket();
+                if (completedTicket < reservation.PreviousTicket)
+                {
+                    device.WaitQueueTicket(reservation.PreviousTicket);
+                    completedTicket = device.GetCompletedTicket();
+                }
+
+                if (completedTicket < reservation.PreviousTicket)
+                {
+                    throw new InvalidOperationException(
+                        $"Frame-resource slot {reservation.SlotIndex} was reused before graphics ticket " +
+                        $"{reservation.PreviousTicket} completed. Completed={completedTicket}.");
+                }
+            }
+
+            Profiler.PlotValue("Render.FrameResourceSlot", reservation.SlotIndex);
+            return reservation;
+        }
+        catch
+        {
+            m_FrameResourceSlots.Cancel(reservation);
+            throw;
+        }
     }
 
     private static bool IsFiniteCamera(

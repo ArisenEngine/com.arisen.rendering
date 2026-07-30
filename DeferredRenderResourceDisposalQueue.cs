@@ -6,8 +6,21 @@ namespace ArisenEngine.Rendering;
 public sealed class DeferredRenderResourceDisposalQueue
 {
     private readonly List<PendingResource> m_PendingResources = new();
+    private readonly DeferredRenderResourceDisposalState m_State = new();
 
     public int PendingCount => m_PendingResources.Count;
+
+    public void BindDevice(RHIDevice device, ulong deviceGeneration)
+    {
+        if (!device.IsValid)
+        {
+            throw new ArgumentException(
+                "A deferred render-resource queue requires a valid RHI device.",
+                nameof(device));
+        }
+
+        m_State.Bind(device.Handle, deviceGeneration);
+    }
 
     public void Enqueue(IDisposable resource, ulong submittedTicket)
     {
@@ -22,11 +35,16 @@ public sealed class DeferredRenderResourceDisposalQueue
             return;
         }
 
-        m_PendingResources.Add(new PendingResource(resource, submittedTicket));
+        ulong deviceGeneration = m_State.GetBoundGeneration();
+        m_PendingResources.Add(new PendingResource(
+            resource,
+            submittedTicket,
+            deviceGeneration));
     }
 
-    public void ReleaseCompleted(RHIDevice device)
+    public void ReleaseCompleted(RHIDevice device, ulong deviceGeneration)
     {
+        BindDevice(device, deviceGeneration);
         if (m_PendingResources.Count == 0)
         {
             return;
@@ -35,16 +53,15 @@ public sealed class DeferredRenderResourceDisposalQueue
         using var _ = Profiler.Zone("RenderResourceDisposal.ReleaseCompleted");
         Profiler.PlotValue("RenderResourceDisposal.PendingCount", m_PendingResources.Count);
 
-        if (!device.IsValid)
-        {
-            return;
-        }
-
-        ReleaseCompleted(device.GetCompletedTicket());
+        ReleaseCompleted(device.GetCompletedTicket(), deviceGeneration);
     }
 
-    public void Drain(RHIDevice device)
+    public void Drain(
+        RHIDevice device,
+        ulong deviceGeneration,
+        ulong submittedThroughTicket)
     {
+        BindDevice(device, deviceGeneration);
         if (m_PendingResources.Count == 0)
         {
             return;
@@ -53,19 +70,43 @@ public sealed class DeferredRenderResourceDisposalQueue
         using var _ = Profiler.Zone("RenderResourceDisposal.Drain");
         Profiler.PlotValue("RenderResourceDisposal.PendingCount", m_PendingResources.Count);
 
-        if (device.IsValid)
+        ulong maximumPendingTicket = 0;
+        for (int i = 0; i < m_PendingResources.Count; i++)
         {
-            for (int i = 0; i < m_PendingResources.Count; i++)
-            {
-                device.WaitQueueTicket(m_PendingResources[i].SubmittedTicket);
-            }
+            PendingResource pending = m_PendingResources[i];
+            m_State.ValidatePendingGeneration(pending.DeviceGeneration);
+            maximumPendingTicket = Math.Max(maximumPendingTicket, pending.SubmittedTicket);
         }
+
+        m_State.ValidateDrainBoundary(maximumPendingTicket, submittedThroughTicket);
+        device.WaitQueueTicket(maximumPendingTicket);
 
         ReleaseAll();
     }
 
-    private void ReleaseCompleted(ulong completedTicket)
+    public void ReleaseDevice(
+        RHIDevice device,
+        ulong deviceGeneration,
+        ulong submittedThroughTicket)
     {
+        if (!m_State.IsBound)
+        {
+            if (m_PendingResources.Count != 0)
+            {
+                throw new InvalidOperationException(
+                    $"Cannot release an unbound deferred render-resource queue with {m_PendingResources.Count} pending resources.");
+            }
+
+            return;
+        }
+
+        Drain(device, deviceGeneration, submittedThroughTicket);
+        m_State.Unbind(device.Handle, deviceGeneration, m_PendingResources.Count);
+    }
+
+    private void ReleaseCompleted(ulong completedTicket, ulong deviceGeneration)
+    {
+        m_State.ValidatePendingGeneration(deviceGeneration);
         if (completedTicket == 0)
         {
             return;
@@ -74,12 +115,14 @@ public sealed class DeferredRenderResourceDisposalQueue
         var releasedCount = 0;
         for (int i = m_PendingResources.Count - 1; i >= 0; i--)
         {
-            if (m_PendingResources[i].SubmittedTicket > completedTicket)
+            PendingResource pending = m_PendingResources[i];
+            m_State.ValidatePendingGeneration(pending.DeviceGeneration);
+            if (pending.SubmittedTicket > completedTicket)
             {
                 continue;
             }
 
-            m_PendingResources[i].Resource.Dispose();
+            pending.Resource.Dispose();
             RemoveAtSwapBack(i);
             releasedCount++;
         }
@@ -97,7 +140,9 @@ public sealed class DeferredRenderResourceDisposalQueue
         var releasedCount = m_PendingResources.Count;
         for (int i = releasedCount - 1; i >= 0; i--)
         {
-            m_PendingResources[i].Resource.Dispose();
+            PendingResource pending = m_PendingResources[i];
+            m_State.ValidatePendingGeneration(pending.DeviceGeneration);
+            pending.Resource.Dispose();
         }
 
         m_PendingResources.Clear();
@@ -120,11 +165,16 @@ public sealed class DeferredRenderResourceDisposalQueue
     {
         public readonly IDisposable Resource;
         public readonly ulong SubmittedTicket;
+        public readonly ulong DeviceGeneration;
 
-        public PendingResource(IDisposable resource, ulong submittedTicket)
+        public PendingResource(
+            IDisposable resource,
+            ulong submittedTicket,
+            ulong deviceGeneration)
         {
             Resource = resource;
             SubmittedTicket = submittedTicket;
+            DeviceGeneration = deviceGeneration;
         }
     }
 }

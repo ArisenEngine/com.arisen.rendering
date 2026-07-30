@@ -115,7 +115,11 @@ internal sealed class RenderFrameSubmission
 
         var waitSwapChain = waitForFrameAcquire ? m_SwapChain : (RHISwapChain?)null;
         var signalSwapChain = signalFrameComplete ? m_SwapChain : (RHISwapChain?)null;
-        m_LastTicket = m_Device.Submit(commandBuffer, waitSwapChain, signalSwapChain);
+        m_LastTicket = m_Device.Submit(
+            commandBuffer,
+            waitSwapChain,
+            signalSwapChain,
+            m_FrameIndex);
         m_SubmitCount++;
         m_FrameCompleteSignaled |= signalFrameComplete;
 

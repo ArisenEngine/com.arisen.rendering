@@ -17,6 +17,132 @@ public enum EnvironmentTextureCookedFormat
     R16G16B16A16SFloat
 }
 
+public enum EnvironmentSkyMode
+{
+    Panorama,
+    ProceduralOutdoor
+}
+
+public enum EnvironmentExposurePolicy
+{
+    Scene,
+    Fixed
+}
+
+public readonly record struct OutdoorEnvironmentProfile(
+    EnvironmentSkyMode SkyMode,
+    float SunSkyCoupling,
+    float HorizonExponent,
+    float ZenithExponent,
+    float SunAngularRadiusDegrees,
+    float SunDiscIntensity,
+    float SunGlowIntensity,
+    float SunGlowExponent,
+    bool AerialPerspectiveEnabled,
+    float AerialStartDistance,
+    float AerialDistance,
+    float AerialStrength,
+    bool HeightFogEnabled,
+    float HeightFogBaseHeight,
+    float HeightFogDensity,
+    float HeightFogFalloff,
+    EnvironmentExposurePolicy ExposurePolicy,
+    float FixedExposure)
+{
+    public const float MaximumDistance = 10_000_000.0f;
+    public const float MaximumAbsoluteHeight = 10_000_000.0f;
+
+    public static OutdoorEnvironmentProfile Disabled { get; } = new(
+        EnvironmentSkyMode.Panorama,
+        SunSkyCoupling: 0.0f,
+        HorizonExponent: 1.0f,
+        ZenithExponent: 1.0f,
+        SunAngularRadiusDegrees: 0.53f,
+        SunDiscIntensity: 0.0f,
+        SunGlowIntensity: 0.0f,
+        SunGlowExponent: 64.0f,
+        AerialPerspectiveEnabled: false,
+        AerialStartDistance: 0.0f,
+        AerialDistance: 1.0f,
+        AerialStrength: 0.0f,
+        HeightFogEnabled: false,
+        HeightFogBaseHeight: 0.0f,
+        HeightFogDensity: 0.0f,
+        HeightFogFalloff: 0.0f,
+        EnvironmentExposurePolicy.Scene,
+        FixedExposure: 1.0f);
+
+    public bool IsAtmosphereEnabled =>
+        (AerialPerspectiveEnabled && AerialStrength > 0.0f) ||
+        (HeightFogEnabled && HeightFogDensity > 0.0f);
+
+    public float ResolveExposure(float sceneExposure) =>
+        ExposurePolicy == EnvironmentExposurePolicy.Fixed
+            ? FixedExposure
+            : sceneExposure;
+
+    public void Validate(string sourceDescription)
+    {
+        if (!Enum.IsDefined(SkyMode))
+        {
+            throw Invalid(sourceDescription, nameof(SkyMode), SkyMode);
+        }
+
+        if (!Enum.IsDefined(ExposurePolicy))
+        {
+            throw Invalid(sourceDescription, nameof(ExposurePolicy), ExposurePolicy);
+        }
+
+        ValidateRange(sourceDescription, nameof(SunSkyCoupling), SunSkyCoupling, 0.0f, 1.0f);
+        ValidateRange(sourceDescription, nameof(HorizonExponent), HorizonExponent, 0.05f, 16.0f);
+        ValidateRange(sourceDescription, nameof(ZenithExponent), ZenithExponent, 0.05f, 16.0f);
+        ValidateRange(sourceDescription, nameof(SunAngularRadiusDegrees), SunAngularRadiusDegrees, 0.01f, 10.0f);
+        ValidateRange(sourceDescription, nameof(SunDiscIntensity), SunDiscIntensity, 0.0f, 128.0f);
+        ValidateRange(sourceDescription, nameof(SunGlowIntensity), SunGlowIntensity, 0.0f, 128.0f);
+        ValidateRange(sourceDescription, nameof(SunGlowExponent), SunGlowExponent, 1.0f, 4096.0f);
+        ValidateRange(sourceDescription, nameof(AerialStartDistance), AerialStartDistance, 0.0f, MaximumDistance);
+        ValidateRange(sourceDescription, nameof(AerialDistance), AerialDistance, 0.01f, MaximumDistance);
+        ValidateRange(sourceDescription, nameof(AerialStrength), AerialStrength, 0.0f, 1.0f);
+        ValidateRange(
+            sourceDescription,
+            nameof(HeightFogBaseHeight),
+            HeightFogBaseHeight,
+            -MaximumAbsoluteHeight,
+            MaximumAbsoluteHeight);
+        ValidateRange(sourceDescription, nameof(HeightFogDensity), HeightFogDensity, 0.0f, 10.0f);
+        ValidateRange(sourceDescription, nameof(HeightFogFalloff), HeightFogFalloff, 0.0f, 10.0f);
+        ValidateRange(
+            sourceDescription,
+            nameof(FixedExposure),
+            FixedExposure,
+            0.0f,
+            64.0f);
+    }
+
+    private static void ValidateRange(
+        string sourceDescription,
+        string fieldName,
+        float value,
+        float minimum,
+        float maximum)
+    {
+        if (!float.IsFinite(value) || value < minimum || value > maximum)
+        {
+            throw new InvalidOperationException(
+                $"[EnvironmentTextureAssetLoader] Outdoor profile '{sourceDescription}' {fieldName} " +
+                $"must be finite and within [{minimum}, {maximum}], got '{value}'.");
+        }
+    }
+
+    private static InvalidOperationException Invalid(
+        string sourceDescription,
+        string fieldName,
+        object value) =>
+        new(
+            $"[EnvironmentTextureAssetLoader] Outdoor profile '{sourceDescription}' has unsupported " +
+            $"{fieldName} '{value}'.");
+}
+
 public readonly record struct EnvironmentTextureVariantKey(
     EnvironmentTextureLayout Layout,
     EnvironmentTextureCookedFormat Format,
@@ -41,7 +167,8 @@ public sealed record EnvironmentTextureAsset(
     EnvironmentTextureVariantKey Variant,
     Texture2DColorSpace SourceColorSpace,
     float RotationDegrees,
-    float Intensity);
+    float Intensity,
+    OutdoorEnvironmentProfile OutdoorProfile);
 
 public readonly record struct CookedEnvironmentTexture(
     EnvironmentTextureAsset Asset,
@@ -53,6 +180,7 @@ public readonly record struct CookedEnvironmentTexture(
     EnvironmentTextureCookedFormat Format,
     float RotationDegrees,
     float Intensity,
+    OutdoorEnvironmentProfile OutdoorProfile,
     int PixelDataOffset,
     int PixelDataSize,
     CookedAssetHandle Handle)
@@ -162,7 +290,8 @@ public static class EnvironmentTextureAssetLoader
                 GenerateMipMaps: false),
             ParseEnum<Texture2DColorSpace>(source.SourceColorSpace, nameof(source.SourceColorSpace), sourceAsset.SourcePath),
             source.RotationDegrees,
-            source.Intensity);
+            source.Intensity,
+            source.GetOutdoorProfile(sourceAsset.SourcePath));
     }
 
     private static TEnum ParseEnum<TEnum>(string value, string fieldName, string sourcePath)
@@ -188,13 +317,20 @@ public static class EnvironmentTextureAssetLoader
         public string RuntimeFormat { get; set; } = nameof(EnvironmentTextureCookedFormat.R16G16B16A16SFloat);
         public float RotationDegrees { get; set; }
         public float Intensity { get; set; } = 1.0f;
+        public SerializedOutdoorEnvironmentProfile? Outdoor { get; set; }
 
         public void Validate(string sourcePath)
         {
-            if (Version != 1)
+            if (Version is not (1 or 2))
             {
                 throw new InvalidOperationException(
                     $"[EnvironmentTextureAssetLoader] Environment texture '{sourcePath}' version '{Version}' is not supported.");
+            }
+
+            if (Version == 1 && Outdoor != null)
+            {
+                throw new InvalidOperationException(
+                    $"[EnvironmentTextureAssetLoader] Environment texture '{sourcePath}' must use version 2 before declaring Outdoor settings.");
             }
 
             if (SourceTexture == null || SourceTexture.Guid == Guid.Empty)
@@ -214,6 +350,66 @@ public static class EnvironmentTextureAssetLoader
                 throw new InvalidOperationException(
                     $"[EnvironmentTextureAssetLoader] Environment texture '{sourcePath}' Intensity must be finite and greater than zero.");
             }
+
+
+            GetOutdoorProfile(sourcePath).Validate(sourcePath);
+        }
+
+        public OutdoorEnvironmentProfile GetOutdoorProfile(string sourcePath)
+        {
+            if (Version == 1 || Outdoor == null)
+            {
+                return OutdoorEnvironmentProfile.Disabled;
+            }
+
+            return Outdoor.ToProfile(sourcePath);
+        }
+    }
+
+    private sealed class SerializedOutdoorEnvironmentProfile
+    {
+        public string SkyMode { get; set; } = nameof(EnvironmentSkyMode.Panorama);
+        public float SunSkyCoupling { get; set; }
+        public float HorizonExponent { get; set; } = 1.0f;
+        public float ZenithExponent { get; set; } = 1.0f;
+        public float SunAngularRadiusDegrees { get; set; } = 0.53f;
+        public float SunDiscIntensity { get; set; }
+        public float SunGlowIntensity { get; set; }
+        public float SunGlowExponent { get; set; } = 64.0f;
+        public bool AerialPerspectiveEnabled { get; set; }
+        public float AerialStartDistance { get; set; }
+        public float AerialDistance { get; set; } = 1.0f;
+        public float AerialStrength { get; set; }
+        public bool HeightFogEnabled { get; set; }
+        public float HeightFogBaseHeight { get; set; }
+        public float HeightFogDensity { get; set; }
+        public float HeightFogFalloff { get; set; }
+        public string ExposurePolicy { get; set; } = nameof(EnvironmentExposurePolicy.Scene);
+        public float FixedExposure { get; set; } = 1.0f;
+
+        public OutdoorEnvironmentProfile ToProfile(string sourcePath)
+        {
+            var profile = new OutdoorEnvironmentProfile(
+                ParseEnum<EnvironmentSkyMode>(SkyMode, nameof(SkyMode), sourcePath),
+                SunSkyCoupling,
+                HorizonExponent,
+                ZenithExponent,
+                SunAngularRadiusDegrees,
+                SunDiscIntensity,
+                SunGlowIntensity,
+                SunGlowExponent,
+                AerialPerspectiveEnabled,
+                AerialStartDistance,
+                AerialDistance,
+                AerialStrength,
+                HeightFogEnabled,
+                HeightFogBaseHeight,
+                HeightFogDensity,
+                HeightFogFalloff,
+                ParseEnum<EnvironmentExposurePolicy>(ExposurePolicy, nameof(ExposurePolicy), sourcePath),
+                FixedExposure);
+            profile.Validate(sourcePath);
+            return profile;
         }
     }
 
@@ -226,10 +422,15 @@ public static class EnvironmentTextureAssetLoader
 
 public static class EnvironmentTextureAssetCooker
 {
-    public const int CookedFormatVersion = 1;
+    public const int CookedFormatVersion = 2;
 
-    private const int HeaderSize = 64;
+    private const int LegacyCookedFormatVersion = 1;
+    private const int LegacyHeaderSize = 64;
+    private const int HeaderSize = 144;
     private const int BytesPerPixel = 8;
+    private const int AerialPerspectiveFlag = 1 << 0;
+    private const int HeightFogFlag = 1 << 1;
+    private const int KnownOutdoorFlags = AerialPerspectiveFlag | HeightFogFlag;
     private static readonly byte[] s_Magic = Encoding.ASCII.GetBytes("ARIENVTX");
 
     public static CookedEnvironmentTexture LoadOrCook(
@@ -273,7 +474,8 @@ public static class EnvironmentTextureAssetCooker
 
         if (!assetDatabase.TryGetCookedArtifact(asset.Guid, variant, out _) ||
             !File.Exists(outputPath) ||
-            File.GetLastWriteTimeUtc(outputPath) < dependencyWriteTimeUtc)
+            File.GetLastWriteTimeUtc(outputPath) < dependencyWriteTimeUtc ||
+            !HasCurrentCookedVersion(outputPath))
         {
             CookTexture(assetDatabase, asset, variant, outputPath);
         }
@@ -359,6 +561,12 @@ public static class EnvironmentTextureAssetCooker
                     $"stale source texture '{header.SourceTextureGuid}', expected '{asset.SourceTexture.Guid}'.");
             }
 
+            if (asset != null && header.OutdoorProfile != asset.OutdoorProfile)
+            {
+                throw new InvalidOperationException(
+                    $"[EnvironmentTextureAssetCooker] Cooked environment texture '{asset.Guid}' contains a stale outdoor profile.");
+            }
+
             asset ??= new EnvironmentTextureAsset(
                 environmentTextureGuid,
                 $"RuntimeEnvironment/{environmentTextureGuid:N}",
@@ -371,7 +579,8 @@ public static class EnvironmentTextureAssetCooker
                     GenerateMipMaps: header.MipCount > 1),
                 Texture2DColorSpace.Linear,
                 header.RotationDegrees,
-                header.Intensity);
+                header.Intensity,
+                header.OutdoorProfile);
 
             return new CookedEnvironmentTexture(
                 asset,
@@ -383,7 +592,8 @@ public static class EnvironmentTextureAssetCooker
                 header.Format,
                 header.RotationDegrees,
                 header.Intensity,
-                HeaderSize,
+                header.OutdoorProfile,
+                header.PixelDataOffset,
                 header.PixelDataSize,
                 handle);
         }
@@ -397,7 +607,7 @@ public static class EnvironmentTextureAssetCooker
     public static ReadOnlySpan<byte> GetPixelData(ReadOnlyMemory<byte> bytes)
     {
         var header = ReadHeader(bytes.Span);
-        return bytes.Span.Slice(HeaderSize, header.PixelDataSize);
+        return bytes.Span.Slice(header.PixelDataOffset, header.PixelDataSize);
     }
 
     private static void CookTexture(
@@ -443,12 +653,13 @@ public static class EnvironmentTextureAssetCooker
         WriteInt32(stream, (int)asset.Variant.Layout);
         WriteInt32(stream, (int)asset.Variant.Format);
         WriteInt32(stream, pixelBytes.Length);
-        WriteInt32(stream, 0);
+        WriteInt32(stream, HeaderSize);
         WriteSingle(stream, asset.RotationDegrees);
         WriteSingle(stream, asset.Intensity);
         Span<byte> sourceGuidBytes = stackalloc byte[16];
         asset.SourceTexture.Guid.TryWriteBytes(sourceGuidBytes);
         stream.Write(sourceGuidBytes);
+        WriteOutdoorProfile(stream, asset.OutdoorProfile);
         stream.Write(pixelBytes);
 
         Logger.Log(
@@ -544,17 +755,28 @@ public static class EnvironmentTextureAssetCooker
 
     private static CookedEnvironmentTextureHeader ReadHeader(ReadOnlySpan<byte> bytes)
     {
-        if (bytes.Length < HeaderSize || !bytes.Slice(0, s_Magic.Length).SequenceEqual(s_Magic))
+        if (bytes.Length < LegacyHeaderSize ||
+            !bytes.Slice(0, s_Magic.Length).SequenceEqual(s_Magic))
         {
             throw new InvalidOperationException(
                 "[EnvironmentTextureAssetCooker] Cooked environment texture header magic is invalid.");
         }
 
         var version = ReadInt32(bytes, 8);
-        if (version != CookedFormatVersion)
+        if (version is not (LegacyCookedFormatVersion or CookedFormatVersion))
         {
             throw new InvalidOperationException(
                 $"[EnvironmentTextureAssetCooker] Cooked environment texture version '{version}' is not supported.");
+        }
+
+        int pixelDataOffset = version == LegacyCookedFormatVersion
+            ? LegacyHeaderSize
+            : ReadInt32(bytes, 36);
+        if (version == CookedFormatVersion &&
+            (bytes.Length < HeaderSize || pixelDataOffset != HeaderSize))
+        {
+            throw new InvalidOperationException(
+                "[EnvironmentTextureAssetCooker] Cooked environment texture v2 header size is invalid.");
         }
 
         var width = ReadInt32(bytes, 12);
@@ -566,6 +788,9 @@ public static class EnvironmentTextureAssetCooker
         var rotationDegrees = ReadSingle(bytes, 40);
         var intensity = ReadSingle(bytes, 44);
         var sourceTextureGuid = new Guid(bytes.Slice(48, 16));
+        var outdoorProfile = version == LegacyCookedFormatVersion
+            ? OutdoorEnvironmentProfile.Disabled
+            : ReadOutdoorProfile(bytes);
 
         if (width <= 0 || height <= 0 || width != height * 2 || mipCount != 1)
         {
@@ -581,7 +806,10 @@ public static class EnvironmentTextureAssetCooker
         }
 
         var expectedPixelDataSize = checked(width * height * BytesPerPixel);
-        if (pixelDataSize != expectedPixelDataSize || HeaderSize + pixelDataSize > bytes.Length)
+        if (pixelDataSize != expectedPixelDataSize ||
+            pixelDataOffset < LegacyHeaderSize ||
+            pixelDataOffset > bytes.Length ||
+            pixelDataSize > bytes.Length - pixelDataOffset)
         {
             throw new InvalidOperationException(
                 "[EnvironmentTextureAssetCooker] Cooked environment texture payload is truncated or has an invalid size.");
@@ -594,7 +822,9 @@ public static class EnvironmentTextureAssetCooker
                 "[EnvironmentTextureAssetCooker] Cooked environment texture metadata is invalid.");
         }
 
+        outdoorProfile.Validate("cooked environment texture");
         return new CookedEnvironmentTextureHeader(
+            version,
             checked((uint)width),
             checked((uint)height),
             mipCount,
@@ -603,7 +833,88 @@ public static class EnvironmentTextureAssetCooker
             rotationDegrees,
             intensity,
             sourceTextureGuid,
+            outdoorProfile,
+            pixelDataOffset,
             pixelDataSize);
+    }
+
+    private static OutdoorEnvironmentProfile ReadOutdoorProfile(ReadOnlySpan<byte> bytes)
+    {
+        int flags = ReadInt32(bytes, 72);
+        if ((flags & ~KnownOutdoorFlags) != 0)
+        {
+            throw new InvalidOperationException(
+                $"[EnvironmentTextureAssetCooker] Cooked environment texture contains unknown outdoor flags 0x{flags:X}.");
+        }
+
+        return new OutdoorEnvironmentProfile(
+            (EnvironmentSkyMode)ReadInt32(bytes, 64),
+            ReadSingle(bytes, 80),
+            ReadSingle(bytes, 84),
+            ReadSingle(bytes, 88),
+            ReadSingle(bytes, 92),
+            ReadSingle(bytes, 96),
+            ReadSingle(bytes, 100),
+            ReadSingle(bytes, 104),
+            (flags & AerialPerspectiveFlag) != 0,
+            ReadSingle(bytes, 108),
+            ReadSingle(bytes, 112),
+            ReadSingle(bytes, 116),
+            (flags & HeightFogFlag) != 0,
+            ReadSingle(bytes, 120),
+            ReadSingle(bytes, 124),
+            ReadSingle(bytes, 128),
+            (EnvironmentExposurePolicy)ReadInt32(bytes, 68),
+            ReadSingle(bytes, 132));
+    }
+
+    private static void WriteOutdoorProfile(
+        Stream stream,
+        in OutdoorEnvironmentProfile profile)
+    {
+        profile.Validate("environment source");
+        WriteInt32(stream, (int)profile.SkyMode);
+        WriteInt32(stream, (int)profile.ExposurePolicy);
+        int flags = (profile.AerialPerspectiveEnabled ? AerialPerspectiveFlag : 0) |
+                    (profile.HeightFogEnabled ? HeightFogFlag : 0);
+        WriteInt32(stream, flags);
+        WriteInt32(stream, 0);
+        WriteSingle(stream, profile.SunSkyCoupling);
+        WriteSingle(stream, profile.HorizonExponent);
+        WriteSingle(stream, profile.ZenithExponent);
+        WriteSingle(stream, profile.SunAngularRadiusDegrees);
+        WriteSingle(stream, profile.SunDiscIntensity);
+        WriteSingle(stream, profile.SunGlowIntensity);
+        WriteSingle(stream, profile.SunGlowExponent);
+        WriteSingle(stream, profile.AerialStartDistance);
+        WriteSingle(stream, profile.AerialDistance);
+        WriteSingle(stream, profile.AerialStrength);
+        WriteSingle(stream, profile.HeightFogBaseHeight);
+        WriteSingle(stream, profile.HeightFogDensity);
+        WriteSingle(stream, profile.HeightFogFalloff);
+        WriteSingle(stream, profile.FixedExposure);
+        WriteInt32(stream, 0);
+        WriteInt32(stream, 0);
+    }
+
+    private static bool HasCurrentCookedVersion(string path)
+    {
+        try
+        {
+            Span<byte> prefix = stackalloc byte[12];
+            using var stream = File.OpenRead(path);
+            return stream.Read(prefix) == prefix.Length &&
+                   prefix.Slice(0, s_Magic.Length).SequenceEqual(s_Magic) &&
+                   ReadInt32(prefix, 8) == CookedFormatVersion;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
     }
 
     private static void WriteInt32(Stream stream, int value)
@@ -636,6 +947,7 @@ public static class EnvironmentTextureAssetCooker
         float[] RgbaPixels);
 
     private readonly record struct CookedEnvironmentTextureHeader(
+        int Version,
         uint Width,
         uint Height,
         int MipCount,
@@ -644,5 +956,7 @@ public static class EnvironmentTextureAssetCooker
         float RotationDegrees,
         float Intensity,
         Guid SourceTextureGuid,
+        OutdoorEnvironmentProfile OutdoorProfile,
+        int PixelDataOffset,
         int PixelDataSize);
 }

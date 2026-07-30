@@ -65,14 +65,27 @@ public readonly record struct MaterialTextureSamplerSettings(
     MaterialTextureFilter MagFilter,
     MaterialTextureMipmapMode MipmapMode,
     MaterialTextureWrapMode WrapU,
-    MaterialTextureWrapMode WrapV)
+    MaterialTextureWrapMode WrapV,
+    float MaxAnisotropy = 1.0f)
 {
+    public const float MaximumRequestedAnisotropy = 16.0f;
+
     public static MaterialTextureSamplerSettings Default { get; } = new(
         MaterialTextureFilter.Linear,
         MaterialTextureFilter.Linear,
         MaterialTextureMipmapMode.Linear,
         MaterialTextureWrapMode.Repeat,
-        MaterialTextureWrapMode.Repeat);
+        MaterialTextureWrapMode.Repeat,
+        1.0f);
+
+    public bool IsValid =>
+        Enum.IsDefined(MinFilter) &&
+        Enum.IsDefined(MagFilter) &&
+        Enum.IsDefined(MipmapMode) &&
+        Enum.IsDefined(WrapU) &&
+        Enum.IsDefined(WrapV) &&
+        float.IsFinite(MaxAnisotropy) &&
+        MaxAnisotropy is >= 1.0f and <= MaximumRequestedAnisotropy;
 }
 
 public readonly record struct MaterialTextureTransform(
@@ -821,14 +834,12 @@ public static class MaterialAssetLoader
         public MaterialTextureMipmapMode MipmapMode { get; set; } = MaterialTextureMipmapMode.Nearest;
         public MaterialTextureWrapMode WrapU { get; set; } = MaterialTextureWrapMode.Repeat;
         public MaterialTextureWrapMode WrapV { get; set; } = MaterialTextureWrapMode.Repeat;
+        public float MaxAnisotropy { get; set; } = 1.0f;
 
         public void Validate(string sourcePath, string bindingName)
         {
-            if (!Enum.IsDefined(MinFilter) ||
-                !Enum.IsDefined(MagFilter) ||
-                !Enum.IsDefined(MipmapMode) ||
-                !Enum.IsDefined(WrapU) ||
-                !Enum.IsDefined(WrapV))
+            var settings = ToSamplerSettings();
+            if (!settings.IsValid)
             {
                 throw new InvalidOperationException(
                     $"[MaterialAssetLoader] Material '{sourcePath}' Texture2D ref '{bindingName}' has unsupported sampler settings.");
@@ -842,7 +853,8 @@ public static class MaterialAssetLoader
                 MagFilter,
                 MipmapMode,
                 WrapU,
-                WrapV);
+                WrapV,
+                MaxAnisotropy);
         }
     }
 
@@ -963,10 +975,15 @@ public static class MaterialAssetLoader
         public Texture2DCookedFormat Format { get; set; } = Texture2DCookedFormat.R8G8B8A8UNorm;
         public Texture2DColorSpace ColorSpace { get; set; } = Texture2DColorSpace.SRgb;
         public bool GenerateMipMaps { get; set; }
+        public Texture2DMipFilter MipFilter { get; set; } = Texture2DMipFilter.Color;
 
         public Texture2DVariantKey ToVariantKey()
         {
-            return new Texture2DVariantKey(Format, ColorSpace, GenerateMipMaps);
+            return new Texture2DVariantKey(
+                Format,
+                ColorSpace,
+                GenerateMipMaps,
+                MipFilter);
         }
     }
 
@@ -1086,7 +1103,7 @@ public static class MaterialAssetCooker
 {
     private const string MaterialAssetType = "Material";
     public const string RuntimeVariant = "material.runtime";
-    public const int CookedFormatVersion = 6;
+    public const int CookedFormatVersion = 7;
     private const int MaxStringByteCount = 16 * 1024;
     private const int MaxCollectionCount = 1024;
     private static readonly byte[] s_Magic = Encoding.ASCII.GetBytes("ARISMATL");
@@ -1286,6 +1303,7 @@ public static class MaterialAssetCooker
         WriteInt32(stream, (int)textureRef.Texture.Variant.Format);
         WriteInt32(stream, (int)textureRef.Texture.Variant.ColorSpace);
         WriteInt32(stream, textureRef.Texture.Variant.GenerateMipMaps ? 1 : 0);
+        WriteInt32(stream, (int)textureRef.Texture.Variant.MipFilter);
         WriteInt32(stream, (int)textureRef.Texture.SourceFormat);
 
         var sampler = textureRef.ResolvedSampler;
@@ -1294,6 +1312,7 @@ public static class MaterialAssetCooker
         WriteInt32(stream, (int)sampler.MipmapMode);
         WriteInt32(stream, (int)sampler.WrapU);
         WriteInt32(stream, (int)sampler.WrapV);
+        WriteSingle(stream, sampler.MaxAnisotropy);
 
         var transform = textureRef.ResolvedTransform;
         WriteSingle(stream, transform.Offset.X);
@@ -1436,7 +1455,10 @@ public static class MaterialAssetCooker
         var textureVariant = new Texture2DVariantKey(
             (Texture2DCookedFormat)reader.ReadInt32(),
             (Texture2DColorSpace)reader.ReadInt32(),
-            reader.ReadInt32() != 0);
+            reader.ReadInt32() != 0,
+            materialVersion >= 7
+                ? (Texture2DMipFilter)reader.ReadInt32()
+                : Texture2DMipFilter.Color);
         var sourceFormat = (Texture2DSourceFormat)reader.ReadInt32();
         var sampler = materialVersion >= 6
             ? new MaterialTextureSamplerSettings(
@@ -1444,7 +1466,8 @@ public static class MaterialAssetCooker
                 (MaterialTextureFilter)reader.ReadInt32(),
                 (MaterialTextureMipmapMode)reader.ReadInt32(),
                 (MaterialTextureWrapMode)reader.ReadInt32(),
-                (MaterialTextureWrapMode)reader.ReadInt32())
+                (MaterialTextureWrapMode)reader.ReadInt32(),
+                materialVersion >= 7 ? reader.ReadSingle() : 1.0f)
             : MaterialTextureSamplerSettings.Default;
         var transform = materialVersion >= 6
             ? new MaterialTextureTransform(

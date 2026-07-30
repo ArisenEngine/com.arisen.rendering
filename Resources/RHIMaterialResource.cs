@@ -56,6 +56,7 @@ public sealed class RHIMaterialResource : IDisposable
 
     public MaterialAsset Asset => m_Asset;
     public ShaderAsset Shader => m_Asset.Shader;
+    public string ShaderVariantIdentity { get; }
     public MaterialRenderState RenderState => m_Asset.RenderState;
     public AssetDependencyStamp DependencyStamp { get; }
     public AssetDependencyStamp ShaderDependencyStamp { get; }
@@ -85,6 +86,7 @@ public sealed class RHIMaterialResource : IDisposable
 
         DependencyStamp = AssetDependencyTracker.GetMaterialStamp(m_AssetDatabase, m_Asset);
         ShaderDependencyStamp = AssetDependencyTracker.GetShaderStamp(m_AssetDatabase, m_Asset.Shader);
+        ShaderVariantIdentity = m_Asset.Shader.GetVariantIdentity();
 
         var textureRefs = m_Asset.Texture2DRefs ?? Array.Empty<MaterialTexture2DRef>();
         m_Textures = new IRHITexture2DLease[textureRefs.Count];

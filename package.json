@@ -11,14 +11,18 @@
   },
   "services": {
     "provides": [
-      "ArisenEngine.Rendering.IRuntimeShaderCookRecipeRegistry"
+      "ArisenEngine.Rendering.IRuntimeShaderCookRecipeRegistry",
+      "ArisenEngine.Rendering.IGraphicsDeviceLifecycleService"
     ],
     "requires": [
       "ArisenEngine.Core.Assets.IAssetDatabase",
       "ArisenEngine.Core.Assets.IRuntimeAssetCookerRegistry",
       "ArisenEngine.Resources.Serialization.IWorldOriginService",
       "ArisenKernel.Contracts.IWindowProvider",
-      "ArisenKernel.Contracts.IRHIBackend",
+      {
+        "interface": "ArisenKernel.Contracts.IRHIBackend",
+        "deferred": true
+      },
       {
         "interface": "ArisenKernel.Contracts.IRHIDevice",
         "deferred": true

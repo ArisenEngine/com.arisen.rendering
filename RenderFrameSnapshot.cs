@@ -12,12 +12,14 @@ public readonly unsafe struct RenderFrameSnapshot
 {
     public RenderFrameSnapshot(
         RHIDevice device,
+        ulong deviceGeneration,
         RHISwapChain swapChain,
         RHIImageHandle targetImage,
         bool targetImageRequiresInitialization,
         uint surfaceId,
         RenderOutputKind outputKind,
         uint frameIndex,
+        uint frameResourceIndex,
         float deltaTime,
         uint width,
         uint height,
@@ -38,12 +40,14 @@ public readonly unsafe struct RenderFrameSnapshot
         int staticMeshItemCount)
     {
         Device = device;
+        DeviceGeneration = deviceGeneration;
         SwapChain = swapChain;
         TargetImage = targetImage;
         TargetImageRequiresInitialization = targetImageRequiresInitialization;
         SurfaceId = surfaceId;
         OutputKind = outputKind;
         FrameIndex = frameIndex;
+        FrameResourceIndex = frameResourceIndex;
         DeltaTime = deltaTime;
         Width = width;
         Height = height;
@@ -65,12 +69,14 @@ public readonly unsafe struct RenderFrameSnapshot
     }
 
     public RHIDevice Device { get; }
+    public ulong DeviceGeneration { get; }
     public RHISwapChain SwapChain { get; }
     public RHIImageHandle TargetImage { get; }
     public bool TargetImageRequiresInitialization { get; }
     public uint SurfaceId { get; }
     public RenderOutputKind OutputKind { get; }
     public uint FrameIndex { get; }
+    public uint FrameResourceIndex { get; }
     public float DeltaTime { get; }
     public uint Width { get; }
     public uint Height { get; }
