@@ -660,7 +660,7 @@ public sealed class RenderGraph : IDisposable
                             }
 
                             // Request a unique command buffer for this frame
-                            var cmdBuffer = pool.GetCommandBuffer(context.FrameIndex);
+                            var cmdBuffer = pool.GetCommandBuffer(context.FrameResourceIndex);
                             nodeCommandBuffers[capturedWorkItemIndex] = cmdBuffer;
 
                             // Ensure the command buffer is in the recording state

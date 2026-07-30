@@ -23,20 +23,46 @@ public enum Texture2DColorSpace
     SRgb
 }
 
+public enum Texture2DMipFilter
+{
+    Color,
+    NormalMap
+}
+
 public readonly record struct Texture2DVariantKey(
     Texture2DCookedFormat Format,
     Texture2DColorSpace ColorSpace,
-    bool GenerateMipMaps)
+    bool GenerateMipMaps,
+    Texture2DMipFilter MipFilter = Texture2DMipFilter.Color)
 {
     public static Texture2DVariantKey DefaultSRgb { get; } = new(
         Texture2DCookedFormat.R8G8B8A8UNorm,
         Texture2DColorSpace.SRgb,
         GenerateMipMaps: false);
 
+    public static Texture2DVariantKey MipmappedSRgb { get; } = new(
+        Texture2DCookedFormat.R8G8B8A8UNorm,
+        Texture2DColorSpace.SRgb,
+        GenerateMipMaps: true);
+
+    public static Texture2DVariantKey MipmappedLinear { get; } = new(
+        Texture2DCookedFormat.R8G8B8A8UNorm,
+        Texture2DColorSpace.Linear,
+        GenerateMipMaps: true);
+
+    public static Texture2DVariantKey MipmappedNormal { get; } = new(
+        Texture2DCookedFormat.R8G8B8A8UNorm,
+        Texture2DColorSpace.Linear,
+        GenerateMipMaps: true,
+        Texture2DMipFilter.NormalMap);
+
     public string GetCookedVariant()
     {
         var mipSuffix = GenerateMipMaps ? "mips" : "nomips";
-        return $"{Format.ToString().ToLowerInvariant()}.{ColorSpace.ToString().ToLowerInvariant()}.{mipSuffix}";
+        string filterSuffix = MipFilter == Texture2DMipFilter.NormalMap
+            ? ".normalmap"
+            : string.Empty;
+        return $"{Format.ToString().ToLowerInvariant()}.{ColorSpace.ToString().ToLowerInvariant()}.{mipSuffix}{filterSuffix}";
     }
 }
 
@@ -58,6 +84,7 @@ public readonly record struct CookedTexture2D(
     uint Height,
     Texture2DCookedFormat Format,
     Texture2DColorSpace ColorSpace,
+    Texture2DMipFilter MipFilter,
     int MipCount,
     int PixelDataOffset,
     int PixelDataSize,
@@ -68,10 +95,10 @@ public readonly record struct CookedTexture2D(
 
 public static class Texture2DAssetCooker
 {
-    public const int CookedFormatVersion = 1;
+    public const int CookedFormatVersion = 2;
 
     private const string TextureAssetType = "Texture2D";
-    private const int HeaderSize = 36;
+    private const int HeaderSize = 40;
     private const int LinearToSrgbTableResolution = 4096;
     private static readonly byte[] s_Magic = Encoding.ASCII.GetBytes("ARISTX2D");
     private static readonly float[] s_SrgbToLinear = CreateSrgbToLinearTable();
@@ -159,6 +186,7 @@ public static class Texture2DAssetCooker
                 header.Height,
                 header.Format,
                 header.ColorSpace,
+                header.MipFilter,
                 header.MipCount,
                 HeaderSize,
                 header.PixelDataSize,
@@ -203,8 +231,12 @@ public static class Texture2DAssetCooker
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
         var source = DecodeSource(sourceAsset.SourcePath, texture.SourceFormat);
+        ValidateVariant(texture.Variant);
         CookedMipChain mipChain = texture.Variant.GenerateMipMaps
-            ? GenerateMipChain(source, texture.Variant.ColorSpace)
+            ? GenerateMipChain(
+                source,
+                texture.Variant.ColorSpace,
+                texture.Variant.MipFilter)
             : new CookedMipChain(1, source.RgbaPixels);
 
         using var stream = File.Create(outputPath);
@@ -216,6 +248,7 @@ public static class Texture2DAssetCooker
         WriteInt32(stream, (int)texture.Variant.Format);
         WriteInt32(stream, (int)texture.Variant.ColorSpace);
         WriteInt32(stream, mipChain.Pixels.Length);
+        WriteInt32(stream, (int)texture.Variant.MipFilter);
         stream.Write(mipChain.Pixels);
 
         Logger.Log(
@@ -224,7 +257,8 @@ public static class Texture2DAssetCooker
 
     private static CookedMipChain GenerateMipChain(
         DecodedTexture2DSource source,
-        Texture2DColorSpace colorSpace)
+        Texture2DColorSpace colorSpace,
+        Texture2DMipFilter mipFilter)
     {
         int mipCount = GetMipCount(source.Width, source.Height);
         int packedByteCount = GetPackedMipByteCount(source.Width, source.Height, mipCount);
@@ -248,7 +282,8 @@ public static class Texture2DAssetCooker
                 packedPixels.AsSpan(destinationOffset, destinationByteCount),
                 destinationWidth,
                 destinationHeight,
-                colorSpace);
+                colorSpace,
+                mipFilter);
 
             sourceOffset = destinationOffset;
             destinationOffset = checked(destinationOffset + destinationByteCount);
@@ -291,6 +326,11 @@ public static class Texture2DAssetCooker
                 return false;
             }
 
+            if ((Texture2DMipFilter)ReadInt32(header, 36) != variant.MipFilter)
+            {
+                return false;
+            }
+
             int expectedMipCount = variant.GenerateMipMaps
                 ? GetMipCount(checked((uint)width), checked((uint)height))
                 : 1;
@@ -318,7 +358,8 @@ public static class Texture2DAssetCooker
         Span<byte> destination,
         uint destinationWidth,
         uint destinationHeight,
-        Texture2DColorSpace colorSpace)
+        Texture2DColorSpace colorSpace,
+        Texture2DMipFilter mipFilter)
     {
         for (uint destinationY = 0; destinationY < destinationHeight; destinationY++)
         {
@@ -330,6 +371,50 @@ public static class Texture2DAssetCooker
                 uint sourceXEnd = (destinationX + 1u) * sourceWidth / destinationWidth;
                 int sampleCount = checked((int)((sourceXEnd - sourceXBegin) * (sourceYEnd - sourceYBegin)));
                 int destinationIndex = checked((int)((destinationY * destinationWidth + destinationX) * 4u));
+
+                if (mipFilter == Texture2DMipFilter.NormalMap)
+                {
+                    float normalX = 0.0f;
+                    float normalY = 0.0f;
+                    float normalZ = 0.0f;
+                    int alpha = 0;
+                    for (uint sourceY = sourceYBegin; sourceY < sourceYEnd; sourceY++)
+                    {
+                        for (uint sourceX = sourceXBegin; sourceX < sourceXEnd; sourceX++)
+                        {
+                            int sourceIndex = checked((int)((sourceY * sourceWidth + sourceX) * 4u));
+                            normalX += DecodeNormalChannel(source[sourceIndex]);
+                            normalY += DecodeNormalChannel(source[sourceIndex + 1]);
+                            normalZ += DecodeNormalChannel(source[sourceIndex + 2]);
+                            alpha += source[sourceIndex + 3];
+                        }
+                    }
+
+                    float lengthSquared =
+                        (normalX * normalX) +
+                        (normalY * normalY) +
+                        (normalZ * normalZ);
+                    if (!float.IsFinite(lengthSquared) || lengthSquared <= 1.0e-12f)
+                    {
+                        normalX = 0.0f;
+                        normalY = 0.0f;
+                        normalZ = 1.0f;
+                    }
+                    else
+                    {
+                        float inverseLength = 1.0f / MathF.Sqrt(lengthSquared);
+                        normalX *= inverseLength;
+                        normalY *= inverseLength;
+                        normalZ *= inverseLength;
+                    }
+
+                    destination[destinationIndex] = EncodeNormalChannel(normalX);
+                    destination[destinationIndex + 1] = EncodeNormalChannel(normalY);
+                    destination[destinationIndex + 2] = EncodeNormalChannel(normalZ);
+                    destination[destinationIndex + 3] =
+                        checked((byte)((alpha + sampleCount / 2) / sampleCount));
+                    continue;
+                }
 
                 if (colorSpace == Texture2DColorSpace.SRgb)
                 {
@@ -443,6 +528,28 @@ public static class Texture2DAssetCooker
         return s_LinearToSrgb[index];
     }
 
+    private static float DecodeNormalChannel(byte encoded) =>
+        (encoded * (2.0f / 255.0f)) - 1.0f;
+
+    private static byte EncodeNormalChannel(float value) =>
+        checked((byte)Math.Clamp(
+            (int)MathF.Round((Math.Clamp(value, -1.0f, 1.0f) * 0.5f + 0.5f) * 255.0f),
+            0,
+            255));
+
+    private static void ValidateVariant(Texture2DVariantKey variant)
+    {
+        if (!Enum.IsDefined(variant.Format) ||
+            !Enum.IsDefined(variant.ColorSpace) ||
+            !Enum.IsDefined(variant.MipFilter) ||
+            (variant.MipFilter == Texture2DMipFilter.NormalMap &&
+             variant.ColorSpace != Texture2DColorSpace.Linear))
+        {
+            throw new InvalidOperationException(
+                $"[Texture2DAssetCooker] Texture variant '{variant.GetCookedVariant()}' is invalid.");
+        }
+    }
+
     private static CookedTexture2DHeader ReadHeader(ReadOnlySpan<byte> bytes)
     {
         if (bytes.Length < HeaderSize || !bytes.Slice(0, s_Magic.Length).SequenceEqual(s_Magic))
@@ -462,8 +569,17 @@ public static class Texture2DAssetCooker
         var format = (Texture2DCookedFormat)ReadInt32(bytes, 24);
         var colorSpace = (Texture2DColorSpace)ReadInt32(bytes, 28);
         var pixelDataSize = ReadInt32(bytes, 32);
+        var mipFilter = (Texture2DMipFilter)ReadInt32(bytes, 36);
 
-        if (width <= 0 || height <= 0 || mipCount <= 0 || pixelDataSize <= 0)
+        if (width <= 0 ||
+            height <= 0 ||
+            mipCount <= 0 ||
+            pixelDataSize <= 0 ||
+            !Enum.IsDefined(format) ||
+            !Enum.IsDefined(colorSpace) ||
+            !Enum.IsDefined(mipFilter) ||
+            (mipFilter == Texture2DMipFilter.NormalMap &&
+             colorSpace != Texture2DColorSpace.Linear))
         {
             throw new InvalidOperationException("[Texture2DAssetCooker] Cooked texture header contains invalid dimensions or payload size.");
         }
@@ -479,6 +595,7 @@ public static class Texture2DAssetCooker
             mipCount,
             format,
             colorSpace,
+            mipFilter,
             pixelDataSize);
     }
 
@@ -559,6 +676,7 @@ public static class Texture2DAssetCooker
         int MipCount,
         Texture2DCookedFormat Format,
         Texture2DColorSpace ColorSpace,
+        Texture2DMipFilter MipFilter,
         int PixelDataSize);
 
     private readonly record struct CookedMipChain(int MipCount, byte[] Pixels);

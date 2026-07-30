@@ -1,14 +1,14 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Threading;
 using ArisenKernel.Diagnostics;
 
 namespace ArisenEngine.Rendering;
 
 /// <summary>
 /// Provides integration with the RenderDoc API for frame captures.
-/// RenderDoc must be preloaded (via NativeRuntime.PreloadRenderDoc) BEFORE
-/// vkCreateInstance for captures to work. This service binds to the already-loaded
-/// renderdoc.dll and exposes capture control.
+/// RenderDoc must be explicitly loaded before vkCreateInstance for captures to work.
+/// This service only binds to that already-loaded module and never injects it late.
 /// </summary>
 public class RenderDocService : IDisposable
 {
@@ -103,6 +103,7 @@ public class RenderDocService : IDisposable
     private IntPtr m_Library;
     private IntPtr m_ApiPtr;
     private RenderDocVTable m_VTable;
+    private readonly object m_InitializationLock = new();
 
     private pfnTriggerCapture? m_TriggerCapture;
     private pfnLaunchReplayUI? m_LaunchReplayUI;
@@ -113,11 +114,31 @@ public class RenderDocService : IDisposable
     private pfnGetCapture? m_GetCapture;
     private pfnTriggerMultiFrameCapture? m_TriggerMultiFrameCapture;
     
-    public bool IsCaptureRequested { get; private set; }
+    private int m_CaptureRequested;
+    private int m_Initialized;
+    private int m_UnavailableLogged;
+    private string m_AvailabilityDiagnostic =
+        "RenderDoc availability has not been queried for this process.";
 
-    public bool IsAvailable => m_ApiPtr != IntPtr.Zero;
+    public bool IsCaptureRequested => Volatile.Read(ref m_CaptureRequested) != 0;
 
-    private bool m_Initialized;
+    public bool IsAvailable
+    {
+        get
+        {
+            EnsureInitialized();
+            return m_ApiPtr != IntPtr.Zero;
+        }
+    }
+
+    public string AvailabilityDiagnostic
+    {
+        get
+        {
+            EnsureInitialized();
+            return m_AvailabilityDiagnostic;
+        }
+    }
 
     private RenderDocService()
     {
@@ -125,54 +146,48 @@ public class RenderDocService : IDisposable
 
     /// <summary>
     /// Synchronous initialization. Called when the service is first needed.
-    /// By this point, NativeRuntime has already preloaded renderdoc.dll via LoadLibrary
-    /// BEFORE vkCreateInstance, so GetModuleHandle will find it and RenderDoc's Vulkan
-    /// hooks are already active.
+    /// By this point, an explicit process-start capture mode has already loaded
+    /// renderdoc.dll before vkCreateInstance, so GetModuleHandle can bind its API.
     /// </summary>
     public void EnsureInitialized()
     {
-        if (m_Initialized) return;
-        m_Initialized = true;
-        Initialize();
+        if (Volatile.Read(ref m_Initialized) != 0) return;
+
+        lock (m_InitializationLock)
+        {
+            if (m_Initialized != 0) return;
+            if (Initialize())
+            {
+                Volatile.Write(ref m_Initialized, 1);
+            }
+        }
     }
 
-    private void Initialize()
+    private bool Initialize()
     {
         try 
         {
             KernelLog.Info("[RenderDocService] Initializing...");
 
-            // RenderDoc should already be loaded by NativeRuntime.PreloadRenderDoc().
-            // GetModuleHandle just gets the handle to the already-loaded DLL.
             m_Library = GetModuleHandle("renderdoc.dll");
             if (m_Library == IntPtr.Zero)
             {
-                // If not preloaded, we try to load it now (fallback, but captures may not work
-                // if Vulkan was already initialized without RenderDoc hooks).
-                string[] paths = {
-                    "C:\\Program Files\\RenderDoc\\renderdoc.dll",
-                    "C:\\renderdoc.dll"
-                };
-                foreach(var p in paths) {
-                    if (System.IO.File.Exists(p)) {
-                        KernelLog.Warning($"[RenderDocService] Loading library late (after Vulkan init) from: {p}. Captures may not work!");
-                        m_Library = LoadLibrary(p);
-                        break;
-                    }
+                m_AvailabilityDiagnostic =
+                    "RenderDoc is not loaded; frame capture requires process-start enablement before graphics initialization.";
+                if (Interlocked.Exchange(ref m_UnavailableLogged, 1) == 0)
+                {
+                    KernelLog.Info($"[RenderDocService] {m_AvailabilityDiagnostic}");
                 }
-            }
-
-            if (m_Library == IntPtr.Zero)
-            {
-                KernelLog.Warning("[RenderDocService] renderdoc.dll not found. RenderDoc integration disabled.");
-                return;
+                return false;
             }
 
             IntPtr getApiAddr = GetProcAddress(m_Library, "RENDERDOC_GetAPI");
             if (getApiAddr == IntPtr.Zero)
             {
-                KernelLog.Error("[RenderDocService] RENDERDOC_GetAPI not found in renderdoc.dll. Error Code: " + Marshal.GetLastWin32Error());
-                return;
+                m_AvailabilityDiagnostic =
+                    "The loaded RenderDoc module does not expose RENDERDOC_GetAPI.";
+                KernelLog.Error($"[RenderDocService] {m_AvailabilityDiagnostic} Error Code: {Marshal.GetLastWin32Error()}");
+                return true;
             }
 
             var getApi = Marshal.GetDelegateForFunctionPointer<pfnRENDERDOC_GetAPI>(getApiAddr);
@@ -182,9 +197,11 @@ public class RenderDocService : IDisposable
             int result = getApi(10600, out m_ApiPtr);
             if (result != 1)
             {
-                KernelLog.Error($"[RenderDocService] Failed to get RenderDoc API v1.6.0. Result: {result}");
+                m_AvailabilityDiagnostic =
+                    $"The loaded RenderDoc module rejected API v1.6.0 with result {result}.";
+                KernelLog.Error($"[RenderDocService] {m_AvailabilityDiagnostic}");
                 m_ApiPtr = IntPtr.Zero;
-                return;
+                return true;
             }
 
             KernelLog.Info($"[RenderDocService] API pointer acquired: 0x{m_ApiPtr:X}");
@@ -201,11 +218,15 @@ public class RenderDocService : IDisposable
             m_GetCapture = Marshal.GetDelegateForFunctionPointer<pfnGetCapture>(m_VTable.GetCapture);
             m_TriggerMultiFrameCapture = Marshal.GetDelegateForFunctionPointer<pfnTriggerMultiFrameCapture>(m_VTable.TriggerMultiFrameCapture);
 
-            KernelLog.Info("[RenderDocService] RenderDoc API initialized successfully.");
+            m_AvailabilityDiagnostic = "RenderDoc frame capture is available.";
+            KernelLog.Info($"[RenderDocService] {m_AvailabilityDiagnostic}");
+            return true;
         }
         catch (Exception ex)
         {
+            m_AvailabilityDiagnostic = $"RenderDoc API initialization failed: {ex.Message}";
             KernelLog.Error($"[RenderDocService] Initialization failed: {ex.Message}");
+            return m_Library != IntPtr.Zero;
         }
     }
 
@@ -215,19 +236,25 @@ public class RenderDocService : IDisposable
     /// </summary>
     public void TriggerCapture()
     {
-        EnsureInitialized();
-        
-        if (!IsAvailable)
-        {
-            KernelLog.Warning("[RenderDocService] Cannot capture: RenderDoc API not available. Was renderdoc.dll loaded before Vulkan init?");
-            return;
-        }
-
-        IsCaptureRequested = true;
-        KernelLog.Info("[RenderDocService] Capture requested for next frame via manual markers.");
+        TryTriggerCapture();
     }
 
-    public void ClearCaptureRequest() => IsCaptureRequested = false;
+    public bool TryTriggerCapture()
+    {
+        EnsureInitialized();
+        
+        if (m_ApiPtr == IntPtr.Zero)
+        {
+            KernelLog.Warning($"[RenderDocService] Cannot capture: {m_AvailabilityDiagnostic}");
+            return false;
+        }
+
+        Volatile.Write(ref m_CaptureRequested, 1);
+        KernelLog.Info("[RenderDocService] Capture requested for next frame via manual markers.");
+        return true;
+    }
+
+    public void ClearCaptureRequest() => Volatile.Write(ref m_CaptureRequested, 0);
 
     /// <summary>
     /// Begins a frame capture. Uses NULL/NULL wildcards per RenderDoc docs:
@@ -237,7 +264,7 @@ public class RenderDocService : IDisposable
     /// </summary>
     public void StartCapture()
     {
-        if (!m_Initialized || !IsAvailable) return;
+        if (Volatile.Read(ref m_Initialized) == 0 || m_ApiPtr == IntPtr.Zero) return;
         
         // Pass NULL, NULL to wildcard match the single Vulkan device.
         // Virtual surfaces have no HWND, so we cannot pass a window handle.
@@ -261,7 +288,7 @@ public class RenderDocService : IDisposable
     /// </summary>
     public void EndCapture()
     {
-        if (!m_Initialized || !IsAvailable) return;
+        if (Volatile.Read(ref m_Initialized) == 0 || m_ApiPtr == IntPtr.Zero) return;
 
         // Must match the device/window used in StartCapture (NULL, NULL)
         uint result = m_EndFrameCapture?.Invoke(IntPtr.Zero, IntPtr.Zero) ?? 0;
@@ -323,9 +350,6 @@ public class RenderDocService : IDisposable
             }
         }
     }
-
-    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]
-    private static extern IntPtr LoadLibrary(string lpFileName);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
     private static extern IntPtr GetModuleHandle(string lpModuleName);

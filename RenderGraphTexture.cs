@@ -7,6 +7,7 @@ namespace ArisenEngine.Rendering;
 public sealed class RenderGraphTexture : IDisposable
 {
     private const uint InvalidBindlessIndex = 0xFFFFFFFFu;
+    private const uint MaximumArrayLayers = 256;
 
     private RenderGraphTextureAllocation? m_Allocation;
     private RenderGraphTextureDescriptor m_Descriptor;
@@ -25,10 +26,25 @@ public sealed class RenderGraphTexture : IDisposable
     public uint BindlessSamplerIndex => m_Allocation?.BindlessSamplerIndex ?? InvalidBindlessIndex;
     public uint Width => m_Descriptor.Width;
     public uint Height => m_Descriptor.Height;
+    public uint ArrayLayers => m_Descriptor.ArrayLayers;
     public EFormat Format => m_Descriptor.Format;
     public uint Usage => m_Descriptor.Usage;
     public EImageAspectFlagBits AspectMask => m_Descriptor.AspectMask;
     public bool IsValid => m_Allocation is { IsValid: true };
+
+    public RHIImageViewHandle GetLayerImageView(uint arrayLayer)
+    {
+        ThrowIfDisposed();
+        ValidateArrayLayer(arrayLayer);
+        return m_Allocation?.GetLayerImageView(arrayLayer) ?? RHIImageViewHandle.Invalid;
+    }
+
+    public uint GetLayerBindlessImageIndex(uint arrayLayer)
+    {
+        ThrowIfDisposed();
+        ValidateArrayLayer(arrayLayer);
+        return m_Allocation?.GetLayerBindlessImageIndex(arrayLayer) ?? InvalidBindlessIndex;
+    }
 
     internal RenderResourceState CurrentState { get; set; } = RenderResourceState.Unknown;
 
@@ -50,6 +66,13 @@ public sealed class RenderGraphTexture : IDisposable
             throw new ArgumentOutOfRangeException(nameof(descriptor), "[RenderGraphTexture] Texture size must be non-zero.");
         }
 
+        if (descriptor.ArrayLayers == 0 || descriptor.ArrayLayers > MaximumArrayLayers)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(descriptor),
+                $"[RenderGraphTexture] Array layer count must be between 1 and {MaximumArrayLayers}.");
+        }
+
         if (m_Allocation is { IsValid: true } &&
             m_Descriptor.Equals(descriptor))
         {
@@ -62,7 +85,7 @@ public sealed class RenderGraphTexture : IDisposable
         CurrentState = RenderResourceState.Unknown;
 
         Logger.Log(
-            $"[RenderGraphTexture] Created transient texture | Name: {descriptor.DebugName} | Size: {descriptor.Width}x{descriptor.Height} | Format: {descriptor.Format} | Usage: 0x{descriptor.Usage:X} | Aspect: {descriptor.AspectMask} | Sampled: {descriptor.RegisterBindlessSampled} | Image: {Image.Index}:{Image.Generation} | View: {ImageView.Index}:{ImageView.Generation} | BindlessImage: {BindlessImageIndex} | BindlessSampler: {BindlessSamplerIndex}");
+            $"[RenderGraphTexture] Created transient texture | Name: {descriptor.DebugName} | Size: {descriptor.Width}x{descriptor.Height}x{descriptor.ArrayLayers} | Format: {descriptor.Format} | Usage: 0x{descriptor.Usage:X} | Aspect: {descriptor.AspectMask} | Sampled: {descriptor.RegisterBindlessSampled} | Image: {Image.Index}:{Image.Generation} | View: {ImageView.Index}:{ImageView.Generation} | BindlessImage: {BindlessImageIndex} | BindlessSampler: {BindlessSamplerIndex}");
     }
 
     internal void DisposeDeferred(
@@ -119,6 +142,16 @@ public sealed class RenderGraphTexture : IDisposable
         }
     }
 
+    private void ValidateArrayLayer(uint arrayLayer)
+    {
+        if (arrayLayer >= m_Descriptor.ArrayLayers)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(arrayLayer),
+                $"[RenderGraphTexture] Array layer {arrayLayer} is outside [0, {m_Descriptor.ArrayLayers}).");
+        }
+    }
+
     private sealed class RenderGraphTextureAllocation : IDisposable
     {
         private readonly RHIFactory m_Factory;
@@ -128,29 +161,51 @@ public sealed class RenderGraphTexture : IDisposable
             RHIFactory factory,
             RHIImageHandle image,
             RHIImageViewHandle imageView,
+            RHIImageViewHandle[] layerImageViews,
             RHISamplerHandle sampler,
-            uint bindlessImageIndex,
+            uint[] bindlessImageIndices,
             uint bindlessSamplerIndex)
         {
             m_Factory = factory;
             Image = image;
             ImageView = imageView;
+            LayerImageViews = layerImageViews;
             Sampler = sampler;
-            BindlessImageIndex = bindlessImageIndex;
+            BindlessImageIndices = bindlessImageIndices;
             BindlessSamplerIndex = bindlessSamplerIndex;
         }
 
         public RHIImageHandle Image { get; private set; }
         public RHIImageViewHandle ImageView { get; private set; }
+        public RHIImageViewHandle[] LayerImageViews { get; private set; }
         public RHISamplerHandle Sampler { get; private set; }
-        public uint BindlessImageIndex { get; private set; }
+        public uint[] BindlessImageIndices { get; private set; }
+        public uint BindlessImageIndex => BindlessImageIndices.Length > 0
+            ? BindlessImageIndices[0]
+            : InvalidBindlessIndex;
         public uint BindlessSamplerIndex { get; private set; }
         public bool IsValid =>
             Image.IsValid &&
             ImageView.IsValid &&
+            LayerImageViews.All(static view => view.IsValid) &&
             (!Sampler.IsValid ||
-             (BindlessImageIndex != InvalidBindlessIndex &&
+             (BindlessImageIndices.Length > 0 &&
+              BindlessImageIndices.All(static index => index != InvalidBindlessIndex) &&
               BindlessSamplerIndex != InvalidBindlessIndex));
+
+        public RHIImageViewHandle GetLayerImageView(uint arrayLayer)
+        {
+            return LayerImageViews.Length == 0
+                ? ImageView
+                : LayerImageViews[checked((int)arrayLayer)];
+        }
+
+        public uint GetLayerBindlessImageIndex(uint arrayLayer)
+        {
+            return BindlessImageIndices.Length == 0
+                ? InvalidBindlessIndex
+                : BindlessImageIndices[checked((int)arrayLayer)];
+        }
 
         public static RenderGraphTextureAllocation Create(
             RHIFactory factory,
@@ -158,8 +213,9 @@ public sealed class RenderGraphTexture : IDisposable
         {
             var image = RHIImageHandle.Invalid;
             var imageView = RHIImageViewHandle.Invalid;
+            RHIImageViewHandle[] layerImageViews = Array.Empty<RHIImageViewHandle>();
             var sampler = RHISamplerHandle.Invalid;
-            var bindlessImageIndex = InvalidBindlessIndex;
+            uint[] bindlessImageIndices = Array.Empty<uint>();
             var bindlessSamplerIndex = InvalidBindlessIndex;
 
             try
@@ -169,7 +225,7 @@ public sealed class RenderGraphTexture : IDisposable
                     descriptor.Height,
                     1,
                     1,
-                    1,
+                    descriptor.ArrayLayers,
                     descriptor.Format,
                     descriptor.Usage,
                     ERHIMemoryUsage.GpuOnly,
@@ -181,16 +237,42 @@ public sealed class RenderGraphTexture : IDisposable
 
                 imageView = factory.CreateImageView(
                     image,
-                    EImageViewType.IMAGE_VIEW_TYPE_2D,
+                    descriptor.ArrayLayers == 1
+                        ? EImageViewType.IMAGE_VIEW_TYPE_2D
+                        : EImageViewType.IMAGE_VIEW_TYPE_2D_ARRAY,
                     descriptor.Format,
                     (uint)descriptor.AspectMask,
                     0,
                     1,
                     0,
-                    1);
+                    descriptor.ArrayLayers);
                 if (!imageView.IsValid)
                 {
                     throw new InvalidOperationException($"[RenderGraphTexture] Failed to create image view '{descriptor.DebugName}'.");
+                }
+
+                if (descriptor.ArrayLayers > 1)
+                {
+                    layerImageViews = new RHIImageViewHandle[descriptor.ArrayLayers];
+                    for (uint layer = 0; layer < descriptor.ArrayLayers; layer++)
+                    {
+                        RHIImageViewHandle layerView = factory.CreateImageView(
+                            image,
+                            EImageViewType.IMAGE_VIEW_TYPE_2D,
+                            descriptor.Format,
+                            (uint)descriptor.AspectMask,
+                            0,
+                            1,
+                            layer,
+                            1);
+                        if (!layerView.IsValid)
+                        {
+                            throw new InvalidOperationException(
+                                $"[RenderGraphTexture] Failed to create image view '{descriptor.DebugName}' layer {layer}.");
+                        }
+
+                        layerImageViews[layer] = layerView;
+                    }
                 }
 
                 if (descriptor.RegisterBindlessSampled)
@@ -205,10 +287,25 @@ public sealed class RenderGraphTexture : IDisposable
                         throw new InvalidOperationException($"[RenderGraphTexture] Failed to create sampler '{descriptor.DebugName}'.");
                     }
 
-                    bindlessImageIndex = factory.RegisterBindlessResourceImage(imageView);
+                    bindlessImageIndices = new uint[descriptor.ArrayLayers];
+                    Array.Fill(bindlessImageIndices, InvalidBindlessIndex);
+                    for (uint layer = 0; layer < descriptor.ArrayLayers; layer++)
+                    {
+                        RHIImageViewHandle sampledView = layerImageViews.Length == 0
+                            ? imageView
+                            : layerImageViews[layer];
+                        uint bindlessIndex = factory.RegisterBindlessResourceImage(sampledView);
+                        if (bindlessIndex == InvalidBindlessIndex)
+                        {
+                            throw new InvalidOperationException(
+                                $"[RenderGraphTexture] Failed to register bindless image '{descriptor.DebugName}' layer {layer}.");
+                        }
+
+                        bindlessImageIndices[layer] = bindlessIndex;
+                    }
+
                     bindlessSamplerIndex = factory.RegisterBindlessResourceSampler(sampler);
-                    if (bindlessImageIndex == InvalidBindlessIndex ||
-                        bindlessSamplerIndex == InvalidBindlessIndex)
+                    if (bindlessSamplerIndex == InvalidBindlessIndex)
                     {
                         throw new InvalidOperationException($"[RenderGraphTexture] Failed to register bindless descriptors '{descriptor.DebugName}'.");
                     }
@@ -218,8 +315,9 @@ public sealed class RenderGraphTexture : IDisposable
                     factory,
                     image,
                     imageView,
+                    layerImageViews,
                     sampler,
-                    bindlessImageIndex,
+                    bindlessImageIndices,
                     bindlessSamplerIndex);
             }
             catch
@@ -228,8 +326,9 @@ public sealed class RenderGraphTexture : IDisposable
                     factory,
                     image,
                     imageView,
+                    layerImageViews,
                     sampler,
-                    bindlessImageIndex,
+                    bindlessImageIndices,
                     bindlessSamplerIndex);
                 throw;
             }
@@ -246,13 +345,15 @@ public sealed class RenderGraphTexture : IDisposable
                 m_Factory,
                 Image,
                 ImageView,
+                LayerImageViews,
                 Sampler,
-                BindlessImageIndex,
+                BindlessImageIndices,
                 BindlessSamplerIndex);
             Image = RHIImageHandle.Invalid;
             ImageView = RHIImageViewHandle.Invalid;
+            LayerImageViews = Array.Empty<RHIImageViewHandle>();
             Sampler = RHISamplerHandle.Invalid;
-            BindlessImageIndex = InvalidBindlessIndex;
+            BindlessImageIndices = Array.Empty<uint>();
             BindlessSamplerIndex = InvalidBindlessIndex;
             m_Disposed = true;
         }
@@ -261,8 +362,9 @@ public sealed class RenderGraphTexture : IDisposable
             RHIFactory factory,
             RHIImageHandle image,
             RHIImageViewHandle imageView,
+            RHIImageViewHandle[] layerImageViews,
             RHISamplerHandle sampler,
-            uint bindlessImageIndex,
+            uint[] bindlessImageIndices,
             uint bindlessSamplerIndex)
         {
             if (!factory.IsValid)
@@ -275,14 +377,25 @@ public sealed class RenderGraphTexture : IDisposable
                 factory.UnregisterBindlessResourceSampler(bindlessSamplerIndex);
             }
 
-            if (bindlessImageIndex != InvalidBindlessIndex)
+            for (int index = bindlessImageIndices.Length - 1; index >= 0; index--)
             {
-                factory.UnregisterBindlessResourceImage(bindlessImageIndex);
+                if (bindlessImageIndices[index] != InvalidBindlessIndex)
+                {
+                    factory.UnregisterBindlessResourceImage(bindlessImageIndices[index]);
+                }
             }
 
             if (sampler.IsValid)
             {
                 factory.ReleaseSampler(sampler);
+            }
+
+            for (int index = layerImageViews.Length - 1; index >= 0; index--)
+            {
+                if (layerImageViews[index].IsValid)
+                {
+                    factory.ReleaseImageView(layerImageViews[index]);
+                }
             }
 
             if (imageView.IsValid)

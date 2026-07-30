@@ -17,6 +17,8 @@ public class RenderSurface : IRenderSurface
 
     private readonly object m_OutputLock = new();
     private readonly object m_LifetimeLock = new();
+    private readonly Queue<PendingRenderOutput> m_PendingOutputs = new((int)EditorSharedTextureMaxOutstandingFrames);
+    private readonly Dictionary<IntPtr, RHISwapChain> m_ConsumedSemaphoreOwners = new();
     private IntPtr m_Host;
     private uint m_SurfaceId;
     private IntPtr m_Handle;
@@ -130,42 +132,75 @@ public class RenderSurface : IRenderSurface
         width = Math.Max(1u, width);
         height = Math.Max(1u, height);
 
-        if (m_Width == width && m_Height == height) return;
-
-        lock (m_OutputLock)
-        {
-            m_Width = width;
-            m_Height = height;
-            m_ResizeGeneration++;
-            m_LastTicket = 0;
-            m_LastFrameIndex = 0;
-            m_LastConsumedFrameIndex = 0;
-            m_LastRenderWidth = 0;
-            m_LastRenderHeight = 0;
-            m_LastRenderSwapChain = null;
-            m_CachedSwapChain = null;
-            m_FramePacing.Reset();
-        }
-
-        // B101: Professional Virtual Surface Resizing.
-        // We cannot call ResizeRenderSurface in HAL because that assumes a Win32 HWND exists.
-        // Instead, we call the RHI-level SetResolution directly which handles swapchain recreation.
         if ((m_SurfaceId & RHISystem.VirtualSurfaceIDMask) != 0)
         {
-            var nativeSurface = EnsureNativeSurface();
-            if (nativeSurface == null)
-            {
-                return;
-            }
-
             lock (m_OutputLock)
             {
-                RHISurfaceAPI.RHISurface_SetResolution(nativeSurface.Handle, width, height);
+                if (m_Width == width && m_Height == height)
+                {
+                    return;
+                }
+
+                if (m_ConsumedSemaphoreOwners.Count != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Cannot resize virtual surface 0x{m_SurfaceId:X} while " +
+                        $"{m_ConsumedSemaphoreOwners.Count} compositor semaphore lease(s) remain active.");
+                }
+
+                var nativeSurface = EnsureNativeSurface()
+                    ?? throw new InvalidOperationException(
+                        $"Cannot resize virtual surface 0x{m_SurfaceId:X}; its native RHI surface is unavailable.");
+                var swapChain = nativeSurface.GetSwapChain();
+                if (!swapChain.IsValid || !swapChain.AcknowledgeExternalConsumerRelease())
+                {
+                    throw new InvalidOperationException(
+                        $"Cannot resize virtual surface 0x{m_SurfaceId:X}; the native swapchain " +
+                        "did not accept the external-consumer release acknowledgement.");
+                }
+
+                // The UI has stopped presentation and released every imported object before
+                // this render-thread command executes. Remaining outputs were never imported.
+                m_PendingOutputs.Clear();
+                m_FramePacing.Reset();
+                m_LastRenderSwapChain = null;
+                m_CachedSwapChain = null;
+                if (!RHISurfaceAPI.RHISurface_TrySetResolution(nativeSurface.Handle, width, height))
+                {
+                    throw new InvalidOperationException(
+                        $"Virtual surface 0x{m_SurfaceId:X} failed to recreate at {width}x{height}; " +
+                        "the previous native swapchain remains active.");
+                }
+
+                m_Width = width;
+                m_Height = height;
+                m_ResizeGeneration++;
+                m_LastTicket = 0;
+                m_LastFrameIndex = 0;
+                m_LastRenderWidth = 0;
+                m_LastRenderHeight = 0;
+                m_LastRenderResizeGeneration = m_ResizeGeneration;
             }
 
             Logger.Log(
                 $"[RenderSurface] Resized virtual surface | Name: {m_Name} | Surface: 0x{m_SurfaceId:X} | Size: {width}x{height} | Generation: {m_ResizeGeneration}");
             return;
+        }
+
+        lock (m_OutputLock)
+        {
+            if (m_Width == width && m_Height == height)
+            {
+                return;
+            }
+
+            m_Width = width;
+            m_Height = height;
+            m_ResizeGeneration++;
+            m_LastTicket = 0;
+            m_LastFrameIndex = 0;
+            m_LastRenderWidth = 0;
+            m_LastRenderHeight = 0;
         }
 
         NativeHAL.RenderWindowAPI.ResizeRenderSurface(m_SurfaceId, width, height);
@@ -204,9 +239,19 @@ public class RenderSurface : IRenderSurface
         {
             lock (m_OutputLock)
             {
+                foreach (var (handle, swapChain) in m_ConsumedSemaphoreOwners)
+                {
+                    if (swapChain.IsValid)
+                    {
+                        swapChain.ReleaseConsumedSemaphoreWin32Handle(handle);
+                    }
+                }
+
+                m_ConsumedSemaphoreOwners.Clear();
                 m_LastTicket = 0;
                 m_LastRenderSwapChain = null;
                 m_CachedSwapChain = null;
+                m_PendingOutputs.Clear();
                 m_NativeSurface = null;
                 m_FramePacing.Reset();
 
@@ -288,10 +333,22 @@ public class RenderSurface : IRenderSurface
 
         lock (m_OutputLock)
         {
-            var swapChainToUse = m_LastRenderSwapChain ?? m_CachedSwapChain;
-            if (swapChainToUse.HasValue && swapChainToUse.Value.IsValid)
+            if (m_ConsumedSemaphoreOwners.Remove(handle, out var swapChain) && swapChain.IsValid)
             {
-                swapChainToUse.Value.ReleaseConsumedSemaphoreWin32Handle(handle);
+                swapChain.ReleaseConsumedSemaphoreWin32Handle(handle);
+            }
+        }
+    }
+
+    public void CompleteConsumedSemaphoreHandle(IntPtr handle)
+    {
+        if (handle == IntPtr.Zero) return;
+
+        lock (m_OutputLock)
+        {
+            if (m_ConsumedSemaphoreOwners.Remove(handle, out var swapChain) && swapChain.IsValid)
+            {
+                swapChain.CompleteConsumedSemaphoreWin32Handle(handle);
             }
         }
     }
@@ -389,7 +446,7 @@ public class RenderSurface : IRenderSurface
     {
         lock (m_OutputLock)
         {
-            if (m_LastTicket == 0 || m_LastRenderWidth == 0 || m_LastRenderHeight == 0)
+            if (m_PendingOutputs.Count == 0)
             {
                 return new RenderOutputInfo
                 {
@@ -399,17 +456,20 @@ public class RenderSurface : IRenderSurface
                 };
             }
 
+            var pending = m_PendingOutputs.Peek();
             return new RenderOutputInfo
             {
-                Ticket = m_LastTicket,
-                FrameIndex = m_LastFrameIndex,
-                ResizeGeneration = m_LastRenderResizeGeneration,
-                SharedHandle = GetSharedHandleLocked(m_LastFrameIndex),
-                MemorySize = GetSharedMemorySizeLocked(m_LastFrameIndex),
-                WaitSemaphoreHandle = GetRenderFinishedSemaphoreHandleLocked(m_LastFrameIndex),
-                SignalSemaphoreHandle = CreateConsumedSemaphoreHandleLocked(m_LastFrameIndex),
-                Width = m_LastRenderWidth,
-                Height = m_LastRenderHeight
+                Ticket = pending.Ticket,
+                FrameIndex = pending.FrameIndex,
+                ResizeGeneration = pending.ResizeGeneration,
+                SharedHandle = pending.SharedHandle,
+                MemorySize = pending.MemorySize,
+                WaitSemaphoreHandle = pending.WaitSemaphoreHandle,
+                SignalSemaphoreHandle = CreateConsumedSemaphoreHandleLocked(
+                    pending.FrameIndex,
+                    pending.SwapChain),
+                Width = pending.Width,
+                Height = pending.Height
             };
         }
     }
@@ -418,6 +478,22 @@ public class RenderSurface : IRenderSurface
     {
         lock (m_OutputLock)
         {
+            if (m_PendingOutputs.Count == 0)
+            {
+                KernelLog.Warning(
+                    $"[RenderSurface] Ignored consumption for frame {frameIndex}; no shared-texture output is pending on surface 0x{m_SurfaceId:X}.");
+                return;
+            }
+
+            var pending = m_PendingOutputs.Peek();
+            if (pending.FrameIndex != frameIndex)
+            {
+                KernelLog.Warning(
+                    $"[RenderSurface] Ignored out-of-order consumption on surface 0x{m_SurfaceId:X}. Expected={pending.FrameIndex}, Actual={frameIndex}.");
+                return;
+            }
+
+            m_PendingOutputs.Dequeue();
             m_FramePacing.MarkConsumed(frameIndex);
             m_LastConsumedFrameIndex = m_FramePacing.LastConsumedFrameIndex;
         }
@@ -444,6 +520,39 @@ public class RenderSurface : IRenderSurface
     {
         lock (m_OutputLock)
         {
+            if (m_PendingOutputs.Count >= EditorSharedTextureMaxOutstandingFrames)
+            {
+                throw new InvalidOperationException(
+                    $"Shared-texture output queue overflow on surface 0x{m_SurfaceId:X}. " +
+                    $"Pending={m_PendingOutputs.Count}, Limit={EditorSharedTextureMaxOutstandingFrames}.");
+            }
+
+            const uint imageCount = 3;
+            var imageIndex = frameIndex % imageCount;
+            var sharedHandle = swapChain.GetSharedWin32Handle(imageIndex);
+            var memorySize = swapChain.GetSharedMemorySize(imageIndex);
+            var waitSemaphoreHandle = swapChain.GetRenderFinishedSemaphoreWin32Handle(frameIndex);
+            if (ticket == 0 || sharedHandle == IntPtr.Zero || memorySize == 0 ||
+                waitSemaphoreHandle == IntPtr.Zero || width == 0 || height == 0)
+            {
+                throw new InvalidOperationException(
+                    $"Shared-texture output metadata is incomplete on surface 0x{m_SurfaceId:X}. " +
+                    $"Ticket={ticket}, Frame={frameIndex}, Handle=0x{sharedHandle.ToInt64():X}, " +
+                    $"Memory={memorySize}, Wait=0x{waitSemaphoreHandle.ToInt64():X}, Size={width}x{height}.");
+            }
+
+            var pending = new PendingRenderOutput(
+                ticket,
+                frameIndex,
+                m_ResizeGeneration,
+                sharedHandle,
+                memorySize,
+                waitSemaphoreHandle,
+                width,
+                height,
+                swapChain);
+
+            m_PendingOutputs.Enqueue(pending);
             m_LastTicket = ticket;
             m_LastFrameIndex = frameIndex;
             m_LastRenderWidth = width;
@@ -455,6 +564,17 @@ public class RenderSurface : IRenderSurface
         }
     }
 
+    private readonly record struct PendingRenderOutput(
+        ulong Ticket,
+        uint FrameIndex,
+        uint ResizeGeneration,
+        IntPtr SharedHandle,
+        ulong MemorySize,
+        IntPtr WaitSemaphoreHandle,
+        uint Width,
+        uint Height,
+        RHISwapChain SwapChain);
+
     private Core.RHI.RHISurface? EnsureNativeSurface()
     {
         if (m_NativeSurface != null)
@@ -465,7 +585,7 @@ public class RenderSurface : IRenderSurface
         var device = RHISystem.GetOrCreateDevice(m_SurfaceId, m_Width, m_Height);
         if (device.IsValid)
         {
-            m_NativeSurface = device.GetSurface();
+            m_NativeSurface = RHISystem.GetSurface(m_SurfaceId);
         }
 
         return m_NativeSurface;
@@ -523,8 +643,19 @@ public class RenderSurface : IRenderSurface
     {
         var swapChainToUse = GetSwapChainForSharedOutputLocked();
         return swapChainToUse is { IsValid: true }
-            ? swapChainToUse.Value.CreateConsumedSemaphoreWin32Handle(frameIndex)
+            ? CreateConsumedSemaphoreHandleLocked(frameIndex, swapChainToUse.Value)
             : IntPtr.Zero;
+    }
+
+    private IntPtr CreateConsumedSemaphoreHandleLocked(uint frameIndex, RHISwapChain swapChain)
+    {
+        var handle = swapChain.CreateConsumedSemaphoreWin32Handle(frameIndex);
+        if (handle != IntPtr.Zero)
+        {
+            m_ConsumedSemaphoreOwners.TryAdd(handle, swapChain);
+        }
+
+        return handle;
     }
 }
 

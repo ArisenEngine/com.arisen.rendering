@@ -371,18 +371,34 @@ public sealed class RenderingRuntimeAssetCooker : IRuntimeAssetCooker
     private static Texture2DVariantKey ParseTextureVariant(string variant)
     {
         string[] parts = variant.Split('.', StringSplitOptions.None);
-        if (parts.Length != 3 ||
+        if (parts.Length is < 3 or > 4 ||
             !Enum.TryParse(parts[0], ignoreCase: true, out Texture2DCookedFormat format) ||
             !Enum.IsDefined(format) ||
             !Enum.TryParse(parts[1], ignoreCase: true, out Texture2DColorSpace colorSpace) ||
             !Enum.IsDefined(colorSpace) ||
-            parts[2] is not ("mips" or "nomips"))
+            parts[2] is not ("mips" or "nomips") ||
+            (parts.Length == 4 && parts[3] != "normalmap"))
         {
             throw new InvalidOperationException(
                 $"[RenderingRuntimeAssetCooker] Texture variant '{variant}' is invalid.");
         }
 
-        return new Texture2DVariantKey(format, colorSpace, parts[2] == "mips");
+        var mipFilter = parts.Length == 4
+            ? Texture2DMipFilter.NormalMap
+            : Texture2DMipFilter.Color;
+        var key = new Texture2DVariantKey(
+            format,
+            colorSpace,
+            parts[2] == "mips",
+            mipFilter);
+        if (mipFilter == Texture2DMipFilter.NormalMap &&
+            colorSpace != Texture2DColorSpace.Linear)
+        {
+            throw new InvalidOperationException(
+                $"[RenderingRuntimeAssetCooker] Texture variant '{variant}' is invalid.");
+        }
+
+        return key;
     }
 
     private static string BuildOutputRelativePath(

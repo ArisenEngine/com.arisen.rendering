@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Threading.Tasks;
+using ArisenKernel.Contracts;
 
 namespace ArisenEngine.Rendering;
 
@@ -32,16 +34,65 @@ public sealed class RHICommandQueue
     /// </summary>
     public void ExecutePending(RenderSubsystem subsystem)
     {
+        Dictionary<IntPtr, ResizeSurfaceCommand>? pendingResizes = null;
+        List<IntPtr>? resizeOrder = null;
+
         while (m_PendingCommands.TryDequeue(out var command))
         {
-            try 
+            if (command is ResizeSurfaceCommand resize)
             {
-                command.Execute(subsystem);
+                pendingResizes ??= new Dictionary<IntPtr, ResizeSurfaceCommand>();
+                resizeOrder ??= new List<IntPtr>();
+                if (pendingResizes.TryAdd(resize.Host, resize))
+                {
+                    resizeOrder.Add(resize.Host);
+                }
+                else
+                {
+                    resize.AbsorbCompletions(pendingResizes[resize.Host]);
+                    pendingResizes[resize.Host] = resize;
+                }
+
+                continue;
             }
-            catch (Exception ex)
+
+            if (pendingResizes != null && resizeOrder != null)
             {
-                ArisenKernel.Diagnostics.KernelLog.Error($"[RHICommandQueue] Failed to execute {command.GetType().Name}: {ex.Message}");
+                ExecutePendingResizes(subsystem, pendingResizes, resizeOrder);
+                pendingResizes.Clear();
+                resizeOrder.Clear();
             }
+
+            ExecuteCommand(subsystem, command);
+        }
+
+        if (pendingResizes != null && resizeOrder != null)
+        {
+            ExecutePendingResizes(subsystem, pendingResizes, resizeOrder);
+        }
+    }
+
+    private static void ExecutePendingResizes(
+        RenderSubsystem subsystem,
+        IReadOnlyDictionary<IntPtr, ResizeSurfaceCommand> pendingResizes,
+        IReadOnlyList<IntPtr> resizeOrder)
+    {
+        for (int index = 0; index < resizeOrder.Count; index++)
+        {
+            ExecuteCommand(subsystem, pendingResizes[resizeOrder[index]]);
+        }
+    }
+
+    private static void ExecuteCommand(RenderSubsystem subsystem, IRHICommand command)
+    {
+        try
+        {
+            command.Execute(subsystem);
+        }
+        catch (Exception ex)
+        {
+            ArisenKernel.Diagnostics.KernelLog.Error(
+                $"[RHICommandQueue] Failed to execute {command.GetType().Name}: {ex.Message}");
         }
     }
 }
@@ -50,57 +101,178 @@ public sealed class RHICommandQueue
 
 public sealed class ResizeSurfaceCommand : IRHICommand
 {
+    private List<TaskCompletionSource<bool>>? m_Completions;
+
     public IntPtr Host { get; }
     public uint Width { get; }
     public uint Height { get; }
 
-    public ResizeSurfaceCommand(IntPtr host, uint width, uint height)
+    public ResizeSurfaceCommand(
+        IntPtr host,
+        uint width,
+        uint height,
+        TaskCompletionSource<bool>? completion = null)
     {
         Host = host;
         Width = width;
         Height = height;
+        if (completion != null)
+        {
+            m_Completions = new List<TaskCompletionSource<bool>>(1) { completion };
+        }
     }
 
     public void Execute(RenderSubsystem subsystem)
     {
-        subsystem.InternalResizeSurface(Host, (int)Width, (int)Height);
+        try
+        {
+            bool resized = subsystem.InternalResizeSurface(Host, (int)Width, (int)Height);
+            Complete(resized);
+        }
+        catch (Exception ex)
+        {
+            Fail(ex);
+            throw;
+        }
+    }
+
+    public void AbsorbCompletions(ResizeSurfaceCommand previous)
+    {
+        if (previous.m_Completions is not { Count: > 0 })
+        {
+            return;
+        }
+
+        m_Completions ??= new List<TaskCompletionSource<bool>>(previous.m_Completions.Count);
+        m_Completions.AddRange(previous.m_Completions);
+        previous.m_Completions.Clear();
+    }
+
+    private void Complete(bool resized)
+    {
+        if (m_Completions == null)
+        {
+            return;
+        }
+
+        foreach (var completion in m_Completions)
+        {
+            completion.TrySetResult(resized);
+        }
+        m_Completions.Clear();
+    }
+
+    private void Fail(Exception exception)
+    {
+        if (m_Completions == null)
+        {
+            return;
+        }
+
+        foreach (var completion in m_Completions)
+        {
+            completion.TrySetException(exception);
+        }
+        m_Completions.Clear();
     }
 }
 
 public sealed class RegisterSurfaceCommand : IRHICommand
 {
+    private readonly TaskCompletionSource<bool>? m_Completion;
+
     public IntPtr Host { get; }
     public string Name { get; }
     public SurfaceType SurfaceType { get; }
     public int Width { get; }
     public int Height { get; }
 
-    public RegisterSurfaceCommand(IntPtr host, string name, SurfaceType type, int width, int height)
+    public RegisterSurfaceCommand(
+        IntPtr host,
+        string name,
+        SurfaceType type,
+        int width,
+        int height,
+        TaskCompletionSource<bool>? completion = null)
     {
         Host = host;
         Name = name;
         SurfaceType = type;
         Width = width;
         Height = height;
+        m_Completion = completion;
     }
 
     public void Execute(RenderSubsystem subsystem)
     {
-        subsystem.InternalRegisterSurface(Host, Name, SurfaceType, Width, Height);
+        try
+        {
+            subsystem.InternalRegisterSurface(Host, Name, SurfaceType, Width, Height);
+            m_Completion?.TrySetResult(true);
+        }
+        catch (Exception exception)
+        {
+            m_Completion?.TrySetException(exception);
+            throw;
+        }
     }
 }
 
 public sealed class UnregisterSurfaceCommand : IRHICommand
 {
+    private readonly TaskCompletionSource<bool>? m_Completion;
+
     public IntPtr Host { get; }
 
-    public UnregisterSurfaceCommand(IntPtr host)
+    public UnregisterSurfaceCommand(
+        IntPtr host,
+        TaskCompletionSource<bool>? completion = null)
     {
         Host = host;
+        m_Completion = completion;
     }
 
     public void Execute(RenderSubsystem subsystem)
     {
-        subsystem.InternalUnregisterSurface(Host);
+        try
+        {
+            m_Completion?.TrySetResult(subsystem.InternalUnregisterSurface(Host));
+        }
+        catch (Exception exception)
+        {
+            m_Completion?.TrySetException(exception);
+            throw;
+        }
+    }
+}
+
+public sealed class RestartGraphicsBackendCommand : IRHICommand
+{
+    private readonly IRHIBackend m_Backend;
+    private readonly RHIBackendRestartOptions m_Options;
+    private readonly TaskCompletionSource<ulong> m_Completion;
+
+    public RestartGraphicsBackendCommand(
+        IRHIBackend backend,
+        RHIBackendRestartOptions options,
+        TaskCompletionSource<ulong> completion)
+    {
+        m_Backend = backend ?? throw new ArgumentNullException(nameof(backend));
+        m_Options = options;
+        m_Completion = completion ?? throw new ArgumentNullException(nameof(completion));
+    }
+
+    public void Execute(RenderSubsystem subsystem)
+    {
+        try
+        {
+            m_Completion.TrySetResult(
+                subsystem.InternalRestartGraphicsBackend(m_Backend, m_Options));
+        }
+        catch (Exception exception)
+        {
+            m_Completion.TrySetException(exception);
+            throw;
+        }
     }
 }

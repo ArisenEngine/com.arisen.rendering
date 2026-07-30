@@ -32,6 +32,7 @@ public sealed class RHIEnvironmentTextureResource : IDisposable
         m_Allocation?.BindlessSamplerIndex ?? RHITexture2DAllocation.InvalidBindlessIndex;
     public float RotationRadians => m_CookedTexture.RotationDegrees * (MathF.PI / 180.0f);
     public float Intensity => m_CookedTexture.Intensity;
+    public OutdoorEnvironmentProfile OutdoorProfile => m_CookedTexture.OutdoorProfile;
     public AssetDependencyStamp DependencyStamp { get; }
     public bool IsValid => m_Allocation is { IsValid: true };
 
