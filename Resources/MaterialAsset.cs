@@ -1136,31 +1136,31 @@ public static class MaterialAssetCooker
                 $"[MaterialAssetCooker] Material asset '{materialGuid}' has asset type '{sourceAsset.AssetType}', expected '{MaterialAssetType}'.");
         }
 
-        var outputPath = assetDatabase.GetCookedArtifactPath(materialGuid, RuntimeVariant, ".material");
         var newestSourceWriteTimeUtc = GetNewestSourceWriteTimeUtc(assetDatabase, materialGuid);
 
-        if (!assetDatabase.TryGetCookedArtifact(materialGuid, RuntimeVariant, out _) ||
-            !File.Exists(outputPath) ||
-            File.GetLastWriteTimeUtc(outputPath) < newestSourceWriteTimeUtc ||
-            !IsCurrentCookedMaterial(outputPath))
+        if (!assetDatabase.TryGetCookedArtifact(
+                materialGuid,
+                RuntimeVariant,
+                out CookedAssetRecord current) ||
+            !File.Exists(current.Path) ||
+            File.GetLastWriteTimeUtc(current.Path) < newestSourceWriteTimeUtc ||
+            !IsCurrentCookedMaterial(current.Path))
         {
-            CookMaterial(assetDatabase, sourceAsset, materialGuid, outputPath);
-        }
+            using CookedArtifactWrite write = assetDatabase.BeginCookedArtifactWrite(
+                materialGuid,
+                RuntimeVariant,
+                ".material");
+            CookMaterial(assetDatabase, sourceAsset, materialGuid, write.OutputPath);
 
-        var outputInfo = new FileInfo(outputPath);
-        if (!outputInfo.Exists || outputInfo.Length <= s_Magic.Length + sizeof(int))
-        {
-            throw new InvalidOperationException(
-                $"[MaterialAssetCooker] Material asset '{materialGuid}' produced no cooked payload.");
-        }
+            var outputInfo = new FileInfo(write.OutputPath);
+            if (!outputInfo.Exists || outputInfo.Length <= s_Magic.Length + sizeof(int))
+            {
+                throw new InvalidOperationException(
+                    $"[MaterialAssetCooker] Material asset '{materialGuid}' produced no cooked payload.");
+            }
 
-        assetDatabase.RegisterCookedArtifact(new CookedAssetRecord(
-            materialGuid,
-            sourceAsset.AssetType,
-            RuntimeVariant,
-            outputInfo.FullName,
-            outputInfo.Length,
-            outputInfo.LastWriteTimeUtc));
+            write.Commit(sourceAsset.AssetType);
+        }
 
         return LoadCooked(assetDatabase, materialGuid);
     }

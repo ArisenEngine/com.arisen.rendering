@@ -9,19 +9,15 @@ public abstract class RenderPipelineAsset : ISerializationCallbackReceiver
 
     internal RenderPipeline InternalCreatePipeline()
     {
-        RenderPipeline pipeline = (RenderPipeline)null;
-
         try
         {
-            pipeline = this.CreatePipeline();
+            return CreatePipeline();
         }
         catch (Exception ex)
         {
             Logger.Error(ex.Message);
             throw;
         }
-
-        return pipeline;
     }
 
 

@@ -34,23 +34,23 @@ public sealed class RHICommandQueue
     /// </summary>
     public void ExecutePending(RenderSubsystem subsystem)
     {
-        Dictionary<IntPtr, ResizeSurfaceCommand>? pendingResizes = null;
-        List<IntPtr>? resizeOrder = null;
+        Dictionary<RenderSurfaceRegistration, ResizeSurfaceCommand>? pendingResizes = null;
+        List<RenderSurfaceRegistration>? resizeOrder = null;
 
         while (m_PendingCommands.TryDequeue(out var command))
         {
             if (command is ResizeSurfaceCommand resize)
             {
-                pendingResizes ??= new Dictionary<IntPtr, ResizeSurfaceCommand>();
-                resizeOrder ??= new List<IntPtr>();
-                if (pendingResizes.TryAdd(resize.Host, resize))
+                pendingResizes ??= new Dictionary<RenderSurfaceRegistration, ResizeSurfaceCommand>();
+                resizeOrder ??= new List<RenderSurfaceRegistration>();
+                if (pendingResizes.TryAdd(resize.Registration, resize))
                 {
-                    resizeOrder.Add(resize.Host);
+                    resizeOrder.Add(resize.Registration);
                 }
                 else
                 {
-                    resize.AbsorbCompletions(pendingResizes[resize.Host]);
-                    pendingResizes[resize.Host] = resize;
+                    resize.AbsorbCompletions(pendingResizes[resize.Registration]);
+                    pendingResizes[resize.Registration] = resize;
                 }
 
                 continue;
@@ -74,8 +74,8 @@ public sealed class RHICommandQueue
 
     private static void ExecutePendingResizes(
         RenderSubsystem subsystem,
-        IReadOnlyDictionary<IntPtr, ResizeSurfaceCommand> pendingResizes,
-        IReadOnlyList<IntPtr> resizeOrder)
+        IReadOnlyDictionary<RenderSurfaceRegistration, ResizeSurfaceCommand> pendingResizes,
+        IReadOnlyList<RenderSurfaceRegistration> resizeOrder)
     {
         for (int index = 0; index < resizeOrder.Count; index++)
         {
@@ -103,17 +103,17 @@ public sealed class ResizeSurfaceCommand : IRHICommand
 {
     private List<TaskCompletionSource<bool>>? m_Completions;
 
-    public IntPtr Host { get; }
+    public RenderSurfaceRegistration Registration { get; }
     public uint Width { get; }
     public uint Height { get; }
 
     public ResizeSurfaceCommand(
-        IntPtr host,
+        RenderSurfaceRegistration registration,
         uint width,
         uint height,
         TaskCompletionSource<bool>? completion = null)
     {
-        Host = host;
+        Registration = registration;
         Width = width;
         Height = height;
         if (completion != null)
@@ -126,7 +126,10 @@ public sealed class ResizeSurfaceCommand : IRHICommand
     {
         try
         {
-            bool resized = subsystem.InternalResizeSurface(Host, (int)Width, (int)Height);
+            bool resized = subsystem.InternalResizeSurface(
+                Registration,
+                (int)Width,
+                (int)Height);
             Complete(resized);
         }
         catch (Exception ex)
@@ -179,7 +182,7 @@ public sealed class ResizeSurfaceCommand : IRHICommand
 
 public sealed class RegisterSurfaceCommand : IRHICommand
 {
-    private readonly TaskCompletionSource<bool>? m_Completion;
+    private readonly TaskCompletionSource<RenderSurfaceRegistration>? m_Completion;
 
     public IntPtr Host { get; }
     public string Name { get; }
@@ -193,7 +196,7 @@ public sealed class RegisterSurfaceCommand : IRHICommand
         SurfaceType type,
         int width,
         int height,
-        TaskCompletionSource<bool>? completion = null)
+        TaskCompletionSource<RenderSurfaceRegistration>? completion = null)
     {
         Host = host;
         Name = name;
@@ -207,8 +210,13 @@ public sealed class RegisterSurfaceCommand : IRHICommand
     {
         try
         {
-            subsystem.InternalRegisterSurface(Host, Name, SurfaceType, Width, Height);
-            m_Completion?.TrySetResult(true);
+            RenderSurfaceRegistration registration = subsystem.InternalRegisterSurface(
+                Host,
+                Name,
+                SurfaceType,
+                Width,
+                Height);
+            m_Completion?.TrySetResult(registration);
         }
         catch (Exception exception)
         {
@@ -222,13 +230,13 @@ public sealed class UnregisterSurfaceCommand : IRHICommand
 {
     private readonly TaskCompletionSource<bool>? m_Completion;
 
-    public IntPtr Host { get; }
+    public RenderSurfaceRegistration Registration { get; }
 
     public UnregisterSurfaceCommand(
-        IntPtr host,
+        RenderSurfaceRegistration registration,
         TaskCompletionSource<bool>? completion = null)
     {
-        Host = host;
+        Registration = registration;
         m_Completion = completion;
     }
 
@@ -236,7 +244,7 @@ public sealed class UnregisterSurfaceCommand : IRHICommand
     {
         try
         {
-            m_Completion?.TrySetResult(subsystem.InternalUnregisterSurface(Host));
+            m_Completion?.TrySetResult(subsystem.InternalUnregisterSurface(Registration));
         }
         catch (Exception exception)
         {

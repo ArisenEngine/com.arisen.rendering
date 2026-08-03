@@ -2,6 +2,9 @@
   "id": "com.arisen.rendering",
   "name": "Arisen Rendering Pipeline",
   "version": "1.0.0",
+  "engine": {
+    "minVersion": "0.1.0"
+  },
   "layer": "domain",
   "author": "Arisen Team",
   "description": "RenderPipeline interfaces, RenderGraph, and low-level shading implementations",

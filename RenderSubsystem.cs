@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
-using System.Collections.Concurrent;
-using System.Runtime.InteropServices;
+using System.Runtime.ExceptionServices;
 using System.Threading.Tasks;
 using ArisenEngine.Core.Diagnostics;
 using ArisenKernel.Lifecycle;
@@ -21,33 +20,15 @@ public class RenderSubsystem : ITickableSubsystem
 {
     public RenderSubsystem()
     {
+        m_SurfaceRegistry = EngineKernel.Instance.RenderSurfaces;
         Instance = this;
     }
 
     public static RenderSubsystem? Instance;
     public static Action? AllSurfacesDestroyed;
-    public event Action<IntPtr>? OutputFrameReady;
-    private static ConcurrentDictionary<IntPtr, SurfaceInfo> s_GlobalSurfaces
-    {
-        get
-        {
-            var addrStr = Environment.GetEnvironmentVariable("ARISEN_SURFACE_REGISTRY_ADDR");
-            if (!string.IsNullOrEmpty(addrStr) && long.TryParse(addrStr, out var addr))
-            {
-                var handle = GCHandle.FromIntPtr(new IntPtr(addr));
-                if (handle.IsAllocated && handle.Target is ConcurrentDictionary<IntPtr, SurfaceInfo> dict)
-                {
-                    return dict;
-                }
-            }
-
-            var newDict = new ConcurrentDictionary<IntPtr, SurfaceInfo>();
-            var newHandle = GCHandle.Alloc(newDict);
-            Environment.SetEnvironmentVariable("ARISEN_SURFACE_REGISTRY_ADDR", ((IntPtr)newHandle).ToInt64().ToString());
-            return newDict;
-        }
-    }
+    public event Action<RenderSurfaceRegistration>? OutputFrameReady;
     
+    private readonly RenderSurfaceRegistry m_SurfaceRegistry;
     private readonly RHICommandQueue m_CommandQueue = new();
     private readonly Dictionary<uint, RenderFrameSubmission> m_Submissions = new();
     private readonly RenderFrameResourceSlotState m_FrameResourceSlots = new();
@@ -56,10 +37,15 @@ public class RenderSubsystem : ITickableSubsystem
     private RenderPipelineAsset? m_CurrentAsset;
     private IRenderPipelineProvider? m_RenderPipelineProvider;
     private IRHIDevice? m_RHIDevice;
+    private RenderDocService? m_RenderDocService;
+#if !ARISEN_ENGINE_EDITOR
     private IWindowProvider? m_WindowProvider;
+#endif
     private IWorldOriginService? m_WorldOriginService;
     private SceneViewCameraOverride? m_SceneViewCameraOverride;
-    private IntPtr m_RuntimeWindowHost;
+#if !ARISEN_ENGINE_EDITOR
+    private RenderSurfaceRegistration m_RuntimeWindowRegistration;
+#endif
 
     // Rendering should typically happen last in the frame
     public int Priority => 100;
@@ -75,8 +61,15 @@ public class RenderSubsystem : ITickableSubsystem
             ?? throw new InvalidOperationException(
                 "[RenderSubsystem] No active workspace manifest is available for render-pipeline selection.");
         m_RenderPipelineProvider = services.GetService<IRenderPipelineProvider>();
+        m_RenderDocService = services.GetService<RenderDocService>();
         m_WorldOriginService = services.GetService<IWorldOriginService>();
         RenderPipelineProviderSelection.Activate(project, m_RenderPipelineProvider);
+        if (RenderDiagnostics.EnabledCategories != RenderDiagnosticCategory.None)
+        {
+            KernelLog.InfoFormat(
+                "[RenderSubsystem] Verbose render diagnostics enabled: {0}.",
+                RenderDiagnostics.EnabledCategories);
+        }
         KernelLog.InfoFormat(
             "[RenderSubsystem] Activated render-pipeline provider '{0}' with settings type '{1}'.",
             m_RenderPipelineProvider.ProviderPackageId,
@@ -89,9 +82,8 @@ public class RenderSubsystem : ITickableSubsystem
             if (windowInfo.SurfaceKind == WindowSurfaceKind.Win32 &&
                 windowInfo.NativeHandle != IntPtr.Zero)
             {
-                m_RuntimeWindowHost = windowInfo.NativeHandle;
-                InternalRegisterExistingSurface(
-                    m_RuntimeWindowHost,
+                m_RuntimeWindowRegistration = InternalRegisterExistingSurface(
+                    windowInfo.NativeHandle,
                     "RuntimeMainWindow",
                     SurfaceType.Window,
                     new RuntimeWindowRenderSurface(windowInfo));
@@ -122,16 +114,24 @@ public class RenderSubsystem : ITickableSubsystem
     public void Tick(float deltaTime)
     {
         using var _ = Profiler.Zone("RenderSubsystem.Tick");
+        RenderSurfaceRegistration processingSurface = default;
 
         try
         {
             // Execute all pending RHI commands (resize, registration) on the Render thread
             // BEFORE starting the frame's rendering work.
             m_CommandQueue.ExecutePending(this);
+            m_RenderDocService?.PollCaptureArtifactPublication();
+            FailCaptureForMissingTarget();
 
             var asset = Graphics.currentRenderPipelineAsset;
-        
-            Logger.Log($"[RenderSubsystem] Tick [Hash:{GetHashCode()}] - Frame {EngineKernel.Instance.CurrentFrameIndex}, Pipeline Asset: {(asset == null ? "NULL" : asset.GetType().Name)}");
+            if (RenderDiagnostics.IsEnabled(RenderDiagnosticCategory.Frame))
+            {
+                Logger.Log(
+                    $"[RenderSubsystem] Tick | Frame: {EngineKernel.Instance.CurrentFrameIndex} | " +
+                    $"PipelineAsset: {(asset == null ? "NULL" : asset.GetType().Name)}");
+            }
+
             if (asset == null)
             {
                 return;
@@ -152,8 +152,9 @@ public class RenderSubsystem : ITickableSubsystem
 
             // 2. Prepare Context and Render per Surface
             WorldPosition renderOrigin = m_WorldOriginService?.CurrentOrigin ?? default;
-            foreach (var surfaceInfo in s_GlobalSurfaces.Values)
+            foreach (var surfaceInfo in m_SurfaceRegistry.Snapshot())
             {
+            processingSurface = surfaceInfo.Registration;
             var surface = surfaceInfo.Surface;
             var device = RHISystem.GetOrCreateDevice(surface.SurfaceId, surface.Width, surface.Height);
             var deviceService = GetRHIDeviceService();
@@ -195,7 +196,7 @@ public class RenderSubsystem : ITickableSubsystem
                     out frameIndex))
             {
                 Profiler.PlotValue("Render.SharedTexturePacingSkipped", 1);
-                if (engineFrameIndex % 60 == 0)
+                if (RenderDiagnostics.IsEnabled(RenderDiagnosticCategory.Frame))
                 {
                     Logger.Log(
                         $"[RenderSubsystem] Shared texture pacing skipped frame | Surface: 0x{surface.SurfaceId:X} | EngineFrame: {engineFrameIndex} | NextOutputFrame: {frameIndex} | LastConsumed: {surface.GetLastConsumedFrameIndex()}");
@@ -217,11 +218,39 @@ public class RenderSubsystem : ITickableSubsystem
                 continue;
             }
 
-            RenderFrameResourceReservation frameResource = AcquireFrameResourceSlot(
-                device,
-                deviceGeneration);
+            RenderFrameResourceReservation frameResource = default;
+            RenderDocCaptureLease captureLease = default;
+            RenderDocCaptureArtifactExpectation captureExpectation = default;
+            bool captureStarted = false;
+            bool captureEnded = false;
+            string captureEndDiagnostic = string.Empty;
+            Exception? frameFailure = null;
             try
             {
+            if (m_RenderDocService != null &&
+                m_RenderDocService.TryClaimCapture(
+                    surfaceInfo.Registration,
+                    out captureLease))
+            {
+                if (!m_RenderDocService.TryStartCapture(
+                        captureLease,
+                        out captureExpectation,
+                        out string startDiagnostic))
+                {
+                    m_RenderDocService.FailCapture(
+                        captureLease,
+                        RenderDocCaptureFailureStage.CaptureStart,
+                        startDiagnostic);
+                }
+                else
+                {
+                    captureStarted = true;
+                }
+            }
+
+            frameResource = AcquireFrameResourceSlot(
+                device,
+                deviceGeneration);
             var arena = FrameArena.Instance;
             Span<MeshDrawCommand> frameDrawList = Span<MeshDrawCommand>.Empty;
             Span<StaticMeshRenderItem> frameStaticMeshItems = Span<StaticMeshRenderItem>.Empty;
@@ -449,7 +478,7 @@ public class RenderSubsystem : ITickableSubsystem
                      Profiler.PlotValue("Render.OriginY", snapshot.RenderOrigin.Y);
                      Profiler.PlotValue("Render.OriginZ", snapshot.RenderOrigin.Z);
 
-                    if (frameIndex % 60 == 0)
+                    if (RenderDiagnostics.IsEnabled(RenderDiagnosticCategory.Frame))
                     {
                         Logger.Log($"[RenderSubsystem] FrameSnapshot | Frame: {snapshot.FrameIndex} | Surface: 0x{snapshot.SurfaceId:X} | Size: {snapshot.Width}x{snapshot.Height} | Cameras: {snapshot.CameraCount} | DirectionalLights: {snapshot.DirectionalLightCount}/{directionalLightStats.EnabledCount} enabled ({directionalLightStats.SourceCount} source) | PointLights: {snapshot.PointLightCount}/{pointLightStats.EnabledCount} enabled ({pointLightStats.SourceCount} source) | SpotLights: {snapshot.SpotLightCount}/{spotLightStats.EnabledCount} enabled ({spotLightStats.SourceCount} source) | Environments: {snapshot.SceneEnvironmentCount}/{sceneEnvironmentStats.EnabledCount} enabled ({sceneEnvironmentStats.SourceCount} source) | Draws: {snapshot.DrawListCount} | StaticMeshItems: {snapshot.StaticMeshItemCount} | Output: {snapshot.OutputKind}");
                         if (directionalLightStats.DroppedCount > 0)
@@ -481,68 +510,120 @@ public class RenderSubsystem : ITickableSubsystem
                         }
                     }
 
-                    // B11: RenderDoc Integration
-                    // If a capture was requested (e.g. from the Editor UI), we wrap the engine work
-                    // with Start/End capture calls. RenderDocService uses NULL/NULL wildcards
-                    // to match the single Vulkan device (virtual surfaces have no HWND).
-                    var rd = ArisenKernel.Lifecycle.EngineKernel.Instance.Services.GetService<RenderDocService>();
-                    bool requestCapture = rd?.IsCaptureRequested ?? false;
+                    ticket = m_CurrentPipeline.InternalRender(context);
 
-                    if (requestCapture)
-                    {
-                        rd?.StartCapture();
-                    }
-
-                    try
-                    {
-                        ticket = m_CurrentPipeline.InternalRender(context);
-                    }
-                    finally
-                    {
-                        if (requestCapture)
-                        {
-                            rd?.EndCapture();
-                            rd?.ClearCaptureRequest();
-                            Logger.Log("[RenderSubsystem] RenderDoc capture completed.");
-                        }
-                    }
-
-                    // Phase 2 Optimization: Precision synchronization.
-                    // Instead of stalling the CPU here (which slows down the simulation),
-                    // we pass the ticket to the surface so the consumer (Editor Viewport)
-                    // can perform a targeted asynchronous wait.
-                    if (concreteSurface != null && ticket != 0)
-                    {
-                        var pid = System.Diagnostics.Process.GetCurrentProcess().Id;
-                        var sharedHandle = surface.GetSharedHandle(context.FrameIndex);
-                        if (frameIndex % 60 == 0 || ticket > 0)
-                            Logger.Info($"[ArisenViewportControl] PID: {pid}, Frame {frameIndex} Status: Ticket {ticket}, Handle 0x{sharedHandle.ToInt64():X}, SubsystemHash: {GetHashCode()}, IsGlobalInstance: {this == Instance}");
-
-                        // B11: Ticket update must be atomic for the UI thread's polling loop
-                        lock (concreteSurface)
-                        {
-                            concreteSurface.SetLastRenderTicket(ticket, context.FrameIndex, context.Width, context.Height, swapChain);
-                            if (frameIndex % 60 == 0)
-                                Logger.Log($"[RenderSubsystem] SetLastRenderTicket for Host {surfaceInfo.Parent}: {ticket}");
-                        }
-                    }
                 }
             }
 
                 // Finalize output work and signal presentation.
-                submission.End();
-                if (outputKind == RenderOutputKind.EditorSharedTexture &&
+                bool framePresented = submission.End();
+                if (framePresented &&
+                    outputKind == RenderOutputKind.EditorSharedTexture &&
                     concreteSurface != null &&
                     ticket != 0)
                 {
-                    NotifyOutputFrameReady(surfaceInfo.Parent);
+                    if (RenderDiagnostics.IsEnabled(RenderDiagnosticCategory.Frame))
+                    {
+                        var sharedHandle = surface.GetSharedHandle(frameIndex);
+                        Logger.Info(
+                            $"[RenderSubsystem] Shared output | PID: {Environment.ProcessId} | " +
+                            $"Host: 0x{surfaceInfo.Parent.ToInt64():X} | Frame: {frameIndex} | " +
+                            $"Ticket: {ticket} | Handle: 0x{sharedHandle.ToInt64():X}");
+                    }
+
+                    concreteSurface.SetLastRenderTicket(
+                        ticket,
+                        frameIndex,
+                        surface.Width,
+                        surface.Height,
+                        swapChain);
+                    submission.CommitOutput();
+                    NotifyOutputFrameReady(surfaceInfo.Registration);
                 }
             }
-            finally
+            catch (Exception ex)
             {
-                m_FrameResourceSlots.Complete(frameResource, submission.LastTicket);
+                frameFailure = ex;
+            }
+
+            if (captureStarted && m_RenderDocService != null)
+            {
+                captureEnded = m_RenderDocService.TryEndCapture(
+                    out captureEndDiagnostic);
+            }
+
+            try
+            {
+                submission.Retire();
+            }
+            catch (Exception ex)
+            {
+                frameFailure = RenderFrameFailureAggregator.Append(frameFailure, "retirement", ex);
+            }
+
+            if (frameResource.IsValid)
+            {
+                try
+                {
+                    m_FrameResourceSlots.Complete(frameResource, submission.LastTicket);
+                }
+                catch (Exception ex)
+                {
+                    frameFailure = RenderFrameFailureAggregator.Append(
+                        frameFailure,
+                        "resource completion",
+                        ex);
+                }
+            }
+
+            if (captureStarted && m_RenderDocService != null)
+            {
+                if (frameFailure != null)
+                {
+                    string failureDiagnostic =
+                        $"Target surface frame failed with {frameFailure.GetType().Name}: {frameFailure.Message}";
+                    if (!captureEnded)
+                    {
+                        failureDiagnostic +=
+                            $" EndFrameCapture also failed: {captureEndDiagnostic}";
+                    }
+
+                    m_RenderDocService.FailCapture(
+                        captureLease,
+                        RenderDocCaptureFailureStage.SurfaceFrame,
+                        failureDiagnostic);
+                }
+                else if (!captureEnded)
+                {
+                    m_RenderDocService.FailCapture(
+                        captureLease,
+                        RenderDocCaptureFailureStage.CaptureEnd,
+                        captureEndDiagnostic);
+                }
+                else
+                {
+                    m_RenderDocService.BeginArtifactPublication(
+                        captureExpectation,
+                        captureEndDiagnostic);
+                }
+            }
+
+            if (frameFailure != null)
+            {
+                ExceptionDispatchInfo.Capture(frameFailure).Throw();
             }
             }
+            }
+        catch (Exception exception)
+        {
+            if (processingSurface.IsValid)
+            {
+                m_RenderDocService?.ReportSurfaceFrameFailure(
+                    processingSurface,
+                    exception);
+            }
+
+            throw;
         }
         finally
         {
@@ -550,19 +631,14 @@ public class RenderSubsystem : ITickableSubsystem
         }
     }
 
-    public void RegisterSurface(IntPtr host, string name, SurfaceType surfaceType, int width = 0, int height = 0)
-    {
-        m_CommandQueue.Enqueue(new RegisterSurfaceCommand(host, name, surfaceType, width, height));
-    }
-
-    public Task<bool> RegisterSurfaceAsync(
+    public Task<RenderSurfaceRegistration> RegisterSurfaceAsync(
         IntPtr host,
         string name,
         SurfaceType surfaceType,
         int width = 0,
         int height = 0)
     {
-        var completion = new TaskCompletionSource<bool>(
+        var completion = new TaskCompletionSource<RenderSurfaceRegistration>(
             TaskCreationOptions.RunContinuationsAsynchronously);
         m_CommandQueue.Enqueue(new RegisterSurfaceCommand(
             host,
@@ -590,109 +666,128 @@ public class RenderSubsystem : ITickableSubsystem
         System.Threading.Volatile.Write(ref m_SceneViewCameraOverride, null);
     }
 
-    private void NotifyOutputFrameReady(IntPtr host)
+    private void NotifyOutputFrameReady(RenderSurfaceRegistration registration)
     {
         try
         {
-            OutputFrameReady?.Invoke(host);
+            OutputFrameReady?.Invoke(registration);
         }
         catch (Exception ex)
         {
             KernelLog.WarningFormat(
-                "[RenderSubsystem] Output-ready subscriber failed for host 0x{0:X}: {1}",
-                host.ToInt64(),
+                "[RenderSubsystem] Output-ready subscriber failed for host 0x{0:X}, generation {1}: {2}",
+                registration.Host.ToInt64(),
+                registration.Generation,
                 ex.Message);
         }
     }
 
-    internal void InternalRegisterSurface(IntPtr host, string name, SurfaceType surfaceType, int width = 0, int height = 0)
+    internal RenderSurfaceRegistration InternalRegisterSurface(
+        IntPtr host,
+        string name,
+        SurfaceType surfaceType,
+        int width = 0,
+        int height = 0)
     {
         using var _ = Profiler.Zone("RenderSubsystem.InternalRegisterSurface");
-        if (!s_GlobalSurfaces.ContainsKey(host))
+        var surface = new RenderSurface(host, name, width, height);
+        try
         {
-            var surface = new RenderSurface(host, name, width, height);
-            s_GlobalSurfaces.TryAdd(host, new SurfaceInfo()
-            {
-                Name = name,
-                Parent = host,
-                Surface = surface,
-                SurfaceType = surfaceType
-            });
-
-            return;
+            return m_SurfaceRegistry.Register(host, name, surfaceType, surface);
         }
+        catch (Exception registrationError)
+        {
+            try
+            {
+                surface.DisposeSurface();
+            }
+            catch (Exception disposalError)
+            {
+                throw new AggregateException(
+                    "Render surface registration failed and provisional surface disposal also failed.",
+                    registrationError,
+                    disposalError);
+            }
 
-        throw new Exception($"Same host : {host} already added");
+            throw;
+        }
     }
 
-    internal void InternalRegisterExistingSurface(IntPtr host, string name, SurfaceType surfaceType, IRenderSurface surface)
+    internal RenderSurfaceRegistration InternalRegisterExistingSurface(
+        IntPtr host,
+        string name,
+        SurfaceType surfaceType,
+        IRenderSurface surface)
     {
         using var _ = Profiler.Zone("RenderSubsystem.InternalRegisterExistingSurface");
-        if (!s_GlobalSurfaces.ContainsKey(host))
-        {
-            s_GlobalSurfaces.TryAdd(host, new SurfaceInfo()
-            {
-                Name = name,
-                Parent = host,
-                Surface = surface,
-                SurfaceType = surfaceType
-            });
-
-            return;
-        }
-
-        throw new Exception($"Same host : {host} already added");
+        return m_SurfaceRegistry.Register(host, name, surfaceType, surface);
     }
 
-    public void ResizeSurface(IntPtr host, int width, int height)
+    public void ResizeSurface(
+        RenderSurfaceRegistration registration,
+        int width,
+        int height)
     {
-        m_CommandQueue.Enqueue(new ResizeSurfaceCommand(host, (uint)width, (uint)height));
+        m_CommandQueue.Enqueue(new ResizeSurfaceCommand(
+            registration,
+            (uint)Math.Max(1, width),
+            (uint)Math.Max(1, height)));
     }
 
-    public Task<bool> ResizeSurfaceAsync(IntPtr host, int width, int height)
+    public Task<bool> ResizeSurfaceAsync(
+        RenderSurfaceRegistration registration,
+        int width,
+        int height)
     {
         var completion = new TaskCompletionSource<bool>(
             TaskCreationOptions.RunContinuationsAsynchronously);
         m_CommandQueue.Enqueue(new ResizeSurfaceCommand(
-            host,
+            registration,
             (uint)Math.Max(1, width),
             (uint)Math.Max(1, height),
             completion));
         return completion.Task;
     }
 
-    internal bool InternalResizeSurface(IntPtr host, int width, int height)
+    internal bool InternalResizeSurface(
+        RenderSurfaceRegistration registration,
+        int width,
+        int height)
     {
-        if (s_GlobalSurfaces.TryGetValue(host, out var surface))
+        if (m_SurfaceRegistry.TryGet(registration, out var surface))
         {
             var resizedWidth = Math.Max(1, width);
             var resizedHeight = Math.Max(1, height);
             surface.Surface.Resize((uint)resizedWidth, (uint)resizedHeight);
             Logger.Log(
-                $"[RenderSubsystem] Processed surface resize | Host: 0x{host.ToInt64():X} | Name: {surface.Name} | Size: {resizedWidth}x{resizedHeight}");
+                $"[RenderSubsystem] Processed surface resize | Host: 0x{registration.Host.ToInt64():X} | " +
+                $"Generation: {registration.Generation} | Name: {surface.Name} | Size: {resizedWidth}x{resizedHeight}");
             return true;
         }
 
         KernelLog.WarningFormat(
-            "[RenderSubsystem] Ignored resize for unknown surface. Host=0x{0:X}, RequestedSize={1}x{2}",
-            host.ToInt64(),
+            "[RenderSubsystem] Ignored resize for stale or unknown surface. Host=0x{0:X}, Generation={1}, RequestedSize={2}x{3}",
+            registration.Host.ToInt64(),
+            registration.Generation,
             width,
             height);
         return false;
     }
 
-    public IntPtr GetSurfaceSharedHandle(IntPtr host, uint frameIndex)
+    public IntPtr GetSurfaceSharedHandle(
+        RenderSurfaceRegistration registration,
+        uint frameIndex)
     {
-        if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
+        if (m_SurfaceRegistry.TryGet(registration, out var surfaceInfo))
         {
             return surfaceInfo.Surface.GetSharedHandle(frameIndex);
         }
         return IntPtr.Zero;
     }
 
-    public ulong GetLastRenderTicket(IntPtr host)
+    public ulong GetLastRenderTicket(RenderSurfaceRegistration registration)
     {
-        if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
+        if (m_SurfaceRegistry.TryGet(registration, out var surfaceInfo))
         {
             // B11: Ticket read must be atomic
             lock (surfaceInfo.Surface)
@@ -705,18 +800,20 @@ public class RenderSubsystem : ITickableSubsystem
         return 0;
     }
 
-    public uint GetLastRenderFrameIndex(IntPtr host)
+    public uint GetLastRenderFrameIndex(RenderSurfaceRegistration registration)
     {
-        if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
+        if (m_SurfaceRegistry.TryGet(registration, out var surfaceInfo))
         {
             return surfaceInfo.Surface.GetLastRenderFrameIndex();
         }
         return 0;
     }
 
-    public bool GetOutputInfo(IntPtr host, out RenderOutputInfo info)
+    public bool GetOutputInfo(
+        RenderSurfaceRegistration registration,
+        out RenderOutputInfo info)
     {
-        if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
+        if (m_SurfaceRegistry.TryGet(registration, out var surfaceInfo))
         {
             info = surfaceInfo.Surface.GetOutputInfo();
             return true;
@@ -726,25 +823,31 @@ public class RenderSubsystem : ITickableSubsystem
         return false;
     }
 
-    public void ReleaseConsumedSemaphoreHandle(IntPtr host, IntPtr handle)
+    public void ReleaseConsumedSemaphoreHandle(
+        RenderSurfaceRegistration registration,
+        IntPtr handle)
     {
-        if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
+        if (m_SurfaceRegistry.TryGet(registration, out var surfaceInfo))
         {
             surfaceInfo.Surface.ReleaseConsumedSemaphoreHandle(handle);
         }
     }
 
-    public void CompleteConsumedSemaphoreHandle(IntPtr host, IntPtr handle)
+    public void CompleteConsumedSemaphoreHandle(
+        RenderSurfaceRegistration registration,
+        IntPtr handle)
     {
-        if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
+        if (m_SurfaceRegistry.TryGet(registration, out var surfaceInfo))
         {
             surfaceInfo.Surface.CompleteConsumedSemaphoreHandle(handle);
         }
     }
 
-    public bool ReportConsumedFrameIndex(IntPtr host, uint frameIndex)
+    public bool ReportConsumedFrameIndex(
+        RenderSurfaceRegistration registration,
+        uint frameIndex)
     {
-        if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
+        if (m_SurfaceRegistry.TryGet(registration, out var surfaceInfo))
         {
             surfaceInfo.Surface.ReportConsumedFrameIndex(frameIndex);
             return true;
@@ -753,71 +856,83 @@ public class RenderSubsystem : ITickableSubsystem
         return false;
     }
 
-    public uint GetLastConsumedFrameIndex(IntPtr host)
+    public uint GetLastConsumedFrameIndex(RenderSurfaceRegistration registration)
     {
-        return s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo)
+        return m_SurfaceRegistry.TryGet(registration, out var surfaceInfo)
             ? surfaceInfo.Surface.GetLastConsumedFrameIndex()
             : 0;
     }
 
-    public uint GetLastRenderWidth(IntPtr host)
+    public uint GetLastRenderWidth(RenderSurfaceRegistration registration)
     {
-        if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo) && surfaceInfo.Surface is RenderSurface concrete)
+        if (m_SurfaceRegistry.TryGet(registration, out var surfaceInfo) &&
+            surfaceInfo.Surface is RenderSurface concrete)
         {
             return concrete.GetLastRenderWidth();
         }
         return 0;
     }
 
-    public uint GetLastRenderHeight(IntPtr host)
+    public uint GetLastRenderHeight(RenderSurfaceRegistration registration)
     {
-        if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo) && surfaceInfo.Surface is RenderSurface concrete)
+        if (m_SurfaceRegistry.TryGet(registration, out var surfaceInfo) &&
+            surfaceInfo.Surface is RenderSurface concrete)
         {
             return concrete.GetLastRenderHeight();
         }
         return 0;
     }
 
-    public System.Threading.Tasks.Task WaitForRenderTicketAsync(IntPtr host, ulong ticket)
+    public Task WaitForRenderTicketAsync(
+        RenderSurfaceRegistration registration,
+        ulong ticket)
     {
-        if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
+        if (m_SurfaceRegistry.TryGet(registration, out var surfaceInfo))
         {
             return surfaceInfo.Surface.WaitForRenderTicketAsync(ticket);
         }
-        return System.Threading.Tasks.Task.CompletedTask;
+        return Task.CompletedTask;
     }
 
-    public void UnregisterSurface(IntPtr host)
+    public void UnregisterSurface(RenderSurfaceRegistration registration)
     {
-        m_CommandQueue.Enqueue(new UnregisterSurfaceCommand(host));
+        m_CommandQueue.Enqueue(new UnregisterSurfaceCommand(registration));
     }
 
-    public Task<bool> UnregisterSurfaceAsync(IntPtr host)
+    public Task<bool> UnregisterSurfaceAsync(RenderSurfaceRegistration registration)
     {
         var completion = new TaskCompletionSource<bool>(
             TaskCreationOptions.RunContinuationsAsynchronously);
-        m_CommandQueue.Enqueue(new UnregisterSurfaceCommand(host, completion));
+        m_CommandQueue.Enqueue(new UnregisterSurfaceCommand(registration, completion));
         return completion.Task;
     }
 
-    internal bool InternalUnregisterSurface(IntPtr host)
+    internal bool InternalUnregisterSurface(RenderSurfaceRegistration registration)
     {
-        if (s_GlobalSurfaces.TryGetValue(host, out var surfaceInfo))
+        if (m_SurfaceRegistry.TryGet(registration, out var surfaceInfo))
         {
             m_Submissions.Remove(surfaceInfo.Surface.SurfaceId);
-            surfaceInfo.Surface.DisposeSurface();
-            s_GlobalSurfaces.TryRemove(host, out _);
-
-            if (s_GlobalSurfaces.Count == 0)
+            try
             {
-                AllSurfacesDestroyed?.Invoke();
+                return m_SurfaceRegistry.Unregister(registration);
             }
-            return true;
+            finally
+            {
+                if (!m_SurfaceRegistry.TryGet(registration, out _))
+                {
+                    m_RenderDocService?.ReportSurfaceUnregistered(registration);
+                }
+                if (m_SurfaceRegistry.Count == 0)
+                {
+                    AllSurfacesDestroyed?.Invoke();
+                }
+            }
         }
 
         KernelLog.WarningFormat(
-            "[RenderSubsystem] Ignored unregister for unknown surface. Host=0x{0:X}",
-            host.ToInt64());
+            "[RenderSubsystem] Ignored unregister for stale or unknown surface. Host=0x{0:X}, Generation={1}",
+            registration.Host.ToInt64(),
+            registration.Generation);
         return false;
     }
 
@@ -839,10 +954,10 @@ public class RenderSubsystem : ITickableSubsystem
         RHIBackendRestartOptions options)
     {
         using var _ = Profiler.Zone("RenderSubsystem.RestartGraphicsBackend");
-        if (s_GlobalSurfaces.Count != 0)
+        if (m_SurfaceRegistry.Count != 0)
         {
             throw new InvalidOperationException(
-                $"Graphics backend restart requires every render surface to be removed; {s_GlobalSurfaces.Count} remain.");
+                $"Graphics backend restart requires every render surface to be removed; {m_SurfaceRegistry.Count} remain.");
         }
         if (!backend.IsInitialized)
         {
@@ -887,6 +1002,7 @@ public class RenderSubsystem : ITickableSubsystem
 
     public void Shutdown()
     {
+        var failures = new List<Exception>();
 #if !ARISEN_ENGINE_EDITOR
         if (m_WindowProvider != null)
         {
@@ -894,25 +1010,45 @@ public class RenderSubsystem : ITickableSubsystem
             m_WindowProvider = null;
         }
 
-        m_RuntimeWindowHost = IntPtr.Zero;
+        m_RuntimeWindowRegistration = default;
 #endif
 
-        foreach (var surface in s_GlobalSurfaces.Values)
-        {
-            surface.Surface.DisposeSurface();
-        }
-        s_GlobalSurfaces.Clear();
+        m_RenderDocService?.PollCaptureArtifactPublication();
+        m_RenderDocService?.ReportRenderSubsystemShutdown();
+        TryShutdownAction(failures, "render-surface drain", () => m_SurfaceRegistry.Drain());
         m_Submissions.Clear();
         m_FrameResourceSlots.Reset();
 
-        m_CurrentPipeline?.Dispose();
+        RenderPipeline? pipeline = m_CurrentPipeline;
         m_CurrentPipeline = null;
         m_CurrentAsset = null;
+        if (pipeline != null)
+        {
+            TryShutdownAction(failures, "render-pipeline disposal", pipeline.Dispose);
+        }
         ClearSceneViewCameraOverride();
-        m_RenderPipelineProvider?.ReleaseDeviceResources();
-        m_RenderPipelineProvider?.Deactivate();
+        IRenderPipelineProvider? pipelineProvider = m_RenderPipelineProvider;
         m_RenderPipelineProvider = null;
+        if (pipelineProvider != null)
+        {
+            TryShutdownAction(
+                failures,
+                "render-pipeline device-resource release",
+                pipelineProvider.ReleaseDeviceResources);
+            TryShutdownAction(
+                failures,
+                "render-pipeline deactivation",
+                pipelineProvider.Deactivate);
+        }
         m_RHIDevice = null;
+        m_RenderDocService = null;
+
+        if (failures.Count != 0)
+        {
+            throw new AggregateException(
+                "Render subsystem shutdown completed with one or more cleanup errors.",
+                failures);
+        }
     }
 
     private IRHIDevice GetRHIDeviceService()
@@ -933,6 +1069,23 @@ public class RenderSubsystem : ITickableSubsystem
         return device;
     }
 
+    private void FailCaptureForMissingTarget()
+    {
+        RenderDocService? renderDoc = m_RenderDocService;
+        if (renderDoc == null)
+        {
+            return;
+        }
+
+        RenderDocCaptureRequestSnapshot request = renderDoc.CaptureRequest;
+        if ((request.Status is RenderDocCaptureRequestStatus.Pending or
+                RenderDocCaptureRequestStatus.Capturing) &&
+            !m_SurfaceRegistry.TryGet(request.Target, out _))
+        {
+            renderDoc.ReportSurfaceUnregistered(request.Target);
+        }
+    }
+
     public void Dispose()
     {
         Shutdown();
@@ -941,21 +1094,38 @@ public class RenderSubsystem : ITickableSubsystem
 #if !ARISEN_ENGINE_EDITOR
     private void OnRuntimeWindowResized(WindowResizeInfo resizeInfo)
     {
-        if (m_RuntimeWindowHost == IntPtr.Zero) return;
+        if (!m_RuntimeWindowRegistration.IsValid) return;
         ResizeSurface(
-            m_RuntimeWindowHost,
+            m_RuntimeWindowRegistration,
             Math.Max(1, resizeInfo.Width),
             Math.Max(1, resizeInfo.Height));
     }
 #endif
 
-    private struct SurfaceInfo
+    private static void TryShutdownAction(
+        List<Exception> failures,
+        string operation,
+        Action action)
     {
-        public string Name;
-        public IntPtr Parent;
-        public IRenderSurface Surface;
-        public SurfaceType SurfaceType;
-        public uint SurfaceId => Surface.SurfaceId;
+        try
+        {
+            action();
+        }
+        catch (AggregateException aggregate)
+        {
+            foreach (Exception failure in aggregate.Flatten().InnerExceptions)
+            {
+                failures.Add(new InvalidOperationException(
+                    $"Render subsystem {operation} failed.",
+                    failure));
+            }
+        }
+        catch (Exception failure)
+        {
+            failures.Add(new InvalidOperationException(
+                $"Render subsystem {operation} failed.",
+                failure));
+        }
     }
 
     private RenderFrameSubmission GetOrCreateSubmission(uint surfaceId)

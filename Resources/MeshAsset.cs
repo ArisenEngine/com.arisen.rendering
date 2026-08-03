@@ -114,30 +114,27 @@ public static class MeshAssetCooker
                 $"[MeshAssetCooker] Mesh asset '{mesh.Guid}' has asset type '{sourceAsset.AssetType}', expected '{MeshAssetType}'.");
         }
 
-        var outputPath = assetDatabase.GetCookedArtifactPath(mesh.Guid, variant, ".mesh");
         var sourceWriteTimeUtc = GetSourceDependencyWriteTimeUtc(sourceAsset.SourcePath, mesh.SourceFormat);
 
-        if (!assetDatabase.TryGetCookedArtifact(mesh.Guid, variant, out _) ||
-            !File.Exists(outputPath) ||
-            File.GetLastWriteTimeUtc(outputPath) < sourceWriteTimeUtc ||
-            !IsCurrentCookedMesh(outputPath))
+        if (!assetDatabase.TryGetCookedArtifact(mesh.Guid, variant, out CookedAssetRecord current) ||
+            !File.Exists(current.Path) ||
+            File.GetLastWriteTimeUtc(current.Path) < sourceWriteTimeUtc ||
+            !IsCurrentCookedMesh(current.Path))
         {
-            CookMesh(sourceAsset, mesh, variant, outputPath);
-        }
+            using CookedArtifactWrite write = assetDatabase.BeginCookedArtifactWrite(
+                mesh.Guid,
+                variant,
+                ".mesh");
+            CookMesh(sourceAsset, mesh, variant, write.OutputPath);
 
-        var outputInfo = new FileInfo(outputPath);
-        if (!outputInfo.Exists || outputInfo.Length <= HeaderSize)
-        {
-            throw new InvalidOperationException($"[MeshAssetCooker] Mesh asset '{mesh.Guid}' produced no cooked payload.");
-        }
+            var outputInfo = new FileInfo(write.OutputPath);
+            if (!outputInfo.Exists || outputInfo.Length <= HeaderSize)
+            {
+                throw new InvalidOperationException($"[MeshAssetCooker] Mesh asset '{mesh.Guid}' produced no cooked payload.");
+            }
 
-        assetDatabase.RegisterCookedArtifact(new CookedAssetRecord(
-            mesh.Guid,
-            sourceAsset.AssetType,
-            variant,
-            outputInfo.FullName,
-            outputInfo.Length,
-            outputInfo.LastWriteTimeUtc));
+            write.Commit(sourceAsset.AssetType);
+        }
 
         return LoadCooked(assetDatabase, mesh, variant);
     }

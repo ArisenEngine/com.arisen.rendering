@@ -6,12 +6,12 @@ namespace ArisenEngine.Rendering;
 public class Mesh : IDisposable
 {
     private RHIDevice m_Device;
-    private VertexBuffer m_VertexBuffer;
-    private IndexBuffer m_IndexBuffer;
+    private VertexBuffer? m_VertexBuffer;
+    private IndexBuffer? m_IndexBuffer;
     private string m_Name;
 
-    public VertexBuffer VertexBuffer => m_VertexBuffer;
-    public IndexBuffer IndexBuffer => m_IndexBuffer;
+    public VertexBuffer? VertexBuffer => m_VertexBuffer;
+    public IndexBuffer? IndexBuffer => m_IndexBuffer;
     public string Name => m_Name;
 
     public Mesh(RHIDevice device, string name = "Mesh")

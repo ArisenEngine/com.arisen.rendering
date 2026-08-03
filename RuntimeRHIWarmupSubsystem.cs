@@ -6,7 +6,9 @@ namespace ArisenEngine.Rendering;
 
 public sealed class RuntimeRHIWarmupSubsystem : IEngineSubsystem
 {
+#if !ARISEN_ENGINE_EDITOR
     private IRHIBackend? m_Backend;
+#endif
 
     public int Priority => 0;
     public EnginePhase InitPhase => EnginePhase.PostInit;

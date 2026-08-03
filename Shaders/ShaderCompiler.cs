@@ -87,7 +87,7 @@ namespace ArisenEngine.ShaderLab
                             options.OptimizeLevel ?? "0",
                             IntPtr.Zero, 0,
                             IntPtr.Zero, 0,
-                            string.IsNullOrWhiteSpace(outputPath) ? null : outputPath,
+                            outputPath,
                             options.UseDXLayout.HasValue && options.UseDXLayout.Value);
                     }
                     else
@@ -105,7 +105,7 @@ namespace ArisenEngine.ShaderLab
                                 options.OptimizeLevel ?? "0",
                                 defAlloc.Length > 0 ? (IntPtr)pDef : IntPtr.Zero, defines.Count,
                                 incAlloc.Length > 0 ? (IntPtr)pInc : IntPtr.Zero, includes.Count,
-                                string.IsNullOrWhiteSpace(outputPath) ? null : outputPath,
+                                outputPath,
                                 options.UseDXLayout.HasValue && options.UseDXLayout.Value);
                         }
                     }

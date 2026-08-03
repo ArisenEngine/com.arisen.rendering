@@ -11,8 +11,6 @@ namespace ArisenEngine.Rendering;
 /// </summary>
 internal sealed class RenderFrameSubmission
 {
-    private const uint DiagnosticsFrameInterval = 60;
-
     private RHIDevice m_Device;
     private RHISwapChain m_SwapChain;
     private uint m_SurfaceId;
@@ -20,10 +18,7 @@ internal sealed class RenderFrameSubmission
     private uint m_Width;
     private uint m_Height;
     private RenderOutputKind m_OutputKind;
-    private bool m_Acquired;
-    private bool m_FrameCompleteSignaled;
-    private int m_SubmitCount;
-    private ulong m_LastTicket;
+    private readonly RenderFrameSubmissionState m_State = new();
     private readonly RenderTargetImageStateTracker m_TargetImageState = new();
 
     public uint SurfaceId => m_SurfaceId;
@@ -34,9 +29,9 @@ internal sealed class RenderFrameSubmission
     public RHIImageHandle TargetImage { get; private set; } = RHIImageHandle.Invalid;
     public bool TargetImageRequiresInitialization { get; private set; }
     public RHISwapChain SwapChain => m_SwapChain;
-    public ulong LastTicket => m_LastTicket;
-    public int SubmitCount => m_SubmitCount;
-    public bool HasAcquiredFrame => m_Acquired;
+    public ulong LastTicket => m_State.LastTicket;
+    public int SubmitCount => m_State.SubmitCount;
+    public bool HasAcquiredFrame => m_State.HasFrameOwnership;
 
     public bool Begin(
         RHIDevice device,
@@ -49,6 +44,13 @@ internal sealed class RenderFrameSubmission
     {
         using var _ = Profiler.Zone("RenderSubmission.BeginFrame");
 
+        if (m_State.HasFrameOwnership || m_State.RetirementPending)
+        {
+            throw new InvalidOperationException(
+                $"Render submission for surface 0x{m_SurfaceId:X} still owns frame {m_FrameIndex}.");
+        }
+
+        m_State.ResetForBegin();
         m_Device = device;
         m_SwapChain = swapChain;
         m_SurfaceId = surfaceId;
@@ -56,10 +58,6 @@ internal sealed class RenderFrameSubmission
         m_FrameIndex = frameIndex;
         m_Width = width;
         m_Height = height;
-        m_SubmitCount = 0;
-        m_LastTicket = 0;
-        m_FrameCompleteSignaled = false;
-        m_Acquired = false;
         TargetImage = RHIImageHandle.Invalid;
         TargetImageRequiresInitialization = false;
 
@@ -76,17 +74,21 @@ internal sealed class RenderFrameSubmission
         }
 
         TargetImage = m_SwapChain.BeginFrame(frameIndex);
-        m_Acquired = TargetImage.IsValid;
+        bool acquired = TargetImage.IsValid;
+        if (acquired)
+        {
+            m_State.MarkAcquired();
+        }
         TargetImageRequiresInitialization = m_TargetImageState.RequiresInitialization(TargetImage);
-        Profiler.PlotValue("RenderSubmission.AcquireSucceeded", m_Acquired ? 1 : 0);
+        Profiler.PlotValue("RenderSubmission.AcquireSucceeded", acquired ? 1 : 0);
 
-        if (!m_Acquired)
+        if (!acquired)
         {
             LogSkippedAcquire("swapchain did not return a valid image");
             return false;
         }
 
-        if (ShouldLogDiagnostics())
+        if (RenderDiagnostics.IsEnabled(RenderDiagnosticCategory.Submission))
         {
             Logger.Log(
                 $"[RenderSubmission] BeginFrame | Surface: 0x{m_SurfaceId:X} | Frame: {m_FrameIndex} | " +
@@ -101,7 +103,7 @@ internal sealed class RenderFrameSubmission
     {
         using var _ = Profiler.Zone("RenderSubmission.SubmitGraphics");
 
-        if (!m_Acquired)
+        if (!m_State.HasFrameOwnership)
         {
             throw new InvalidOperationException(
                 $"Render submission for surface 0x{m_SurfaceId:X} attempted to submit before acquiring a frame.");
@@ -113,59 +115,96 @@ internal sealed class RenderFrameSubmission
                 $"Render submission for surface 0x{m_SurfaceId:X} received an invalid graphics command buffer.");
         }
 
+        m_State.ValidateSubmit(waitForFrameAcquire, signalFrameComplete);
         var waitSwapChain = waitForFrameAcquire ? m_SwapChain : (RHISwapChain?)null;
         var signalSwapChain = signalFrameComplete ? m_SwapChain : (RHISwapChain?)null;
-        m_LastTicket = m_Device.Submit(
+        ulong ticket = m_Device.Submit(
             commandBuffer,
             waitSwapChain,
             signalSwapChain,
             m_FrameIndex);
-        m_SubmitCount++;
-        m_FrameCompleteSignaled |= signalFrameComplete;
+        m_State.CommitSubmit(ticket, waitForFrameAcquire, signalFrameComplete);
 
-        return m_LastTicket;
+        return ticket;
     }
 
-    public void End()
+    public bool End()
     {
         using var _ = Profiler.Zone("RenderSubmission.EndFrame");
 
-        Profiler.PlotValue("RenderSubmission.SubmitCount", m_SubmitCount);
-        Profiler.PlotValue("RenderSubmission.LastTicket", m_LastTicket);
+        Profiler.PlotValue("RenderSubmission.SubmitCount", m_State.SubmitCount);
+        Profiler.PlotValue("RenderSubmission.LastTicket", m_State.LastTicket);
         Profiler.PlotValue("RenderSubmission.Presented", 0);
 
-        if (!m_Acquired)
+        RenderFrameEndAction endAction = m_State.GetEndAction();
+        if (endAction == RenderFrameEndAction.None)
         {
-            return;
+            return false;
         }
 
-        if (m_SubmitCount == 0)
+        if (endAction == RenderFrameEndAction.Retire)
         {
+            string reason = m_State.SubmitCount == 0
+                ? "no submitted command buffers"
+                : "frame completion was not signaled";
             KernelLog.WarningFormat(
-                "[RenderSubmission] Skipped present. Surface=0x{0:X}, Frame={1}, Reason=no submitted command buffers",
+                "[RenderSubmission] Skipped present. Surface=0x{0:X}, Frame={1}, Reason={2}",
                 m_SurfaceId,
-                m_FrameIndex);
-            return;
-        }
-
-        if (!m_FrameCompleteSignaled)
-        {
-            KernelLog.WarningFormat(
-                "[RenderSubmission] Skipped present. Surface=0x{0:X}, Frame={1}, Reason=frame completion was not signaled",
-                m_SurfaceId,
-                m_FrameIndex);
-            return;
+                m_FrameIndex,
+                reason);
+            Retire();
+            return false;
         }
 
         m_SwapChain.EndFrame(m_FrameIndex);
+        m_State.MarkPresented();
         m_TargetImageState.MarkInitialized(TargetImage);
         Profiler.PlotValue("RenderSubmission.Presented", 1);
 
-        if (ShouldLogDiagnostics())
+        if (RenderDiagnostics.IsEnabled(RenderDiagnosticCategory.Submission))
         {
             Logger.Log(
                 $"[RenderSubmission] EndFrame | Surface: 0x{m_SurfaceId:X} | Frame: {m_FrameIndex} | " +
-                $"Submits: {m_SubmitCount} | LastTicket: {m_LastTicket}");
+                $"Submits: {m_State.SubmitCount} | LastTicket: {m_State.LastTicket}");
+        }
+
+        if (m_OutputKind == RenderOutputKind.NativeSwapchain)
+        {
+            CommitOutput();
+        }
+
+        return true;
+    }
+
+    public void CommitOutput()
+    {
+        if (!m_State.HasFrameOwnership ||
+            m_State.Phase != RenderFrameSubmissionPhase.Presented)
+        {
+            throw new InvalidOperationException(
+                $"Render submission for surface 0x{m_SurfaceId:X} cannot commit an unpresented frame.");
+        }
+
+        m_State.CommitOutput();
+    }
+
+    public void Retire()
+    {
+        if (!m_State.TryBeginRetirement())
+        {
+            return;
+        }
+
+        try
+        {
+            using var _ = Profiler.Zone("RenderSubmission.RetireFrame");
+            ulong retirementTicket = m_SwapChain.RetireFrame(m_FrameIndex);
+            m_State.CommitRetirement(retirementTicket);
+        }
+        catch
+        {
+            m_State.CancelRetirement();
+            throw;
         }
     }
 
@@ -173,7 +212,7 @@ internal sealed class RenderFrameSubmission
     {
         Profiler.PlotValue("RenderSubmission.AcquireSucceeded", 0);
 
-        if (ShouldLogDiagnostics())
+        if (RenderDiagnostics.IsEnabled(RenderDiagnosticCategory.Submission))
         {
             KernelLog.WarningFormat(
                 "[RenderSubmission] Skipped frame acquire. Surface=0x{0:X}, Frame={1}, Size={2}x{3}, Reason={4}",
@@ -185,8 +224,4 @@ internal sealed class RenderFrameSubmission
         }
     }
 
-    private bool ShouldLogDiagnostics()
-    {
-        return m_FrameIndex % DiagnosticsFrameInterval == 0;
-    }
 }

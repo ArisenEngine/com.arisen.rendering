@@ -4,8 +4,8 @@ namespace ArisenEngine.Rendering;
 
 public static class Graphics
 {
-    internal static RenderPipelineAsset currentRenderPipelineAsset;
-    public static RenderPipelineAsset CurrentRenderPipelineAsset => currentRenderPipelineAsset;
+    internal static RenderPipelineAsset? currentRenderPipelineAsset;
+    public static RenderPipelineAsset? CurrentRenderPipelineAsset => currentRenderPipelineAsset;
 
     public static void SetCurrentRenderPipeline(RenderPipelineAsset? asset)
     {

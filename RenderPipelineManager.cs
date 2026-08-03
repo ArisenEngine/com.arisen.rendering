@@ -2,14 +2,14 @@ namespace ArisenEngine.Rendering;
 
 public static class RenderPipelineManager
 {
-    static RenderPipelineAsset s_CurrentPipelineAsset;
+    private static RenderPipelineAsset? s_CurrentPipelineAsset;
 
-    public static RenderPipeline currentPipeline { get; private set; }
+    public static RenderPipeline? currentPipeline { get; private set; }
 
-    public static event Action<Camera[]> beginFrameRendering;
-    public static event Action<Camera> beginCameraRendering;
-    public static event Action<Camera[]> endFrameRendering;
-    public static event Action<Camera> endCameraRendering;
+    public static event Action<Camera[]>? beginFrameRendering;
+    public static event Action<Camera>? beginCameraRendering;
+    public static event Action<Camera[]>? endFrameRendering;
+    public static event Action<Camera>? endCameraRendering;
 
     static void PrepareRenderPipeline(RenderPipelineAsset pipelineAsset)
     {
