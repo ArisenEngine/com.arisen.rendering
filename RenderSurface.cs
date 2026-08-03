@@ -221,11 +221,11 @@ public class RenderSurface : IRenderSurface
 
             if (m_DisposeStarted)
             {
-                while (!m_IsDisposed)
+                while (m_DisposeStarted && !m_IsDisposed)
                 {
                     Monitor.Wait(m_LifetimeLock);
                 }
-                return;
+                if (m_IsDisposed) return;
             }
 
             m_DisposeStarted = true;
@@ -235,6 +235,7 @@ public class RenderSurface : IRenderSurface
             }
         }
 
+        bool releaseCommitted = false;
         try
         {
             lock (m_OutputLock)
@@ -248,12 +249,6 @@ public class RenderSurface : IRenderSurface
                 }
 
                 m_ConsumedSemaphoreOwners.Clear();
-                m_LastTicket = 0;
-                m_LastRenderSwapChain = null;
-                m_CachedSwapChain = null;
-                m_PendingOutputs.Clear();
-                m_NativeSurface = null;
-                m_FramePacing.Reset();
 
                 if ((m_SurfaceId & RHISystem.VirtualSurfaceIDMask) == 0)
                 {
@@ -263,15 +258,24 @@ public class RenderSurface : IRenderSurface
                 {
                     RHISystem.RemoveDevice(m_SurfaceId);
                 }
+
+                m_LastTicket = 0;
+                m_LastRenderSwapChain = null;
+                m_CachedSwapChain = null;
+                m_PendingOutputs.Clear();
+                m_NativeSurface = null;
+                m_FramePacing.Reset();
             }
 
             Surfaces.Remove(this);
+            releaseCommitted = true;
         }
         finally
         {
             lock (m_LifetimeLock)
             {
-                m_IsDisposed = true;
+                m_DisposeStarted = false;
+                m_IsDisposed = releaseCommitted;
                 Monitor.PulseAll(m_LifetimeLock);
             }
         }

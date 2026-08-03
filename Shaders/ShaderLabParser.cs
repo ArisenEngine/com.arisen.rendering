@@ -12,7 +12,7 @@ public class ShaderLabParser
 {
     private Lexer m_Lexer;
     private Preprocessor m_Preprocessor;
-    private SubShader _lastParsedSubShader = null;
+    private SubShader? _lastParsedSubShader;
     private readonly string m_BaseDir = string.Empty;
 
     public ShaderLabParser(string code)
@@ -30,8 +30,8 @@ public class ShaderLabParser
 
     private Token Current => m_Lexer.Peek();
     private Token Next() => m_Lexer.Next();
-    private bool Match(TokenType type, string text = null) => m_Lexer.Match(type, text);
-    private Token Expect(TokenType type, string text = null) => m_Lexer.Expect(type, text);
+    private bool Match(TokenType type, string? text = null) => m_Lexer.Match(type, text);
+    private Token Expect(TokenType type, string? text = null) => m_Lexer.Expect(type, text);
 
     public ShaderLabShader ParseGraphicsShader()
     {
@@ -388,7 +388,7 @@ public class ShaderLabParser
         return subShader;
     }
 
-    RenderStateValue ParseRenderStateFactor()
+    private RenderStateValue? ParseRenderStateFactor()
     {
         if (Match(TokenType.Symbol, "["))
         {

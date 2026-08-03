@@ -135,31 +135,28 @@ public static class Texture2DAssetCooker
                 $"[Texture2DAssetCooker] Texture asset '{texture.Guid}' has asset type '{sourceAsset.AssetType}', expected '{TextureAssetType}'.");
         }
 
-        var outputPath = assetDatabase.GetCookedArtifactPath(texture.Guid, variant, ".texture2d");
         var sourceWriteTimeUtc = File.GetLastWriteTimeUtc(sourceAsset.SourcePath);
 
-        if (!assetDatabase.TryGetCookedArtifact(texture.Guid, variant, out _) ||
-            !File.Exists(outputPath) ||
-            File.GetLastWriteTimeUtc(outputPath) < sourceWriteTimeUtc ||
-            !HasCompatibleCookedArtifact(outputPath, texture.Variant))
+        if (!assetDatabase.TryGetCookedArtifact(texture.Guid, variant, out CookedAssetRecord current) ||
+            !File.Exists(current.Path) ||
+            File.GetLastWriteTimeUtc(current.Path) < sourceWriteTimeUtc ||
+            !HasCompatibleCookedArtifact(current.Path, texture.Variant))
         {
-            CookTexture(sourceAsset, texture, variant, outputPath);
-        }
+            using CookedArtifactWrite write = assetDatabase.BeginCookedArtifactWrite(
+                texture.Guid,
+                variant,
+                ".texture2d");
+            CookTexture(sourceAsset, texture, variant, write.OutputPath);
 
-        var outputInfo = new FileInfo(outputPath);
-        if (!outputInfo.Exists || outputInfo.Length <= HeaderSize)
-        {
-            throw new InvalidOperationException(
-                $"[Texture2DAssetCooker] Texture asset '{texture.Guid}' produced no cooked payload.");
-        }
+            var outputInfo = new FileInfo(write.OutputPath);
+            if (!outputInfo.Exists || outputInfo.Length <= HeaderSize)
+            {
+                throw new InvalidOperationException(
+                    $"[Texture2DAssetCooker] Texture asset '{texture.Guid}' produced no cooked payload.");
+            }
 
-        assetDatabase.RegisterCookedArtifact(new CookedAssetRecord(
-            texture.Guid,
-            sourceAsset.AssetType,
-            variant,
-            outputInfo.FullName,
-            outputInfo.Length,
-            outputInfo.LastWriteTimeUtc));
+            write.Commit(sourceAsset.AssetType);
+        }
 
         return LoadCooked(assetDatabase, texture, variant);
     }

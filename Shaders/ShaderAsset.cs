@@ -170,30 +170,27 @@ public static class ShaderAssetCooker
                 $"[ShaderAssetCooker] Shader asset '{shader.Guid}' has asset type '{sourceAsset.AssetType}', expected '{ShaderSourceAssetType}'.");
         }
 
-        var outputPath = assetDatabase.GetCookedArtifactPath(shader.Guid, variant, GetCookedExtension(shader.Variant.Backend));
         var newestSourceWriteTimeUtc = GetNewestSourceWriteTimeUtc(sourceAsset.SourcePath, shader.Includes);
 
-        if (!assetDatabase.TryGetCookedArtifact(shader.Guid, variant, out _) ||
-            !File.Exists(outputPath) ||
-            File.GetLastWriteTimeUtc(outputPath) < newestSourceWriteTimeUtc)
+        if (!assetDatabase.TryGetCookedArtifact(shader.Guid, variant, out CookedAssetRecord current) ||
+            !File.Exists(current.Path) ||
+            File.GetLastWriteTimeUtc(current.Path) < newestSourceWriteTimeUtc)
         {
-            CookStage(sourceAsset, shader, stage, variant, outputPath);
-        }
+            using CookedArtifactWrite write = assetDatabase.BeginCookedArtifactWrite(
+                shader.Guid,
+                variant,
+                GetCookedExtension(shader.Variant.Backend));
+            CookStage(sourceAsset, shader, stage, variant, write.OutputPath);
 
-        var outputInfo = new FileInfo(outputPath);
-        if (!outputInfo.Exists || outputInfo.Length == 0)
-        {
-            throw new InvalidOperationException(
-                $"[ShaderAssetCooker] Shader asset '{shader.Guid}' stage '{stage.Name}' produced no cooked bytecode.");
-        }
+            var outputInfo = new FileInfo(write.OutputPath);
+            if (!outputInfo.Exists || outputInfo.Length == 0)
+            {
+                throw new InvalidOperationException(
+                    $"[ShaderAssetCooker] Shader asset '{shader.Guid}' stage '{stage.Name}' produced no cooked bytecode.");
+            }
 
-        assetDatabase.RegisterCookedArtifact(new CookedAssetRecord(
-            shader.Guid,
-            sourceAsset.AssetType,
-            variant,
-            outputInfo.FullName,
-            outputInfo.Length,
-            outputInfo.LastWriteTimeUtc));
+            write.Commit(sourceAsset.AssetType);
+        }
 
         return LoadCookedStage(assetDatabase, shader, stage, variant);
     }

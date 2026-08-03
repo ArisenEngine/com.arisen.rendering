@@ -25,7 +25,7 @@ public enum TokenType
 public class Token
 {
     public TokenType type;
-    public string text;
+    public string text = string.Empty;
 
     public int line;
 
@@ -227,7 +227,7 @@ public class Lexer
         return m_Tokens[m_Index++];
     }
 
-    public bool Match(TokenType type, string text = null)
+    public bool Match(TokenType type, string? text = null)
     {
         var t = Peek();
         if (t.type != type)
@@ -237,7 +237,7 @@ public class Lexer
         return true;
     }
 
-    public Token Expect(TokenType type, string text = null)
+    public Token Expect(TokenType type, string? text = null)
     {
         var t = Next();
         if (t.type != type || (text != null && t.text != text))

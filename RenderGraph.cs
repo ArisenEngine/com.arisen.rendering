@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -16,8 +17,6 @@ namespace ArisenEngine.Rendering;
 
 public sealed class RenderGraph : IDisposable
 {
-    private const uint DiagnosticsFrameInterval = 60;
-
     private readonly struct RenderGraphCullingResult
     {
         public RenderGraphCullingResult(uint[] culledNodeIds, string[] culledPassNames)
@@ -51,6 +50,29 @@ public sealed class RenderGraph : IDisposable
         public RenderGraphCullingResult Culling { get; }
     }
 
+    private readonly struct RecordedCommandBufferLease
+    {
+        public RecordedCommandBufferLease(
+            RHICommandBufferPool pool,
+            RHICommandBuffer commandBuffer,
+            uint frameResourceIndex)
+        {
+            Pool = pool;
+            CommandBuffer = commandBuffer;
+            FrameResourceIndex = frameResourceIndex;
+        }
+
+        public RHICommandBufferPool Pool { get; }
+        public RHICommandBuffer CommandBuffer { get; }
+        public uint FrameResourceIndex { get; }
+        public bool IsValid => Pool.IsValid && CommandBuffer.IsValid;
+
+        public void Release()
+        {
+            Pool.ReleaseCommandBuffer(FrameResourceIndex, CommandBuffer.RHIHandle);
+        }
+    }
+
     private struct ResourceAccessState
     {
         public RenderPassNode? LastWriter;
@@ -72,7 +94,7 @@ public sealed class RenderGraph : IDisposable
     private readonly HashSet<string> m_FrameTransientTextureNames = new(StringComparer.Ordinal);
     private readonly Dictionary<uint, int> m_PassWorkItemCounts = new();
     private readonly List<uint> m_ActivePassNodeIds = new();
-    private readonly Dictionary<uint, RHICommandBuffer[]> m_CommandBuffers = new();
+    private readonly Dictionary<uint, RecordedCommandBufferLease[]> m_CommandBuffers = new();
     private readonly ConcurrentQueue<Exception> m_RecordingErrors = new();
     private readonly ITaskGraph m_TaskSystem;
     private readonly DeferredRenderResourceDisposalQueue? m_DisposalQueue;
@@ -397,8 +419,9 @@ public sealed class RenderGraph : IDisposable
     {
         var factory = context.Device.GetFactory();
         m_Factory = factory; // B1: Store factory for safe resource cleanup on Dispose
-        var diagnosticsEnabled = ShouldLogDiagnostics(context);
         var layout = GetOrCompileLayout(out var compileCacheHit);
+        bool diagnosticsEnabled = RenderDiagnostics.IsEnabled(RenderDiagnosticCategory.Graph) &&
+            (!m_DiagnosticsLoggedOnce || !compileCacheHit);
 
         try
         {
@@ -581,7 +604,66 @@ public sealed class RenderGraph : IDisposable
         uint surfaceId,
         bool diagnosticsEnabled)
     {
-        m_CommandBuffers.Clear();
+        var pendingReleaseFailures = ReleaseRecordedCommandBuffers();
+        if (pendingReleaseFailures.Length > 0)
+        {
+            throw new AggregateException(
+                "RenderGraph could not release command buffers retained by the previous execution.",
+                pendingReleaseFailures);
+        }
+
+        var lastTicket = 0UL;
+        Exception? executionFailure = null;
+
+        try
+        {
+            lastTicket = ExecuteCompiledCore(
+                context,
+                factory,
+                layout,
+                transitionPlan,
+                surfaceId,
+                diagnosticsEnabled);
+        }
+        catch (Exception ex)
+        {
+            executionFailure = ex;
+        }
+
+        var releaseFailures = ReleaseRecordedCommandBuffers();
+        if (executionFailure != null)
+        {
+            if (releaseFailures.Length > 0)
+            {
+                var failures = new Exception[releaseFailures.Length + 1];
+                failures[0] = executionFailure;
+                Array.Copy(releaseFailures, 0, failures, 1, releaseFailures.Length);
+                throw new AggregateException(
+                    "RenderGraph execution and command-buffer release both failed.",
+                    failures);
+            }
+
+            ExceptionDispatchInfo.Capture(executionFailure).Throw();
+        }
+
+        if (releaseFailures.Length > 0)
+        {
+            throw new AggregateException(
+                "RenderGraph command-buffer release failed after execution.",
+                releaseFailures);
+        }
+
+        return lastTicket;
+    }
+
+    private ulong ExecuteCompiledCore(
+        RenderContext context,
+        RHIFactory factory,
+        CompiledRenderGraphLayout layout,
+        RenderGraphResourceTransition[] transitionPlan,
+        uint surfaceId,
+        bool diagnosticsEnabled)
+    {
         m_RecordingErrors.Clear();
         var scheduledWorkItems = 0;
         var submittedWorkItems = 0;
@@ -610,14 +692,14 @@ public sealed class RenderGraph : IDisposable
 
                 if (workItemCount <= 0)
                 {
-                    m_CommandBuffers[node.Id] = Array.Empty<RHICommandBuffer>();
+                    m_CommandBuffers[node.Id] = Array.Empty<RecordedCommandBufferLease>();
                     skippedPasses++;
                     layerSkippedPasses++;
                     AppendLayerDiagnostic(layerDiagnostics, node, 0);
                     continue;
                 }
 
-                var nodeCommandBuffers = new RHICommandBuffer[workItemCount];
+                var nodeCommandBuffers = new RecordedCommandBufferLease[workItemCount];
                 m_CommandBuffers[node.Id] = nodeCommandBuffers;
                 scheduledWorkItems += workItemCount;
                 layerWorkItems += workItemCount;
@@ -661,7 +743,10 @@ public sealed class RenderGraph : IDisposable
 
                             // Request a unique command buffer for this frame
                             var cmdBuffer = pool.GetCommandBuffer(context.FrameResourceIndex);
-                            nodeCommandBuffers[capturedWorkItemIndex] = cmdBuffer;
+                            nodeCommandBuffers[capturedWorkItemIndex] = new RecordedCommandBufferLease(
+                                pool,
+                                cmdBuffer,
+                                context.FrameResourceIndex);
 
                             // Ensure the command buffer is in the recording state
                             cmdBuffer.Begin();
@@ -730,7 +815,7 @@ public sealed class RenderGraph : IDisposable
                     var waitForFrameAcquire = submittedWorkItems == 0;
                     var signalFrameComplete = submittedWorkItems == scheduledWorkItems - 1;
                     lastTicket = context.Submission.SubmitGraphics(
-                        buffers[i],
+                        buffers[i].CommandBuffer,
                         waitForFrameAcquire,
                         signalFrameComplete);
                     submittedWorkItems++;
@@ -748,9 +833,43 @@ public sealed class RenderGraph : IDisposable
         return lastTicket;
     }
 
-    private bool ShouldLogDiagnostics(RenderContext context)
+    private Exception[] ReleaseRecordedCommandBuffers()
     {
-        return !m_DiagnosticsLoggedOnce || context.FrameIndex % DiagnosticsFrameInterval == 0;
+        List<Exception>? failures = null;
+
+        foreach (var entry in m_CommandBuffers)
+        {
+            var leases = entry.Value;
+            for (int i = 0; i < leases.Length; i++)
+            {
+                var lease = leases[i];
+                if (!lease.IsValid)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    lease.Release();
+                    leases[i] = default;
+                }
+                catch (Exception ex)
+                {
+                    failures ??= new List<Exception>();
+                    failures.Add(new InvalidOperationException(
+                        $"RenderGraph failed to release command buffer for pass node {entry.Key}, work item {i}.",
+                        ex));
+                }
+            }
+        }
+
+        if (failures == null)
+        {
+            m_CommandBuffers.Clear();
+            return Array.Empty<Exception>();
+        }
+
+        return failures.ToArray();
     }
 
     private void RecordPlannedTransitionsForPass(
@@ -861,25 +980,12 @@ public sealed class RenderGraph : IDisposable
         RenderResourceState state,
         bool isSource)
     {
-        bool initializeTarget = isSource && context.TargetImageRequiresInitialization;
         return state switch
         {
-            RenderResourceState.OutputOwnership => new RenderFrameColorRhiState(
-                isSource &&
-                (context.OutputKind != RenderOutputKind.EditorSharedTexture || initializeTarget)
-                    ? EImageLayout.IMAGE_LAYOUT_UNDEFINED
-                    : EImageLayout.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                isSource || context.OutputKind == RenderOutputKind.EditorSharedTexture
-                    ? EAccessFlag.ACCESS_NONE
-                    : EAccessFlag.ACCESS_TRANSFER_READ_BIT,
-                context.OutputKind == RenderOutputKind.EditorSharedTexture && !initializeTarget
-                    ? RHIQueueFamily.External
-                    : RHIQueueFamily.Ignored,
-                isSource
-                    ? EPipelineStageFlagBits.PIPELINE_STAGE_TOP_OF_PIPE_BIT
-                    : (context.OutputKind == RenderOutputKind.EditorSharedTexture
-                        ? EPipelineStageFlagBits.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
-                        : EPipelineStageFlagBits.PIPELINE_STAGE_TRANSFER_BIT)),
+            RenderResourceState.OutputOwnership => RenderFrameColorOutputPolicy.Resolve(
+                context.OutputKind,
+                context.TargetImageRequiresInitialization,
+                isSource),
             RenderResourceState.ColorAttachment => new RenderFrameColorRhiState(
                 EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 EAccessFlag.ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -903,26 +1009,6 @@ public sealed class RenderGraph : IDisposable
             _ => throw new InvalidOperationException(
                 $"FrameColor does not support graph transition state '{state}'.")
         };
-    }
-
-    private readonly struct RenderFrameColorRhiState
-    {
-        public RenderFrameColorRhiState(
-            EImageLayout layout,
-            EAccessFlag access,
-            uint queueFamily,
-            EPipelineStageFlagBits stage)
-        {
-            Layout = layout;
-            Access = access;
-            QueueFamily = queueFamily;
-            Stage = stage;
-        }
-
-        public EImageLayout Layout { get; }
-        public EAccessFlag Access { get; }
-        public uint QueueFamily { get; }
-        public EPipelineStageFlagBits Stage { get; }
     }
 
     private static bool TryBuildTransientTextureBarrier(

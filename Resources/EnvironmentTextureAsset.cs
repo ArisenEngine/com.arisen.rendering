@@ -467,33 +467,30 @@ public static class EnvironmentTextureAssetCooker
                 $"[EnvironmentTextureAssetCooker] Environment texture asset '{asset.Guid}' was not found.");
         }
 
-        var outputPath = assetDatabase.GetCookedArtifactPath(asset.Guid, variant, ".environment");
         var dependencyWriteTimeUtc = AssetDependencyTracker.GetEnvironmentTextureDependencyWriteTimeUtc(
             assetDatabase,
             asset);
 
-        if (!assetDatabase.TryGetCookedArtifact(asset.Guid, variant, out _) ||
-            !File.Exists(outputPath) ||
-            File.GetLastWriteTimeUtc(outputPath) < dependencyWriteTimeUtc ||
-            !HasCurrentCookedVersion(outputPath))
+        if (!assetDatabase.TryGetCookedArtifact(asset.Guid, variant, out CookedAssetRecord current) ||
+            !File.Exists(current.Path) ||
+            File.GetLastWriteTimeUtc(current.Path) < dependencyWriteTimeUtc ||
+            !HasCurrentCookedVersion(current.Path))
         {
-            CookTexture(assetDatabase, asset, variant, outputPath);
-        }
+            using CookedArtifactWrite write = assetDatabase.BeginCookedArtifactWrite(
+                asset.Guid,
+                variant,
+                ".environment");
+            CookTexture(assetDatabase, asset, variant, write.OutputPath);
 
-        var outputInfo = new FileInfo(outputPath);
-        if (!outputInfo.Exists || outputInfo.Length <= HeaderSize)
-        {
-            throw new InvalidOperationException(
-                $"[EnvironmentTextureAssetCooker] Environment texture asset '{asset.Guid}' produced no cooked payload.");
-        }
+            var outputInfo = new FileInfo(write.OutputPath);
+            if (!outputInfo.Exists || outputInfo.Length <= HeaderSize)
+            {
+                throw new InvalidOperationException(
+                    $"[EnvironmentTextureAssetCooker] Environment texture asset '{asset.Guid}' produced no cooked payload.");
+            }
 
-        assetDatabase.RegisterCookedArtifact(new CookedAssetRecord(
-            asset.Guid,
-            sourceAsset.AssetType,
-            variant,
-            outputInfo.FullName,
-            outputInfo.Length,
-            outputInfo.LastWriteTimeUtc));
+            write.Commit(sourceAsset.AssetType);
+        }
 
         return LoadCooked(assetDatabase, asset, variant);
     }
