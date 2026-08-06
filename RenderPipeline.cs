@@ -60,9 +60,25 @@ public abstract class RenderPipeline : IDisposable
         }
 
         // 3. Execution Phase: Record parallel commands and submit to GPU.
-        var submittedTicket = m_RenderGraph.Execute(context);
-        m_OutputReadbackPass?.Complete(context, submittedTicket);
-        OnFrameSubmitted(context, submittedTicket);
+        ulong ticketBeforeExecution = context.Submission.LastTicket;
+        ulong submittedTicket;
+        try
+        {
+            submittedTicket = m_RenderGraph.Execute(context);
+        }
+        catch (Exception executionFailure)
+        {
+            var failedSubmissionActions = new PostSubmissionActions(this, context);
+            RenderFramePostSubmission.ThrowExecutionFailure(
+                ref failedSubmissionActions,
+                ticketBeforeExecution,
+                context.Submission.LastTicket,
+                executionFailure);
+            throw;
+        }
+
+        var postSubmissionActions = new PostSubmissionActions(this, context);
+        RenderFramePostSubmission.Execute(ref postSubmissionActions, submittedTicket);
         return submittedTicket;
     }
 
@@ -121,6 +137,33 @@ public abstract class RenderPipeline : IDisposable
             visualSummaryService.IsEnabled)
         {
             m_OutputReadbackPass = new RenderOutputReadbackPass(visualSummaryService);
+        }
+    }
+
+    private readonly struct PostSubmissionActions : IRenderFramePostSubmissionActions
+    {
+        private readonly RenderPipeline m_Pipeline;
+        private readonly RenderContext m_Context;
+
+        public PostSubmissionActions(RenderPipeline pipeline, RenderContext context)
+        {
+            m_Pipeline = pipeline;
+            m_Context = context;
+        }
+
+        public void NotifyFrameSubmitted(ulong submittedTicket)
+        {
+            m_Pipeline.OnFrameSubmitted(m_Context, submittedTicket);
+        }
+
+        public void CompleteReadback(ulong submittedTicket)
+        {
+            m_Pipeline.m_OutputReadbackPass?.Complete(m_Context, submittedTicket);
+        }
+
+        public void AbortReadback(Exception executionFailure)
+        {
+            m_Pipeline.m_OutputReadbackPass?.Abort(executionFailure);
         }
     }
 }

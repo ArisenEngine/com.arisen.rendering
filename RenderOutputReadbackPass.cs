@@ -240,6 +240,28 @@ internal sealed class RenderOutputReadbackPass : RenderPassNode, IDisposable
         }
     }
 
+    public void Abort(Exception executionFailure)
+    {
+        ArgumentNullException.ThrowIfNull(executionFailure);
+        if (!m_CapturePending)
+        {
+            return;
+        }
+
+        try
+        {
+            m_Service.ReportFailure(
+                m_Capture,
+                $"Render graph execution failed before visual-summary readback completion: " +
+                $"{executionFailure.GetType().Name}: {executionFailure.Message}");
+        }
+        finally
+        {
+            m_CapturePending = false;
+            m_Capture = default;
+        }
+    }
+
     public void Dispose()
     {
         if (m_Disposed)

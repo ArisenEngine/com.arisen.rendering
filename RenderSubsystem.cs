@@ -205,20 +205,31 @@ public class RenderSubsystem : ITickableSubsystem
                 continue;
             }
 
+            RenderFrameResourceReservation frameResource = AcquireFrameResourceSlot(
+                device,
+                deviceGeneration);
             var submission = GetOrCreateSubmission(surface.SurfaceId);
-            if (!submission.Begin(
-                    device,
-                    swapChain,
-                    surface.SurfaceId,
-                    outputKind,
-                    frameIndex,
-                    surface.Width,
-                    surface.Height))
+            try
             {
-                continue;
+                if (!submission.Begin(
+                        device,
+                        swapChain,
+                        surface.SurfaceId,
+                        outputKind,
+                        frameIndex,
+                        surface.Width,
+                        surface.Height))
+                {
+                    m_FrameResourceSlots.Cancel(frameResource);
+                    continue;
+                }
+            }
+            catch
+            {
+                m_FrameResourceSlots.Cancel(frameResource);
+                throw;
             }
 
-            RenderFrameResourceReservation frameResource = default;
             RenderDocCaptureLease captureLease = default;
             RenderDocCaptureArtifactExpectation captureExpectation = default;
             bool captureStarted = false;
@@ -248,9 +259,6 @@ public class RenderSubsystem : ITickableSubsystem
                 }
             }
 
-            frameResource = AcquireFrameResourceSlot(
-                device,
-                deviceGeneration);
             var arena = FrameArena.Instance;
             Span<MeshDrawCommand> frameDrawList = Span<MeshDrawCommand>.Empty;
             Span<StaticMeshRenderItem> frameStaticMeshItems = Span<StaticMeshRenderItem>.Empty;
