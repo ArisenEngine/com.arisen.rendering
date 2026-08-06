@@ -420,6 +420,7 @@ public sealed class RenderGraph : IDisposable
         var factory = context.Device.GetFactory();
         m_Factory = factory; // B1: Store factory for safe resource cleanup on Dispose
         var layout = GetOrCompileLayout(out var compileCacheHit);
+        ulong ticketBeforeExecution = context.Submission.LastTicket;
         bool diagnosticsEnabled = RenderDiagnostics.IsEnabled(RenderDiagnosticCategory.Graph) &&
             (!m_DiagnosticsLoggedOnce || !compileCacheHit);
 
@@ -457,11 +458,14 @@ public sealed class RenderGraph : IDisposable
 
             var submittedTicket = ExecuteCompiled(context, factory, layout, transitionPlan, surfaceId, diagnosticsEnabled);
             UpdateTransientTextureStates(m_ActivePassNodeIds);
-            m_LastSubmittedTicket = submittedTicket;
             return submittedTicket;
         }
         finally
         {
+            RenderGraphSubmissionTicketTracker.CommitAcceptedTicket(
+                ref m_LastSubmittedTicket,
+                ticketBeforeExecution,
+                context.Submission.LastTicket);
             // Clear transient frame graph state even when command recording/submission fails.
             Reset();
         }
