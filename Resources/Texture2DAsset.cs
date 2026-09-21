@@ -64,6 +64,45 @@ public readonly record struct Texture2DVariantKey(
             : string.Empty;
         return $"{Format.ToString().ToLowerInvariant()}.{ColorSpace.ToString().ToLowerInvariant()}.{mipSuffix}{filterSuffix}";
     }
+
+    public static bool TryParseCookedVariant(
+        string? variant,
+        out Texture2DVariantKey key)
+    {
+        key = default;
+        if (string.IsNullOrWhiteSpace(variant))
+        {
+            return false;
+        }
+
+        string[] parts = variant.Split('.', StringSplitOptions.None);
+        if (parts.Length is < 3 or > 4 ||
+            !Enum.TryParse(parts[0], ignoreCase: true, out Texture2DCookedFormat format) ||
+            !Enum.IsDefined(format) ||
+            !Enum.TryParse(parts[1], ignoreCase: true, out Texture2DColorSpace colorSpace) ||
+            !Enum.IsDefined(colorSpace) ||
+            parts[2] is not ("mips" or "nomips") ||
+            (parts.Length == 4 && parts[3] != "normalmap"))
+        {
+            return false;
+        }
+
+        var mipFilter = parts.Length == 4
+            ? Texture2DMipFilter.NormalMap
+            : Texture2DMipFilter.Color;
+        if (mipFilter == Texture2DMipFilter.NormalMap &&
+            colorSpace != Texture2DColorSpace.Linear)
+        {
+            return false;
+        }
+
+        key = new Texture2DVariantKey(
+            format,
+            colorSpace,
+            parts[2] == "mips",
+            mipFilter);
+        return true;
+    }
 }
 
 public sealed record Texture2DAsset(

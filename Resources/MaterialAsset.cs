@@ -123,15 +123,21 @@ public readonly record struct MaterialVector4Property(
     string Name,
     Vector4 Value);
 
+public readonly record struct MaterialShaderTextureVariantRequirement(
+    string Name,
+    string CookedVariant);
+
 public readonly record struct MaterialShaderContract(
     IReadOnlyList<string> RequiredTexture2DRefs,
     IReadOnlyList<string> RequiredScalarProperties,
-    IReadOnlyList<string> RequiredVector4Properties)
+    IReadOnlyList<string> RequiredVector4Properties,
+    IReadOnlyList<MaterialShaderTextureVariantRequirement> RequiredTexture2DVariants)
 {
     public static MaterialShaderContract Empty { get; } = new(
         Array.Empty<string>(),
         Array.Empty<string>(),
-        Array.Empty<string>());
+        Array.Empty<string>(),
+        Array.Empty<MaterialShaderTextureVariantRequirement>());
 }
 
 public readonly record struct MaterialRenderState(
@@ -164,7 +170,8 @@ public enum MaterialShaderContractBindingKind
 {
     Texture2DRef,
     ScalarProperty,
-    Vector4Property
+    Vector4Property,
+    Texture2DVariant
 }
 
 public readonly record struct MaterialShaderContractDiagnostic(
@@ -321,7 +328,9 @@ public static class MaterialAssetLoader
             var effectiveContract = SerializedMaterialShaderContract.Merge(shaderSourceContract, Shader.Contract, ShaderContract);
             return effectiveContract.InspectMaterialBindings(
                 sourcePath,
-                Texture2DRefs.Select(texture => texture.Name),
+                Texture2DRefs.Select(texture => (
+                    texture.Name,
+                    texture.Texture.Variant.ToVariantKey().GetCookedVariant())),
                 ScalarProperties.Select(property => property.Name),
                 Vector4Properties.Select(property => property.Name));
         }
@@ -643,6 +652,7 @@ public static class MaterialAssetLoader
         public List<string> RequiredTexture2DRefs { get; set; } = new();
         public List<string> RequiredScalarProperties { get; set; } = new();
         public List<string> RequiredVector4Properties { get; set; } = new();
+        public List<SerializedMaterialTextureVariantRequirement> RequiredTexture2DVariants { get; set; } = new();
 
         public static SerializedMaterialShaderContract Merge(
             MaterialShaderContract shaderSourceContract,
@@ -662,7 +672,17 @@ public static class MaterialAssetLoader
                 RequiredVector4Properties = MergeRequiredNames(
                     shaderSourceContract.RequiredVector4Properties,
                     shaderContract?.RequiredVector4Properties,
-                    materialContract?.RequiredVector4Properties)
+                    materialContract?.RequiredVector4Properties),
+                RequiredTexture2DVariants = MergeRequiredTexture2DVariants(
+                    shaderSourceContract.RequiredTexture2DVariants
+                        .Select(requirement => new SerializedMaterialTextureVariantRequirement
+                        {
+                            Name = requirement.Name,
+                            Variant = requirement.CookedVariant
+                        })
+                        .ToArray(),
+                    shaderContract?.RequiredTexture2DVariants,
+                    materialContract?.RequiredTexture2DVariants)
             };
         }
 
@@ -671,21 +691,23 @@ public static class MaterialAssetLoader
             ValidateRequiredNames(sourcePath, contractPath, nameof(RequiredTexture2DRefs), RequiredTexture2DRefs);
             ValidateRequiredNames(sourcePath, contractPath, nameof(RequiredScalarProperties), RequiredScalarProperties);
             ValidateRequiredNames(sourcePath, contractPath, nameof(RequiredVector4Properties), RequiredVector4Properties);
+            ValidateRequiredTexture2DVariants(sourcePath, contractPath);
         }
 
         public IReadOnlyList<MaterialShaderContractDiagnostic> InspectMaterialBindings(
             string sourcePath,
-            IEnumerable<string> textureNames,
+            IEnumerable<(string Name, string Variant)> textures,
             IEnumerable<string> scalarNames,
             IEnumerable<string> vector4Names)
         {
             var diagnostics = new List<MaterialShaderContractDiagnostic>();
+            (string Name, string Variant)[] materialTextures = textures.ToArray();
             InspectRequiredBindings(
                 sourcePath,
                 "Texture2DRefs",
                 MaterialShaderContractBindingKind.Texture2DRef,
                 RequiredTexture2DRefs,
-                textureNames,
+                materialTextures.Select(texture => texture.Name),
                 diagnostics);
             InspectRequiredBindings(
                 sourcePath,
@@ -700,6 +722,10 @@ public static class MaterialAssetLoader
                 MaterialShaderContractBindingKind.Vector4Property,
                 RequiredVector4Properties,
                 vector4Names,
+                diagnostics);
+            InspectRequiredTexture2DVariants(
+                sourcePath,
+                materialTextures,
                 diagnostics);
             return diagnostics;
         }
@@ -761,6 +787,133 @@ public static class MaterialAssetLoader
                 {
                     throw new InvalidOperationException(
                         $"[MaterialAssetLoader] Material '{sourcePath}' {contractPath}.{sectionName} contains duplicate name '{name}'.");
+                }
+            }
+        }
+
+        private static List<SerializedMaterialTextureVariantRequirement> MergeRequiredTexture2DVariants(
+            params IReadOnlyList<SerializedMaterialTextureVariantRequirement>?[] sources)
+        {
+            var merged = new List<SerializedMaterialTextureVariantRequirement>();
+            var seen = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (int sourceIndex = 0; sourceIndex < sources.Length; sourceIndex++)
+            {
+                IReadOnlyList<SerializedMaterialTextureVariantRequirement>? source = sources[sourceIndex];
+                if (source == null)
+                {
+                    continue;
+                }
+
+                for (int index = 0; index < source.Count; index++)
+                {
+                    SerializedMaterialTextureVariantRequirement requirement = source[index];
+                    if (requirement == null ||
+                        string.IsNullOrWhiteSpace(requirement.Name) ||
+                        string.IsNullOrWhiteSpace(requirement.Variant))
+                    {
+                        continue;
+                    }
+
+                    if (seen.TryGetValue(requirement.Name, out string? existingVariant))
+                    {
+                        if (!string.Equals(existingVariant, requirement.Variant, StringComparison.OrdinalIgnoreCase))
+                        {
+                            throw new InvalidOperationException(
+                                $"[MaterialAssetLoader] Texture2D variant requirement '{requirement.Name}' " +
+                                $"is declared as both '{existingVariant}' and '{requirement.Variant}'.");
+                        }
+
+                        continue;
+                    }
+
+                    seen.Add(requirement.Name, requirement.Variant);
+                    merged.Add(requirement);
+                }
+            }
+
+            return merged;
+        }
+
+        private void ValidateRequiredTexture2DVariants(
+            string sourcePath,
+            string contractPath)
+        {
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int index = 0; index < RequiredTexture2DVariants.Count; index++)
+            {
+                SerializedMaterialTextureVariantRequirement requirement = RequiredTexture2DVariants[index];
+                if (requirement == null ||
+                    string.IsNullOrWhiteSpace(requirement.Name))
+                {
+                    throw new InvalidOperationException(
+                        $"[MaterialAssetLoader] Material '{sourcePath}' {contractPath}.RequiredTexture2DVariants " +
+                        $"entry {index} is missing a binding name.");
+                }
+
+                if (!seen.Add(requirement.Name))
+                {
+                    throw new InvalidOperationException(
+                        $"[MaterialAssetLoader] Material '{sourcePath}' {contractPath}.RequiredTexture2DVariants " +
+                        $"contains duplicate name '{requirement.Name}'.");
+                }
+
+                if (!Texture2DVariantKey.TryParseCookedVariant(
+                        requirement.Variant,
+                        out Texture2DVariantKey variant))
+                {
+                    throw new InvalidOperationException(
+                        $"[MaterialAssetLoader] Material '{sourcePath}' {contractPath}.RequiredTexture2DVariants " +
+                        $"entry '{requirement.Name}' declares invalid variant '{requirement.Variant}'.");
+                }
+
+                if (!string.Equals(
+                        requirement.Variant,
+                        variant.GetCookedVariant(),
+                        StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        $"[MaterialAssetLoader] Material '{sourcePath}' {contractPath}.RequiredTexture2DVariants " +
+                        $"entry '{requirement.Name}' variant '{requirement.Variant}' is not canonical; " +
+                        $"use '{variant.GetCookedVariant()}'.");
+                }
+            }
+        }
+
+        private void InspectRequiredTexture2DVariants(
+            string sourcePath,
+            (string Name, string Variant)[] materialTextures,
+            List<MaterialShaderContractDiagnostic> diagnostics)
+        {
+            for (int index = 0; index < RequiredTexture2DVariants.Count; index++)
+            {
+                SerializedMaterialTextureVariantRequirement requirement = RequiredTexture2DVariants[index];
+                int materialIndex = Array.FindIndex(
+                    materialTextures,
+                    texture => string.Equals(
+                        texture.Name,
+                        requirement.Name,
+                        StringComparison.OrdinalIgnoreCase));
+                if (materialIndex < 0)
+                {
+                    diagnostics.Add(new MaterialShaderContractDiagnostic(
+                        MaterialShaderContractBindingKind.Texture2DVariant,
+                        requirement.Name,
+                        $"[MaterialAssetLoader] Material '{sourcePath}' is missing required Texture2DRefs binding " +
+                        $"'{requirement.Name}' declared by Shader.Contract or ShaderContract."));
+                    continue;
+                }
+
+                if (!string.Equals(
+                        materialTextures[materialIndex].Variant,
+                        requirement.Variant,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    diagnostics.Add(new MaterialShaderContractDiagnostic(
+                        MaterialShaderContractBindingKind.Texture2DVariant,
+                        requirement.Name,
+                        $"[MaterialAssetLoader] Material '{sourcePath}' Texture2DRefs binding " +
+                        $"'{requirement.Name}' declares variant '{materialTextures[materialIndex].Variant}' but the " +
+                        $"shader contract requires '{requirement.Variant}'."));
                 }
             }
         }
@@ -985,6 +1138,12 @@ public static class MaterialAssetLoader
                 GenerateMipMaps,
                 MipFilter);
         }
+    }
+
+    private sealed class SerializedMaterialTextureVariantRequirement
+    {
+        public string Name { get; set; } = string.Empty;
+        public string Variant { get; set; } = string.Empty;
     }
 
     private sealed class SerializedMaterialRenderState

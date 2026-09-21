@@ -164,7 +164,8 @@ public sealed class ShaderLabSource
         return new MaterialShaderContract(
             MergeNames(shader.materialContract.texture2DRefs, annotations.RequiredTexture2DRefs),
             MergeNames(shader.materialContract.scalarProperties, annotations.RequiredScalarProperties),
-            MergeNames(shader.materialContract.vector4Properties, annotations.RequiredVector4Properties));
+            MergeNames(shader.materialContract.vector4Properties, annotations.RequiredVector4Properties),
+            annotations.RequiredTexture2DVariants);
     }
 
     private static IReadOnlyList<string> MergeNames(IReadOnlyList<string> first, IReadOnlyList<string> second)
