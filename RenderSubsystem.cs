@@ -286,7 +286,9 @@ public class RenderSubsystem : ITickableSubsystem
                 }
             }
 
-            var arena = FrameArena.Instance;
+            // Frame-scoped arena owned by MemoryManager: it holds this frame's snapshot copies
+            // and is reclaimed at the frame boundary once every subsystem has ticked.
+            var arena = MemoryManager.FrameArena;
             Span<MeshDrawCommand> frameDrawList = Span<MeshDrawCommand>.Empty;
             Span<StaticMeshRenderItem> frameStaticMeshItems = Span<StaticMeshRenderItem>.Empty;
 
