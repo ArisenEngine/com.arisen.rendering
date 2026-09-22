@@ -40,6 +40,10 @@ public class RenderSubsystem : ITickableSubsystem
     private RenderDocService? m_RenderDocService;
 #if !ARISEN_ENGINE_EDITOR
     private IWindowProvider? m_WindowProvider;
+    private IRuntimeWorldStreamingService? m_WorldStreamingService;
+    private RuntimeStartupPresentationState m_StartupPresentation;
+    private bool m_RuntimeWindowRevealed;
+    private bool m_CompositesMainWindow;
 #endif
     private IWorldOriginService? m_WorldOriginService;
     private SceneViewCameraOverride? m_SceneViewCameraOverride;
@@ -107,6 +111,29 @@ public class RenderSubsystem : ITickableSubsystem
         else
         {
             KernelLog.Warning("[RenderSubsystem] Runtime rendering has no IWindowProvider; no native swapchain surface was registered.");
+        }
+
+        m_CompositesMainWindow = IsInteractiveRuntimeHost();
+        if (m_RuntimeWindowRegistration.IsValid &&
+            services.TryGetService<IRuntimeWorldStreamingService>(out m_WorldStreamingService) &&
+            m_WorldStreamingService != null &&
+            m_CompositesMainWindow)
+        {
+            RuntimeStartupPresentationObservation observation =
+                CaptureStartupPresentationObservation(frameOwnsSceneContent: false);
+            if (m_StartupPresentation.TryArm(observation))
+            {
+                Logger.Log(
+                    "[RenderSubsystem] Runtime startup presentation armed. The main window stays hidden " +
+                    "until the startup world activates and one of its frames owns scene content | " +
+                    $"Frame: {EngineKernel.Instance.CurrentFrameIndex} | Revision: {observation.Revision} | " +
+                    $"PendingWorld: {observation.HasPendingWorld} | " +
+                    $"ActiveWorld: {observation.HasActiveWorld}");
+            }
+        }
+        else
+        {
+            m_WorldStreamingService = null;
         }
 #endif
     }
@@ -525,6 +552,15 @@ public class RenderSubsystem : ITickableSubsystem
 
                 // Finalize output work and signal presentation.
                 bool framePresented = submission.End();
+#if !ARISEN_ENGINE_EDITOR
+                if (m_CompositesMainWindow)
+                {
+                    UpdateRuntimeWindowPresentation(
+                        surfaceInfo.Registration,
+                        framePresented,
+                        frameStaticMeshItems.Length > 0 || frameDrawList.Length > 0);
+                }
+#endif
                 if (framePresented &&
                     outputKind == RenderOutputKind.EditorSharedTexture &&
                     concreteSurface != null &&
@@ -673,6 +709,106 @@ public class RenderSubsystem : ITickableSubsystem
     {
         System.Threading.Volatile.Write(ref m_SceneViewCameraOverride, null);
     }
+
+#if !ARISEN_ENGINE_EDITOR
+    /// <summary>
+    /// True when this host owns a main window that composites the frames the runtime renders.
+    /// An interactive standalone runtime is such a host: its window is created hidden and the
+    /// startup presentation gate below reveals it. A bounded smoke host runs unattended and owns
+    /// its own frame budget, so it never composites and its window stays hidden for the whole
+    /// run: its visual gates key readback captures to frame indices, and a window manager action
+    /// on a visible window (minimizing or collapsing it) reports a zero-extent surface, which
+    /// skips those frames and can fail a run for a reason the engine cannot act on.
+    /// </summary>
+    private static bool IsInteractiveRuntimeHost() =>
+        string.IsNullOrEmpty(EngineKernel.Instance.Config?.SmokeModeName);
+
+    /// <summary>
+    /// Decides whether the standalone runtime's main window may become visible. A window that
+    /// was created hidden stays hidden while the startup presentation gate withholds frames, so
+    /// the pipeline's empty-content placeholder is never composited on screen, and is revealed
+    /// at the end of the first frame that carries the startup world's own content.
+    /// </summary>
+    private void UpdateRuntimeWindowPresentation(
+        RenderSurfaceRegistration registration,
+        bool framePresented,
+        bool frameOwnsSceneContent)
+    {
+        if (m_RuntimeWindowRevealed ||
+            m_WindowProvider == null ||
+            !m_RuntimeWindowRegistration.IsValid ||
+            registration != m_RuntimeWindowRegistration)
+        {
+            return;
+        }
+
+        if (m_StartupPresentation.IsArmed)
+        {
+            // Only a frame that actually reached the swapchain may be shown; revealing the
+            // window on a retired frame would present the withheld placeholder instead.
+            if (!framePresented)
+            {
+                return;
+            }
+
+            RuntimeStartupPresentationObservation startupObservation =
+                CaptureStartupPresentationObservation(frameOwnsSceneContent);
+            RuntimeStartupPresentationDecision startupDecision =
+                m_StartupPresentation.Evaluate(startupObservation);
+            if (startupDecision is RuntimeStartupPresentationDecision.WaitForWorldActivation or
+                RuntimeStartupPresentationDecision.WaitForStreamedCells or
+                RuntimeStartupPresentationDecision.WaitForWorldContent)
+            {
+                Profiler.PlotValue("Render.RuntimeStartupPresentationHeld", 1);
+                if (RenderDiagnostics.IsEnabled(RenderDiagnosticCategory.Frame))
+                {
+                    Logger.Log(
+                        $"[RenderSubsystem] Startup presentation held | Frame: {EngineKernel.Instance.CurrentFrameIndex} | " +
+                        $"Decision: {startupDecision} | Revision: {startupObservation.Revision} | " +
+                        $"PendingWorld: {startupObservation.HasPendingWorld} | " +
+                        $"ActiveWorld: {startupObservation.HasActiveWorld} | " +
+                        $"ActiveStreamedCells: {startupObservation.ActiveStreamedCells} | " +
+                        $"FrameOwnsSceneContent: {startupObservation.FrameOwnsSceneContent} | " +
+                        $"HeldFrames: {m_StartupPresentation.WaitedFrames}");
+                }
+
+                return;
+            }
+
+            Logger.Log(
+                "[RenderSubsystem] Startup presentation released after " +
+                $"{m_StartupPresentation.WaitedFrames} held frame(s) | " +
+                $"Frame: {EngineKernel.Instance.CurrentFrameIndex} | " +
+                $"ActiveWorld={startupObservation.HasActiveWorld} | " +
+                $"ActiveStreamedCells={startupObservation.ActiveStreamedCells} | " +
+                $"FrameOwnsSceneContent={startupObservation.FrameOwnsSceneContent} | " +
+                $"StreamingFailed={startupObservation.StreamingFailed}");
+        }
+
+        m_WindowProvider.SetMainWindowVisible(true);
+        m_RuntimeWindowRevealed = true;
+    }
+
+    private RuntimeStartupPresentationObservation CaptureStartupPresentationObservation(
+        bool frameOwnsSceneContent)
+    {
+        IRuntimeWorldStreamingService service = m_WorldStreamingService
+            ?? throw new InvalidOperationException(
+                "Startup presentation observation requires the runtime world streaming service.");
+        RuntimeWorldPresentationSnapshot presentation = service.PresentationSnapshot;
+        WorldStreamingMetrics metrics = service.GetMetrics();
+        bool activeWorldDeclaresCells = service.ActiveWorld is { Cells.Count: > 0 };
+        return new RuntimeStartupPresentationObservation(
+            presentation.Revision,
+            presentation.PendingWorldAsset is { IsValid: true },
+            presentation.ActiveWorldAsset is { IsValid: true } ||
+            presentation.ActiveWorldGuid != Guid.Empty,
+            activeWorldDeclaresCells,
+            metrics.ActiveCells,
+            frameOwnsSceneContent,
+            metrics.FailedCells > 0);
+    }
+#endif
 
     private void NotifyOutputFrameReady(RenderSurfaceRegistration registration)
     {

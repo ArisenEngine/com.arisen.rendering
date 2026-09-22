@@ -21,6 +21,7 @@
       "ArisenEngine.Core.Assets.IAssetDatabase",
       "ArisenEngine.Core.Assets.IRuntimeAssetCookerRegistry",
       "ArisenEngine.Resources.Serialization.IWorldOriginService",
+      "ArisenEngine.Resources.Serialization.IRuntimeWorldStreamingService",
       "ArisenKernel.Contracts.IWindowProvider",
       {
         "interface": "ArisenKernel.Contracts.IRHIBackend",

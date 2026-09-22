@@ -20,6 +20,7 @@ internal sealed class RenderFrameSubmission
     private RenderOutputKind m_OutputKind;
     private readonly RenderFrameSubmissionState m_State = new();
     private readonly RenderTargetImageStateTracker m_TargetImageState = new();
+    private bool m_PresentationSkipped;
 
     public uint SurfaceId => m_SurfaceId;
     public uint FrameIndex => m_FrameIndex;
@@ -78,6 +79,16 @@ internal sealed class RenderFrameSubmission
         if (acquired)
         {
             m_State.MarkAcquired();
+            if (m_PresentationSkipped)
+            {
+                m_PresentationSkipped = false;
+                KernelLog.InfoFormat(
+                    "[RenderSubmission] Surface 0x{0:X} resumed presenting. Frame={1}, Size={2}x{3}",
+                    m_SurfaceId,
+                    m_FrameIndex,
+                    m_Width,
+                    m_Height);
+            }
         }
         TargetImageRequiresInitialization = m_TargetImageState.RequiresInitialization(TargetImage);
         Profiler.PlotValue("RenderSubmission.AcquireSucceeded", acquired ? 1 : 0);
@@ -211,6 +222,22 @@ internal sealed class RenderFrameSubmission
     private void LogSkippedAcquire(string reason)
     {
         Profiler.PlotValue("RenderSubmission.AcquireSucceeded", 0);
+
+        if (!m_PresentationSkipped)
+        {
+            m_PresentationSkipped = true;
+            // Frame acquisition stops for as long as the surface cannot present: the window
+            // is minimized or collapsed, or its swapchain generation is being replaced.
+            // Report the transition once; a per-frame message would bury the cause under
+            // hundreds of identical lines and turn a normal OS event into log spam.
+            KernelLog.WarningFormat(
+                "[RenderSubmission] Surface 0x{0:X} stopped presenting. Frame={1}, Size={2}x{3}, Reason={4}",
+                m_SurfaceId,
+                m_FrameIndex,
+                m_Width,
+                m_Height,
+                reason);
+        }
 
         if (RenderDiagnostics.IsEnabled(RenderDiagnosticCategory.Submission))
         {
