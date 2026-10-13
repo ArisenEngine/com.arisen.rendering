@@ -31,6 +31,11 @@ public static class GltfModelImportEmitter
     private const int GltfBinaryHeaderSize = 12;
     private const int GltfBinaryChunkHeaderSize = 8;
 
+    // Encoding.UTF8 emits a byte order mark. Authored asset text is canonical UTF-8 without one, and
+    // the rest of the asset tree has none, so generated text must not add three invisible bytes to
+    // the first line of the file.
+    private static readonly Encoding Utf8NoBom = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+
     public static GltfModelImportEmissionResult Emit(
         GltfModelImportPlan plan,
         string sourcePath,
@@ -102,7 +107,7 @@ public static class GltfModelImportEmitter
             File.WriteAllText(
                 materialPath,
                 BuildMaterialSource(material, emittedTextures, settings),
-                Encoding.UTF8);
+                Utf8NoBom);
             WriteMetadata(materialPath + ".meta", materialChild.Metadata, plan.SourceGuid);
             materialPaths.Add(materialPath);
         }
@@ -211,7 +216,7 @@ public static class GltfModelImportEmitter
             File.WriteAllText(
                 scenePath,
                 BuildSceneSource(sceneName, plan.PackageId, entities),
-                Encoding.UTF8);
+                Utf8NoBom);
             WriteMetadata(scenePath + ".meta", sceneChild.Metadata, plan.SourceGuid);
             scenePaths.Add(scenePath);
         }
