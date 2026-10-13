@@ -37,6 +37,8 @@ public class RenderingPackage : IPackageEntry
             new RenderingRuntimeAssetCooker(
                 registry.GetService<IAssetDatabase>(),
                 m_ShaderCookRecipes));
+        registry.GetService<IAssetSourceReimporterRegistry>()
+            .RegisterReimporter(new ModelSourceAssetReimporter());
 
         // Rendering subsystems are declared in package metadata and registered by PackageSubsystem.
         // Runtime builds warm up the selected RHI backend in RuntimeRHIWarmupSubsystem. Editor
