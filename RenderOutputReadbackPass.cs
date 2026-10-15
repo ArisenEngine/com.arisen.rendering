@@ -196,6 +196,12 @@ internal sealed class RenderOutputReadbackPass : RenderPassNode, IDisposable
                 m_SurfaceId,
                 m_FrameIndex);
             RenderOutputImageSummaryWriter.WriteAtomic(m_Capture.OutputPath, artifact);
+            RenderOutputFrameDump.Write(
+                m_Capture.OutputPath,
+                pixels.AsSpan(0, colorByteCount),
+                m_Width,
+                m_Height,
+                artifact.ChannelOrder);
             if (artifact.Passed)
             {
                 m_Service.ReportSuccess(m_Capture);
