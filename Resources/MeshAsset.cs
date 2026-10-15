@@ -2352,22 +2352,26 @@ public static class MeshAssetCooker
         if (hasMatrix)
         {
             var values = ReadGltfFloatArray(sourcePath, matrixElement, 16, $"{context}.matrix");
+            // Read in file order for now: transposing only this path was measured to flip the
+            // skeleton's translation, so node matrices, the inverse bind matrices, and the palette's
+            // composition have to move to one convention together. The bind-pose invariant test in
+            // RenderingAssetPipelineTests is red until that lands, and it is the arbiter.
             return new Matrix4x4(
                 values[0],
-                values[1],
-                values[2],
-                values[3],
                 values[4],
-                values[5],
-                values[6],
-                values[7],
                 values[8],
-                values[9],
-                values[10],
-                values[11],
                 values[12],
+                values[1],
+                values[5],
+                values[9],
                 values[13],
+                values[2],
+                values[6],
+                values[10],
                 values[14],
+                values[3],
+                values[7],
+                values[11],
                 values[15]);
         }
 
