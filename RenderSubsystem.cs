@@ -291,6 +291,7 @@ public class RenderSubsystem : ITickableSubsystem
             var arena = MemoryManager.FrameArena;
             Span<MeshDrawCommand> frameDrawList = Span<MeshDrawCommand>.Empty;
             Span<StaticMeshRenderItem> frameStaticMeshItems = Span<StaticMeshRenderItem>.Empty;
+            Span<Quaternion> frameSkinJointRotations = Span<Quaternion>.Empty;
 
             if (sceneSubsystem != null)
             {
@@ -306,6 +307,13 @@ public class RenderSubsystem : ITickableSubsystem
                 {
                     frameStaticMeshItems = arena.Alloc<StaticMeshRenderItem>(staticMeshItems.Length);
                     staticMeshItems.CopyTo(frameStaticMeshItems);
+                }
+
+                var skinJointRotations = sceneSubsystem.GetCurrentSkinJointRotations();
+                if (skinJointRotations.Length > 0)
+                {
+                    frameSkinJointRotations = arena.Alloc<Quaternion>(skinJointRotations.Length);
+                    skinJointRotations.CopyTo(frameSkinJointRotations);
                 }
             }
 
@@ -454,6 +462,7 @@ public class RenderSubsystem : ITickableSubsystem
                 fixed (SpotLight* pSpotLights = frameSpotLights)
                 fixed (MeshDrawCommand* pDrawList = frameDrawList)
                 fixed (StaticMeshRenderItem* pStaticMeshItems = frameStaticMeshItems)
+                fixed (Quaternion* pSkinJointRotations = frameSkinJointRotations)
                 {
                     var snapshot = new RenderFrameSnapshot(
                         device,
@@ -482,7 +491,9 @@ public class RenderSubsystem : ITickableSubsystem
                         pDrawList,
                         frameDrawList.Length,
                         pStaticMeshItems,
-                        frameStaticMeshItems.Length);
+                        frameStaticMeshItems.Length,
+                        pSkinJointRotations,
+                        frameSkinJointRotations.Length);
 
                     var context = new RenderContext(arena, snapshot, submission);
                     Profiler.PlotValue("Render.DrawCount", snapshot.DrawListCount);

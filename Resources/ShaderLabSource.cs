@@ -23,6 +23,32 @@ public sealed class ShaderLabSource
 
     public IReadOnlyList<string> Includes => BuildIncludes(m_SourcePath, m_Pass);
     public IReadOnlyList<string> CompileTimeKeywords => BuildCompileTimeKeywords(m_Pass);
+
+    /// <summary>
+    /// Reports whether a ShaderLab source declares a compile-time keyword. Cookers use it to decide
+    /// which optional variants a shader can actually produce, so a cooked-only run never misses one.
+    /// </summary>
+    public static bool DeclaresKeyword(string sourcePath, string keyword)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(sourcePath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(keyword);
+        if (!IsShaderLabPath(sourcePath))
+        {
+            return false;
+        }
+
+        ShaderLabSource source = Load(sourcePath);
+        IReadOnlyList<string> keywords = source.CompileTimeKeywords;
+        for (int index = 0; index < keywords.Count; index++)
+        {
+            if (string.Equals(keywords[index], keyword, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
     public MaterialShaderContract MaterialContract => BuildMaterialContract(m_Shader, m_Pass, m_SourcePath);
     public MaterialRenderState RenderState => BuildRenderState(m_Pass, m_SourcePath);
 

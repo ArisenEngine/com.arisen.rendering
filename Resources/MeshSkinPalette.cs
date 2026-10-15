@@ -44,6 +44,53 @@ public static class MeshSkinPalette
         }
     }
 
+    /// <summary>
+    /// Builds the palette a skinned draw uploads. Joints keep their cooked rest translation and take
+    /// the pose's local rotation when one is supplied, so an empty pose reproduces the bind pose.
+    /// </summary>
+    public static void ComputePalette(
+        MeshSkin skin,
+        ReadOnlySpan<Quaternion> poseLocalRotations,
+        Span<Matrix4x4> jointGlobalsScratch,
+        Span<Matrix4x4> destination)
+    {
+        if (destination.Length < skin.Joints.Count || jointGlobalsScratch.Length < skin.Joints.Count)
+        {
+            throw new ArgumentException("[MeshSkinPalette] Buffers are smaller than the joint count.");
+        }
+
+        if (!poseLocalRotations.IsEmpty && poseLocalRotations.Length != skin.Joints.Count)
+        {
+            throw new ArgumentException(
+                $"[MeshSkinPalette] Pose supplies {poseLocalRotations.Length} rotations for {skin.Joints.Count} joints.");
+        }
+
+        for (int jointIndex = 0; jointIndex < skin.Joints.Count; jointIndex++)
+        {
+            MeshSkinJoint joint = skin.Joints[jointIndex];
+            var rotation = poseLocalRotations.IsEmpty ? joint.LocalRotation : poseLocalRotations[jointIndex];
+            var local = Matrix4x4.CreateFromQuaternion(rotation) * Matrix4x4.CreateTranslation(joint.LocalTranslation);
+            if (joint.ParentIndex < 0)
+            {
+                jointGlobalsScratch[jointIndex] = local;
+                continue;
+            }
+
+            if (joint.ParentIndex >= jointIndex)
+            {
+                throw new InvalidOperationException(
+                    $"[MeshSkinPalette] Joint {jointIndex} declares parent '{joint.ParentIndex}'; joints must be ordered parents-first.");
+            }
+
+            jointGlobalsScratch[jointIndex] = local * jointGlobalsScratch[joint.ParentIndex];
+        }
+
+        for (int jointIndex = 0; jointIndex < skin.Joints.Count; jointIndex++)
+        {
+            destination[jointIndex] = skin.Joints[jointIndex].InverseBind * jointGlobalsScratch[jointIndex];
+        }
+    }
+
     public static void ComputeSkinningMatrices(MeshSkin skin, ReadOnlySpan<Matrix4x4> jointGlobals, Span<Matrix4x4> destination)
     {
         if (jointGlobals.Length < skin.Joints.Count || destination.Length < skin.Joints.Count)

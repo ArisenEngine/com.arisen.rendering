@@ -16,6 +16,7 @@ public sealed class RHIStaticMeshResource : IDisposable
     private MeshSubmesh[] m_Submeshes = Array.Empty<MeshSubmesh>();
     private RHIBufferHandle m_VertexBuffer = RHIBufferHandle.Invalid;
     private RHIBufferHandle m_IndexBuffer = RHIBufferHandle.Invalid;
+    private MeshSkin? m_Skin;
     private bool m_Disposed;
 
     public RHIBufferHandle VertexBuffer => m_VertexBuffer;
@@ -27,6 +28,9 @@ public sealed class RHIStaticMeshResource : IDisposable
     public MeshBounds Bounds => m_CookedMesh.Bounds;
     public int SubmeshCount => m_Submeshes.Length;
     public ReadOnlySpan<MeshSubmesh> Submeshes => m_Submeshes;
+    public MeshSkin? Skin => m_Skin;
+    public bool IsSkinned => m_Skin != null;
+    public int SkinJointCount => m_Skin?.Joints.Count ?? 0;
     public AssetDependencyStamp DependencyStamp { get; private set; }
     public bool IsValid => m_VertexBuffer.IsValid && m_IndexBuffer.IsValid && IndexCount > 0;
 
@@ -66,6 +70,9 @@ public sealed class RHIStaticMeshResource : IDisposable
             checked((int)m_CookedMesh.IndexDataSize));
         m_Submeshes = new MeshSubmesh[checked((int)m_CookedMesh.SubmeshCount)];
         MeshAssetCooker.ReadSubmeshes(cookedBytes.Span, m_CookedMesh, m_Submeshes);
+        m_Skin = m_CookedMesh.HasSkin
+            ? MeshSkinPalette.ReadCookedSkin(cookedBytes.Span, m_CookedMesh)
+            : null;
 
         var vertexStagingBuffer = m_Factory.CreateBuffer(
             m_CookedMesh.VertexDataSize,
@@ -138,7 +145,7 @@ public sealed class RHIStaticMeshResource : IDisposable
         }
 
         Logger.Log(
-            $"[RHIStaticMeshResource] Uploaded device-local mesh | Name: {m_Asset.Name} | Vertices: {VertexCount} | Indices: {IndexCount} | Submeshes: {SubmeshCount} | Bounds: {Bounds.Min}->{Bounds.Max} | VertexStride: {VertexStride} | VertexBuffer: {m_VertexBuffer.Index}:{m_VertexBuffer.Generation} | IndexBuffer: {m_IndexBuffer.Index}:{m_IndexBuffer.Generation}");
+            $"[RHIStaticMeshResource] Uploaded device-local mesh | Name: {m_Asset.Name} | Vertices: {VertexCount} | Indices: {IndexCount} | Submeshes: {SubmeshCount} | Joints: {SkinJointCount} | Bounds: {Bounds.Min}->{Bounds.Max} | VertexStride: {VertexStride} | VertexBuffer: {m_VertexBuffer.Index}:{m_VertexBuffer.Generation} | IndexBuffer: {m_IndexBuffer.Index}:{m_IndexBuffer.Generation}");
     }
 
     public MeshSubmesh GetSubmeshOrDefault(int submeshIndex)
@@ -154,20 +161,22 @@ public sealed class RHIStaticMeshResource : IDisposable
     public MeshDrawCommand CreateDrawCommand(Matrix4x4 localToWorld, uint materialId, int submeshIndex = 0)
     {
         var submesh = GetSubmeshOrDefault(submeshIndex);
-        return CreateDrawCommand(localToWorld, materialId, submesh, applyMaterialSlot: true);
+        return CreateDrawCommand(localToWorld, materialId, submesh, applyMaterialSlot: true, skinPaletteOffset: 0, skinJointCount: 0);
     }
 
     public MeshDrawCommand CreateDrawCommandWithMaterialOverride(Matrix4x4 localToWorld, uint materialId, int submeshIndex = 0)
     {
         var submesh = GetSubmeshOrDefault(submeshIndex);
-        return CreateDrawCommand(localToWorld, materialId, submesh, applyMaterialSlot: false);
+        return CreateDrawCommand(localToWorld, materialId, submesh, applyMaterialSlot: false, skinPaletteOffset: 0, skinJointCount: 0);
     }
 
     private MeshDrawCommand CreateDrawCommand(
         Matrix4x4 localToWorld,
         uint materialId,
         MeshSubmesh submesh,
-        bool applyMaterialSlot)
+        bool applyMaterialSlot,
+        uint skinPaletteOffset,
+        uint skinJointCount)
     {
         return new MeshDrawCommand
         {
@@ -180,7 +189,9 @@ public sealed class RHIStaticMeshResource : IDisposable
             IndexType = IndexType,
             MaterialID = applyMaterialSlot
                 ? checked(materialId + submesh.MaterialSlot)
-                : materialId
+                : materialId,
+            SkinPaletteOffset = skinPaletteOffset,
+            SkinJointCount = skinJointCount
         };
     }
 
@@ -189,7 +200,9 @@ public sealed class RHIStaticMeshResource : IDisposable
         Matrix4x4 localToWorld,
         uint materialId,
         int firstSubmeshIndex = 0,
-        int submeshCount = -1)
+        int submeshCount = -1,
+        uint skinPaletteOffset = 0,
+        uint skinJointCount = 0)
     {
         return CreateDrawCommands(
             destination,
@@ -197,7 +210,9 @@ public sealed class RHIStaticMeshResource : IDisposable
             materialId,
             firstSubmeshIndex,
             submeshCount,
-            applyMaterialSlots: true);
+            applyMaterialSlots: true,
+            skinPaletteOffset,
+            skinJointCount);
     }
 
     public int CreateDrawCommandsWithMaterialOverride(
@@ -205,7 +220,9 @@ public sealed class RHIStaticMeshResource : IDisposable
         Matrix4x4 localToWorld,
         uint materialId,
         int firstSubmeshIndex = 0,
-        int submeshCount = -1)
+        int submeshCount = -1,
+        uint skinPaletteOffset = 0,
+        uint skinJointCount = 0)
     {
         return CreateDrawCommands(
             destination,
@@ -213,7 +230,9 @@ public sealed class RHIStaticMeshResource : IDisposable
             materialId,
             firstSubmeshIndex,
             submeshCount,
-            applyMaterialSlots: false);
+            applyMaterialSlots: false,
+            skinPaletteOffset,
+            skinJointCount);
     }
 
     private int CreateDrawCommands(
@@ -222,7 +241,9 @@ public sealed class RHIStaticMeshResource : IDisposable
         uint materialId,
         int firstSubmeshIndex,
         int submeshCount,
-        bool applyMaterialSlots)
+        bool applyMaterialSlots,
+        uint skinPaletteOffset,
+        uint skinJointCount)
     {
         if (firstSubmeshIndex < 0 || firstSubmeshIndex > m_Submeshes.Length)
         {
@@ -250,7 +271,9 @@ public sealed class RHIStaticMeshResource : IDisposable
                 localToWorld,
                 materialId,
                 m_Submeshes[firstSubmeshIndex + i],
-                applyMaterialSlots);
+                applyMaterialSlots,
+                skinPaletteOffset,
+                skinJointCount);
         }
 
         return drawCount;

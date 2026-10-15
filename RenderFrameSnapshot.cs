@@ -1,3 +1,4 @@
+using System.Numerics;
 using Arisen.Native.RHI;
 using ArisenEngine.Core.RHI;
 using ArisenEngine.Resources.Serialization;
@@ -37,7 +38,9 @@ public readonly unsafe struct RenderFrameSnapshot
         MeshDrawCommand* drawListPtr,
         int drawListCount,
         StaticMeshRenderItem* staticMeshItemPtr,
-        int staticMeshItemCount)
+        int staticMeshItemCount,
+        Quaternion* skinJointRotationPtr,
+        int skinJointRotationCount)
     {
         Device = device;
         DeviceGeneration = deviceGeneration;
@@ -66,6 +69,8 @@ public readonly unsafe struct RenderFrameSnapshot
         DrawListCount = drawListCount;
         StaticMeshItemPtr = staticMeshItemPtr;
         StaticMeshItemCount = staticMeshItemCount;
+        SkinJointRotationPtr = skinJointRotationPtr;
+        SkinJointRotationCount = skinJointRotationCount;
     }
 
     public RHIDevice Device { get; }
@@ -95,6 +100,8 @@ public readonly unsafe struct RenderFrameSnapshot
     public int DrawListCount { get; }
     public StaticMeshRenderItem* StaticMeshItemPtr { get; }
     public int StaticMeshItemCount { get; }
+    public Quaternion* SkinJointRotationPtr { get; }
+    public int SkinJointRotationCount { get; }
 
     public ReadOnlySpan<Camera> Cameras => new(CameraPtr, CameraCount);
     public ReadOnlySpan<DirectionalLight> DirectionalLights => new(DirectionalLightPtr, DirectionalLightCount);
@@ -102,4 +109,5 @@ public readonly unsafe struct RenderFrameSnapshot
     public ReadOnlySpan<SpotLight> SpotLights => new(SpotLightPtr, SpotLightCount);
     public ReadOnlySpan<MeshDrawCommand> DrawList => new(DrawListPtr, DrawListCount);
     public ReadOnlySpan<StaticMeshRenderItem> StaticMeshItems => new(StaticMeshItemPtr, StaticMeshItemCount);
+    public ReadOnlySpan<Quaternion> SkinJointRotations => new(SkinJointRotationPtr, SkinJointRotationCount);
 }

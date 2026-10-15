@@ -41,6 +41,7 @@ public struct RenderContext
     public readonly ReadOnlySpan<SpotLight> SpotLights => Snapshot.SpotLights;
     public readonly ReadOnlySpan<MeshDrawCommand> DrawList => Snapshot.DrawList;
     public readonly ReadOnlySpan<StaticMeshRenderItem> StaticMeshItems => Snapshot.StaticMeshItems;
+    public readonly ReadOnlySpan<System.Numerics.Quaternion> SkinJointRotations => Snapshot.SkinJointRotations;
 
     internal RenderContext(FrameArena arena, RenderFrameSnapshot snapshot, RenderFrameSubmission submission)
     {

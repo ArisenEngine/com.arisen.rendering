@@ -90,6 +90,7 @@ public sealed class RenderingRuntimeAssetCooker : IRuntimeAssetCooker
             material.Shader.Guid,
             ShaderAssetCooker.ShaderSourceAssetType,
             $"material '{request.Guid:D}' shader");
+        bool supportsSkinning = ShaderLabSource.DeclaresKeyword(shaderSource.SourcePath, MeshSkinningShaderVariant.Keyword);
         foreach (ShaderStageAsset stage in material.Shader.Stages)
         {
             m_ShaderRecipes.RegisterRecipe(
@@ -104,6 +105,25 @@ public sealed class RenderingRuntimeAssetCooker : IRuntimeAssetCooker
                     stage.EntryPoint,
                     material.Shader.VariantKeywords),
                 Required: true));
+
+            if (supportsSkinning)
+            {
+                // Skinned draws compile the same shader with the SKINNED keyword, so cooked-only
+                // runs need that variant beside the material's own variant.
+                ShaderAsset skinnedShader = MeshSkinningShaderVariant.Create(material.Shader);
+                m_ShaderRecipes.RegisterRecipe(
+                    skinnedShader,
+                    stage.Name,
+                    $"material:{request.Guid:D}:skinned");
+                dependencies.Add(new RuntimeAssetCookDependencyRequest(
+                    skinnedShader.Guid,
+                    shaderSource.PackageId,
+                    ShaderAssetCooker.ShaderSourceAssetType,
+                    skinnedShader.Variant.GetCookedVariant(
+                        stage.EntryPoint,
+                        skinnedShader.VariantKeywords),
+                    Required: true));
+            }
         }
 
         foreach (MaterialTexture2DRef textureRef in material.Texture2DRefs)
