@@ -2192,6 +2192,7 @@ public static class MeshAssetCooker
         var global = Matrix4x4.Identity;
         for (int i = chain.Count - 1; i >= 0; i--)
         {
+            // Row-vector composition: the node's own transform applies first, then its parent's.
             global = ReadGltfNodeTransform(sourcePath, nodes[chain[i]], $"nodes[{chain[i]}]") * global;
         }
 
@@ -2275,26 +2276,25 @@ public static class MeshAssetCooker
         }
 
         var span = GetGltfElementSpan(sourcePath, buffers, bufferViews, accessor, elementIndex, 16);
-        // glTF stores matrices column-major, while System.Numerics' rows are the first four
-        // arguments: reading the file's order straight in transposes every matrix, which turns an
-        // inverse bind matrix into its transpose - harmless-looking for a pure translation, wrong
-        // for every rotation, and wrong for the whole skeleton either way.
+        // Read in file order: this engine composes its own transforms with System.Numerics'
+        // row-vector matrices, and `MeshCooker_CookedSkeletonReproducesTheBindPose` pins that the
+        // value read this way is exactly the inverse of the composed rest global for a real asset.
         return new Matrix4x4(
             BinaryPrimitives.ReadSingleLittleEndian(span.Slice(0, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(16, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(32, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(48, sizeof(float))),
             BinaryPrimitives.ReadSingleLittleEndian(span.Slice(4, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(20, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(36, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(52, sizeof(float))),
             BinaryPrimitives.ReadSingleLittleEndian(span.Slice(8, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(24, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(40, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(56, sizeof(float))),
             BinaryPrimitives.ReadSingleLittleEndian(span.Slice(12, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(16, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(20, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(24, sizeof(float))),
             BinaryPrimitives.ReadSingleLittleEndian(span.Slice(28, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(32, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(36, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(40, sizeof(float))),
             BinaryPrimitives.ReadSingleLittleEndian(span.Slice(44, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(48, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(52, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(56, sizeof(float))),
             BinaryPrimitives.ReadSingleLittleEndian(span.Slice(60, sizeof(float))));
     }
 
