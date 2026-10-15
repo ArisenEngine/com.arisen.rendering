@@ -659,7 +659,9 @@ public static class GltfModelImportPlanner
     {
         if (root.TryGetProperty("skins", out var skins) && skins.ValueKind == JsonValueKind.Array && skins.GetArrayLength() > 0)
         {
-            warnings.Add("skinning data is imported as a rest-pose skeleton, but the render path does not apply skinning or animation yet.");
+            // Skinning itself is part of the runtime now - an entity poses the cooked skeleton through
+            // SkeletonPoseComponent - so the warning names what is still missing: the clip side.
+            warnings.Add("skinning data is imported as a rest-pose skeleton; no clip, sampling, or animation playback drives it yet.");
         }
 
         if (root.TryGetProperty("animations", out var animations) &&
