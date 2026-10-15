@@ -2052,7 +2052,13 @@ public static class MeshAssetCooker
         var buckets = new List<int>[jointCount];
         for (int slot = 0; slot < jointCount; slot++)
         {
-            globals[slot] = GetGltfJointGlobalTransform(sourcePath, nodes, parents, sceneRoots, jointNodes[slot]);
+            globals[slot] = GetGltfJointGlobalTransform(
+                sourcePath,
+                nodes,
+                parents,
+                sceneRoots,
+                jointSlots,
+                jointNodes[slot]);
             depths[slot] = CountGltfJointAncestors(sourcePath, parents, jointSlots, jointNodes[slot], nodes.GetArrayLength());
             (buckets[depths[slot]] ??= new List<int>()).Add(slot);
         }
@@ -2166,6 +2172,7 @@ public static class MeshAssetCooker
         JsonElement nodes,
         int[] parents,
         HashSet<int> sceneRoots,
+        Dictionary<int, int> jointSlots,
         int nodeIndex)
     {
         var chain = new List<int>();
@@ -2190,9 +2197,19 @@ public static class MeshAssetCooker
         }
 
         var global = Matrix4x4.Identity;
-        for (int i = chain.Count - 1; i >= 0; i--)
+        // A skin defines its joints in the skin's own space: the inverse bind matrices already carry
+        // every bind transform, so the chain is composed from its joint root. Composing the
+        // non-joint ancestors above it (a COLLADA export's Z-up wrapper, an armature node) would
+        // apply their transform a second time and stretch the mesh - while leaving them out is what
+        // reproduces the vertices the source authored. The scene places the entity instead.
+        int anchor = chain.Count - 1;
+        while (anchor > 0 && !jointSlots.ContainsKey(chain[anchor]))
         {
-            // Row-vector composition: the node's own transform applies first, then its parent's.
+            anchor--;
+        }
+
+        for (int i = anchor; i >= 0; i--)
+        {
             global = ReadGltfNodeTransform(sourcePath, nodes[chain[i]], $"nodes[{chain[i]}]") * global;
         }
 
