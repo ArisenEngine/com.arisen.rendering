@@ -80,11 +80,16 @@ public readonly record struct CookedMesh(
     uint JointCount,
     uint SkinDataOffset,
     uint SkinDataSize,
+    uint AnimationCount,
+    uint AnimationDataOffset,
+    uint AnimationDataSize,
     CookedAssetHandle Handle)
 {
     public bool IsValid => Handle.IsValid;
 
     public bool HasSkin => JointCount > 0;
+
+    public bool HasAnimations => AnimationCount > 0;
 }
 
 public static class MeshAssetCooker
@@ -94,7 +99,18 @@ public static class MeshAssetCooker
     public const uint SkinnedMeshVertexStride = 80;
     public const uint SkinJointStride = 96;
     public const uint SubmeshStride = 16;
-    public const int CookedFormatVersion = 5;
+    // Version 6 adds the baked animation table beside the skin block: one entry per source clip with
+    // the clip's name, its duration, and per-joint rotation tracks remapped into the cooked skeleton's
+    // order. Translation and scale channels are not part of it - the pose this payload feeds stores
+    // unit-scale joints and, in this slice, rotations only - so a source that animates them is
+    // reported and those tracks are left out.
+    public const int CookedFormatVersion = 6;
+
+    /// <summary>Per-clip header: a fixed-width name, the clip's duration, and its track table.</summary>
+    internal const int AnimationNameBytes = 64;
+    internal const uint AnimationClipHeaderStride = AnimationNameBytes + 12;
+    internal const uint AnimationTrackStride = 12;
+    internal const uint AnimationKeyStride = 20;
 
     private const string MeshAssetType = "Mesh";
     private const uint GltfBinaryMagic = 0x46546C67;
@@ -102,7 +118,7 @@ public static class MeshAssetCooker
     private const uint GltfBinaryBinChunkType = 0x004E4942;
     private const int GltfBinaryHeaderSize = 12;
     private const int GltfBinaryChunkHeaderSize = 8;
-    private const int HeaderSize = 80;
+    private const int HeaderSize = 92;
     private static readonly Vector3 s_DefaultNormal = new(0.0f, 0.0f, 1.0f);
     private static readonly Vector4 s_DefaultTangent = new(1.0f, 0.0f, 0.0f, 1.0f);
     private const float SkinWeightTolerance = 1.0e-3f;
@@ -243,6 +259,9 @@ public static class MeshAssetCooker
                 header.JointCount,
                 header.SkinDataOffset,
                 header.SkinDataSize,
+                header.AnimationCount,
+                header.AnimationDataOffset,
+                header.AnimationDataSize,
                 handle);
         }
         catch
@@ -280,6 +299,29 @@ public static class MeshAssetCooker
         uint skinDataOffset = skinDataSize > 0
             ? checked((uint)(HeaderSize + vertexDataSize + indexDataSize + submeshDataSize))
             : 0u;
+        SourceAnimation[] animations = source.Animations ?? Array.Empty<SourceAnimation>();
+        if (animations.Length > 0 && !skinned)
+        {
+            throw new InvalidOperationException(
+                $"[MeshAssetCooker] Mesh source '{sourceAsset.SourcePath}' carries animations but no " +
+                "skeleton; a clip animates the joints a skinned mesh cooks.");
+        }
+
+        uint animationDataSize = 0u;
+        foreach (SourceAnimation animation in animations)
+        {
+            uint clipSize = AnimationClipHeaderStride;
+            foreach (SourceAnimationTrack track in animation.Tracks)
+            {
+                clipSize += AnimationTrackStride + checked((uint)track.Times.Length * AnimationKeyStride);
+            }
+
+            animationDataSize += clipSize;
+        }
+
+        uint animationDataOffset = animations.Length > 0
+            ? checked((uint)(HeaderSize + vertexDataSize + indexDataSize + submeshDataSize + skinDataSize))
+            : 0u;
 
         using var stream = File.Create(outputPath);
         stream.Write(s_Magic);
@@ -301,6 +343,9 @@ public static class MeshAssetCooker
         WriteInt32(stream, checked((int)jointCount));
         WriteInt32(stream, checked((int)skinDataOffset));
         WriteInt32(stream, checked((int)skinDataSize));
+        WriteInt32(stream, animations.Length);
+        WriteInt32(stream, checked((int)animationDataOffset));
+        WriteInt32(stream, checked((int)animationDataSize));
 
         Span<byte> vertexBytes = stackalloc byte[(int)SkinnedMeshVertexStride];
         vertexBytes.Clear();
@@ -369,6 +414,52 @@ public static class MeshAssetCooker
                 WriteSingle(jointBytes, 28, joint.LocalRotation.W);
                 WriteMatrix(jointBytes, 32, joint.InverseBind);
                 stream.Write(jointBytes);
+            }
+        }
+
+        if (animations.Length > 0)
+        {
+            var nameBytesBuffer = new byte[AnimationNameBytes];
+            Span<byte> trackBytes = stackalloc byte[(int)AnimationTrackStride];
+            Span<byte> keyBytes = stackalloc byte[(int)AnimationKeyStride];
+            foreach (SourceAnimation animation in animations)
+            {
+                Array.Clear(nameBytesBuffer);
+                int nameLength = Math.Min(animation.Name.Length, AnimationNameBytes - 1);
+                System.Text.Encoding.UTF8.GetBytes(animation.Name.AsSpan(0, nameLength), nameBytesBuffer);
+                stream.Write(nameBytesBuffer);
+                WriteSingle(stream, animation.Duration);
+                WriteInt32(stream, checked((int)jointCount));
+                WriteInt32(stream, animation.Tracks.Length);
+
+                uint firstKeyOffset = AnimationClipHeaderStride +
+                    checked((uint)animation.Tracks.Length * AnimationTrackStride);
+                uint keyOffset = 0u;
+                foreach (SourceAnimationTrack track in animation.Tracks)
+                {
+                    trackBytes.Clear();
+                    BinaryPrimitives.WriteInt32LittleEndian(trackBytes.Slice(0, sizeof(int)), track.JointIndex);
+                    BinaryPrimitives.WriteInt32LittleEndian(trackBytes.Slice(4, sizeof(int)), track.Times.Length);
+                    BinaryPrimitives.WriteUInt32LittleEndian(
+                        trackBytes.Slice(8, sizeof(uint)),
+                        firstKeyOffset + keyOffset);
+                    stream.Write(trackBytes);
+                    keyOffset += checked((uint)track.Times.Length * AnimationKeyStride);
+                }
+
+                foreach (SourceAnimationTrack track in animation.Tracks)
+                {
+                    for (int key = 0; key < track.Times.Length; key++)
+                    {
+                        keyBytes.Clear();
+                        WriteSingle(keyBytes, 0, track.Times[key]);
+                        WriteSingle(keyBytes, 4, track.Rotations[key].X);
+                        WriteSingle(keyBytes, 8, track.Rotations[key].Y);
+                        WriteSingle(keyBytes, 12, track.Rotations[key].Z);
+                        WriteSingle(keyBytes, 16, track.Rotations[key].W);
+                        stream.Write(keyBytes);
+                    }
+                }
             }
         }
 
@@ -487,6 +578,9 @@ public static class MeshAssetCooker
         var jointCount = ReadInt32(bytes, 68);
         var skinDataOffset = ReadInt32(bytes, 72);
         var skinDataSize = ReadInt32(bytes, 76);
+        var animationCount = ReadInt32(bytes, 80);
+        var animationDataOffset = ReadInt32(bytes, 84);
+        var animationDataSize = ReadInt32(bytes, 88);
         var bounds = new MeshBounds(
             new Vector3(
                 ReadSingle(bytes, 44),
@@ -550,6 +644,28 @@ public static class MeshAssetCooker
             throw new InvalidOperationException("[MeshAssetCooker] Cooked mesh payload is truncated.");
         }
 
+        if (animationCount < 0 || animationDataOffset < 0 || animationDataSize < 0)
+        {
+            throw new InvalidOperationException("[MeshAssetCooker] Cooked mesh animation header contains invalid values.");
+        }
+
+        if (animationCount == 0)
+        {
+            if (animationDataOffset != 0 || animationDataSize != 0)
+            {
+                throw new InvalidOperationException("[MeshAssetCooker] Cooked mesh declares animation payload fields without clips.");
+            }
+        }
+        else
+        {
+            if (jointCount == 0 ||
+                animationDataOffset != HeaderSize + vertexDataSize + indexDataSize + submeshDataSize + skinDataSize ||
+                animationDataOffset + animationDataSize > bytes.Length)
+            {
+                throw new InvalidOperationException("[MeshAssetCooker] Cooked mesh animation payload layout is inconsistent with its header.");
+            }
+        }
+
         ValidateSubmeshPayload(
             bytes.Slice(HeaderSize + vertexDataSize + indexDataSize, submeshDataSize),
             checked((uint)indexCount));
@@ -566,7 +682,10 @@ public static class MeshAssetCooker
             checked((uint)submeshDataSize),
             checked((uint)jointCount),
             checked((uint)skinDataOffset),
-            checked((uint)skinDataSize));
+            checked((uint)skinDataSize),
+            checked((uint)animationCount),
+            checked((uint)animationDataOffset),
+            checked((uint)animationDataSize));
     }
 
     public static void ReadSubmeshes(ReadOnlySpan<byte> bytes, CookedMesh mesh, Span<MeshSubmesh> destination)
@@ -1197,7 +1316,190 @@ public static class MeshAssetCooker
         var sourceSubmeshes = submeshes.ToArray();
         ValidateSourceSubmeshes(sourcePath, sourceSubmeshes, checked((uint)indices.Count));
         var skin = skinState.HasSkin ? new MeshSkin(skinState.Joints.ToArray()) : null;
-        return new SourceMesh(sourceVertices, indices.ToArray(), sourceSubmeshes, skin);
+        var animations = skin != null
+            ? ReadGltfAnimations(sourcePath, root, skinState, buffers, bufferViews, accessors)
+            : null;
+        return new SourceMesh(sourceVertices, indices.ToArray(), sourceSubmeshes, skin, animations);
+    }
+
+    /// <summary>
+    /// Bakes the source's clips for the cooked skeleton: a channel's target node maps to a cooked
+    /// joint through the skin's slot map, LINEAR rotation channels become key tracks, and channels
+    /// this pose slice cannot carry - translations and scales - are counted and reported instead of
+    /// being silently lost. A non-LINEAR sampler is rejected because the cook would have to resample
+    /// it into keys nobody authored.
+    /// </summary>
+    private static SourceAnimation[] ReadGltfAnimations(
+        string sourcePath,
+        JsonElement root,
+        GltfSkinState skinState,
+        byte[][] buffers,
+        GltfBufferView[] bufferViews,
+        GltfAccessor[] accessors)
+    {
+        if (!root.TryGetProperty("animations", out var animations) ||
+            animations.ValueKind != JsonValueKind.Array)
+        {
+            return Array.Empty<SourceAnimation>();
+        }
+
+        var result = new List<SourceAnimation>(animations.GetArrayLength());
+        int droppedTranslationChannels = 0;
+        int droppedScaleChannels = 0;
+        int droppedForeignChannels = 0;
+        foreach (var animation in animations.EnumerateArray())
+        {
+            if (!animation.TryGetProperty("channels", out var channels) ||
+                channels.ValueKind != JsonValueKind.Array ||
+                !animation.TryGetProperty("samplers", out var samplers) ||
+                samplers.ValueKind != JsonValueKind.Array)
+            {
+                continue;
+            }
+
+            var tracks = new List<SourceAnimationTrack>(channels.GetArrayLength());
+            var trackByJoint = new Dictionary<int, int>(channels.GetArrayLength());
+            float duration = 0.0f;
+            foreach (var channel in channels.EnumerateArray())
+            {
+                if (!channel.TryGetProperty("target", out var target) ||
+                    !target.TryGetProperty("node", out var nodeElement) ||
+                    !target.TryGetProperty("path", out var pathElement))
+                {
+                    continue;
+                }
+
+                string path = pathElement.GetString() ?? string.Empty;
+                if (string.Equals(path, "translation", StringComparison.Ordinal))
+                {
+                    droppedTranslationChannels++;
+                    continue;
+                }
+
+                if (string.Equals(path, "scale", StringComparison.Ordinal))
+                {
+                    droppedScaleChannels++;
+                    continue;
+                }
+
+                if (!string.Equals(path, "rotation", StringComparison.Ordinal))
+                {
+                    droppedForeignChannels++;
+                    continue;
+                }
+
+                int nodeIndex = nodeElement.GetInt32();
+                int jointIndex = nodeIndex >= 0 && nodeIndex < skinState.CookedSlotOfNode.Length
+                    ? skinState.CookedSlotOfNode[nodeIndex]
+                    : -1;
+                if (jointIndex < 0)
+                {
+                    // A channel on a node the character no longer carries (a dropped accessory, or a
+                    // node outside the skeleton) animates nothing the cooked mesh can show.
+                    droppedForeignChannels++;
+                    continue;
+                }
+
+                if (!channel.TryGetProperty("sampler", out var samplerElement))
+                {
+                    continue;
+                }
+
+                int samplerIndex = samplerElement.GetInt32();
+                if (samplerIndex < 0 || samplerIndex >= samplers.GetArrayLength())
+                {
+                    throw new InvalidOperationException(
+                        $"[MeshAssetCooker] glTF source '{sourcePath}' animation channel references " +
+                        $"sampler '{samplerIndex}' outside sampler count '{samplers.GetArrayLength()}'.");
+                }
+
+                JsonElement sampler = samplers[samplerIndex];
+                if (sampler.TryGetProperty("interpolation", out var interpolationElement) &&
+                    interpolationElement.GetString() is { Length: > 0 } interpolation &&
+                    !string.Equals(interpolation, "LINEAR", StringComparison.Ordinal))
+                {
+                    throw new NotSupportedException(
+                        $"[MeshAssetCooker] glTF source '{sourcePath}' animation sampler interpolates " +
+                        $"'{interpolation}'; the clip cook bakes LINEAR rotation channels only.");
+                }
+
+                GltfAccessor times = GetGltfAccessor(sourcePath, accessors, sampler.GetProperty("input").GetInt32());
+                GltfAccessor values = GetGltfAccessor(sourcePath, accessors, sampler.GetProperty("output").GetInt32());
+                if (times.Type != "SCALAR" || times.ComponentType != GltfComponentType.Float ||
+                    values.Type != "VEC4" || values.ComponentType != GltfComponentType.Float ||
+                    times.Count != values.Count)
+                {
+                    throw new InvalidOperationException(
+                        $"[MeshAssetCooker] glTF source '{sourcePath}' animation sampler must pair FLOAT " +
+                        "SCALAR times with FLOAT VEC4 rotations of the same count.");
+                }
+
+                var keyTimes = new float[times.Count];
+                var keyRotations = new Quaternion[values.Count];
+                for (int key = 0; key < times.Count; key++)
+                {
+                    var timeSpan = GetGltfElementSpan(sourcePath, buffers, bufferViews, times, key, 1);
+                    keyTimes[key] = BinaryPrimitives.ReadSingleLittleEndian(timeSpan.Slice(0, sizeof(float)));
+                    Vector4 rotation = ReadGltfVector4(sourcePath, buffers, bufferViews, values, key);
+                    var keyed = new Quaternion(rotation.X, rotation.Y, rotation.Z, rotation.W);
+                    float lengthSquared = keyed.LengthSquared();
+                    if (!float.IsFinite(lengthSquared) || lengthSquared < 1.0e-8f)
+                    {
+                        throw new InvalidOperationException(
+                            $"[MeshAssetCooker] glTF source '{sourcePath}' animation rotation key {key} " +
+                            "is not a non-zero quaternion.");
+                    }
+
+                    keyRotations[key] = Quaternion.Normalize(keyed);
+                    duration = MathF.Max(duration, keyTimes[key]);
+                    if (key > 0 && keyTimes[key] < keyTimes[key - 1])
+                    {
+                        throw new InvalidOperationException(
+                            $"[MeshAssetCooker] glTF source '{sourcePath}' animation key times must " +
+                            "increase; the sampler searches them.");
+                    }
+                }
+
+                var track = new SourceAnimationTrack(jointIndex, keyTimes, keyRotations);
+                if (trackByJoint.TryGetValue(jointIndex, out int existing))
+                {
+                    tracks[existing] = track;
+                }
+                else
+                {
+                    trackByJoint.Add(jointIndex, tracks.Count);
+                    tracks.Add(track);
+                }
+            }
+
+            if (tracks.Count == 0)
+            {
+                continue;
+            }
+
+            string name = animation.TryGetProperty("name", out var nameElement)
+                ? nameElement.GetString() ?? string.Empty
+                : string.Empty;
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                throw new InvalidOperationException(
+                    $"[MeshAssetCooker] glTF source '{sourcePath}' declares an animation without a name; " +
+                    "a clip is addressed by its name.");
+            }
+
+            result.Add(new SourceAnimation(name, duration, tracks.ToArray()));
+        }
+
+        if (droppedTranslationChannels > 0 || droppedScaleChannels > 0 || droppedForeignChannels > 0)
+        {
+            Logger.Warning(
+                $"[MeshAssetCooker] Source '{sourcePath}' bakes {result.Count} clip(s); dropped " +
+                $"{droppedTranslationChannels} translation channel(s), {droppedScaleChannels} scale " +
+                $"channel(s), and {droppedForeignChannels} channel(s) outside the cooked skeleton. The " +
+                "pose this payload feeds stores unit-scale joints and, in this slice, rotations only.");
+        }
+
+        return result.ToArray();
     }
 
     private static bool TryReadGltfSceneGraph(
@@ -1618,6 +1920,12 @@ public static class MeshAssetCooker
 
         public int[] VertexJointRemap { get; private set; } = Array.Empty<int>();
 
+        /// <summary>
+        /// The cooked joint index each source node landed on, or -1 for a node that is not a joint.
+        /// A clip's channels target nodes, so this is what maps them into the cooked skeleton.
+        /// </summary>
+        public int[] CookedSlotOfNode { get; private set; } = Array.Empty<int>();
+
         public void EnableSceneGraph(JsonElement nodes, int[] sceneRootNodes)
         {
             Nodes = nodes;
@@ -1670,11 +1978,12 @@ public static class MeshAssetCooker
             SkinIndex = skinIndex;
         }
 
-        public void SetSkin(List<MeshSkinJoint> joints, int[] vertexJointRemap)
+        public void SetSkin(List<MeshSkinJoint> joints, int[] vertexJointRemap, int[] cookedSlotOfNode)
         {
             Joints.Clear();
             Joints.AddRange(joints);
             VertexJointRemap = vertexJointRemap;
+            CookedSlotOfNode = cookedSlotOfNode;
         }
 
         private NotSupportedException MixesStaticAndSkinned(int staticNodeIndex, int skinnedNodeIndex)
@@ -1806,7 +2115,14 @@ public static class MeshAssetCooker
                 inverseBind));
         }
 
-        state.SetSkin(joints, cookedOfSlot);
+        var cookedSlotOfNode = new int[nodes.GetArrayLength()];
+        Array.Fill(cookedSlotOfNode, -1);
+        for (int slot = 0; slot < jointCount; slot++)
+        {
+            cookedSlotOfNode[jointNodes[slot]] = cookedOfSlot[slot];
+        }
+
+        state.SetSkin(joints, cookedOfSlot, cookedSlotOfNode);
     }
 
     private static int[] BuildGltfNodeParentMap(string sourcePath, JsonElement nodes)
@@ -2879,7 +3195,22 @@ public static class MeshAssetCooker
         SourceVertex[] Vertices,
         uint[] Indices,
         SourceSubmesh[] Submeshes,
-        MeshSkin? Skin = null);
+        MeshSkin? Skin = null,
+        SourceAnimation[]? Animations = null);
+
+    /// <summary>
+    /// One baked clip: its name, its duration, and one rotation track per animated joint in the
+    /// cooked skeleton's order. A joint without a track keeps the cooked rest rotation.
+    /// </summary>
+    private sealed record SourceAnimation(
+        string Name,
+        float Duration,
+        SourceAnimationTrack[] Tracks);
+
+    private sealed record SourceAnimationTrack(
+        int JointIndex,
+        float[] Times,
+        Quaternion[] Rotations);
 
     private readonly record struct SourceSubmesh(
         uint FirstIndex,
@@ -2989,5 +3320,8 @@ public static class MeshAssetCooker
         uint SubmeshDataSize,
         uint JointCount,
         uint SkinDataOffset,
-        uint SkinDataSize);
+        uint SkinDataSize,
+        uint AnimationCount,
+        uint AnimationDataOffset,
+        uint AnimationDataSize);
 }
