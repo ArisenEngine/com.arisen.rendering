@@ -48,6 +48,20 @@ public readonly record struct MeshSubmesh(
     int VertexOffset,
     uint MaterialSlot);
 
+/// <summary>
+/// One joint of a skinned mesh's skeleton, ordered parents-first so a palette resolves in a single
+/// pass. The local transform is the joint's rest pose relative to its nearest joint ancestor (or to
+/// the mesh space for root joints), and the inverse bind maps a bind-pose vertex into that joint's
+/// space. In the row-vector convention a palette entry is <c>inverseBind * jointGlobal</c>.
+/// </summary>
+public readonly record struct MeshSkinJoint(
+    int ParentIndex,
+    Vector3 LocalTranslation,
+    Quaternion LocalRotation,
+    Matrix4x4 InverseBind);
+
+public sealed record MeshSkin(IReadOnlyList<MeshSkinJoint> Joints);
+
 public readonly record struct CookedMesh(
     MeshAsset Asset,
     string Variant,
@@ -63,16 +77,24 @@ public readonly record struct CookedMesh(
     uint SubmeshCount,
     uint SubmeshDataOffset,
     uint SubmeshDataSize,
+    uint JointCount,
+    uint SkinDataOffset,
+    uint SkinDataSize,
     CookedAssetHandle Handle)
 {
     public bool IsValid => Handle.IsValid;
+
+    public bool HasSkin => JointCount > 0;
 }
 
 public static class MeshAssetCooker
 {
     public const uint StaticMeshVertexStride = 60;
+    /// <summary>Joint indices (4 x uint8) and weights (4 x float) follow the static attributes.</summary>
+    public const uint SkinnedMeshVertexStride = 80;
+    public const uint SkinJointStride = 96;
     public const uint SubmeshStride = 16;
-    public const int CookedFormatVersion = 4;
+    public const int CookedFormatVersion = 5;
 
     private const string MeshAssetType = "Mesh";
     private const uint GltfBinaryMagic = 0x46546C67;
@@ -83,6 +105,9 @@ public static class MeshAssetCooker
     private const int HeaderSize = 80;
     private static readonly Vector3 s_DefaultNormal = new(0.0f, 0.0f, 1.0f);
     private static readonly Vector4 s_DefaultTangent = new(1.0f, 0.0f, 0.0f, 1.0f);
+    private const float SkinWeightTolerance = 1.0e-3f;
+    private const float JointScaleTolerance = 1.0e-3f;
+    private const float IdentityTransformTolerance = 1.0e-4f;
     private static readonly byte[] s_Magic = Encoding.ASCII.GetBytes("ARISMESH");
 
     public static CookedMesh LoadOrCook(IAssetDatabase assetDatabase, MeshAsset mesh)
@@ -215,6 +240,9 @@ public static class MeshAssetCooker
                 header.SubmeshCount,
                 HeaderSize + header.VertexDataSize + header.IndexDataSize,
                 header.SubmeshDataSize,
+                header.JointCount,
+                header.SkinDataOffset,
+                header.SkinDataSize,
                 handle);
         }
         catch
@@ -241,15 +269,23 @@ public static class MeshAssetCooker
         var submeshes = source.Submeshes.Length > 0
             ? source.Submeshes
             : new[] { new SourceSubmesh(0, checked((uint)source.Indices.Length), 0, 0) };
-        var vertexDataSize = checked(source.Vertices.Length * (int)StaticMeshVertexStride);
+        ValidateSkin(source.Vertices, source.Skin);
+        bool skinned = source.Skin != null;
+        uint vertexStride = skinned ? SkinnedMeshVertexStride : StaticMeshVertexStride;
+        uint jointCount = skinned ? checked((uint)source.Skin!.Joints.Count) : 0u;
+        var vertexDataSize = checked(source.Vertices.Length * (int)vertexStride);
         var indexDataSize = checked(source.Indices.Length * sizeof(uint));
         var submeshDataSize = checked(submeshes.Length * (int)SubmeshStride);
+        uint skinDataSize = jointCount * SkinJointStride;
+        uint skinDataOffset = skinDataSize > 0
+            ? checked((uint)(HeaderSize + vertexDataSize + indexDataSize + submeshDataSize))
+            : 0u;
 
         using var stream = File.Create(outputPath);
         stream.Write(s_Magic);
         WriteInt32(stream, CookedFormatVersion);
         WriteInt32(stream, source.Vertices.Length);
-        WriteInt32(stream, checked((int)StaticMeshVertexStride));
+        WriteInt32(stream, checked((int)vertexStride));
         WriteInt32(stream, vertexDataSize);
         WriteInt32(stream, source.Indices.Length);
         WriteInt32(stream, (int)mesh.Variant.IndexFormat);
@@ -262,11 +298,12 @@ public static class MeshAssetCooker
         WriteSingle(stream, bounds.Max.X);
         WriteSingle(stream, bounds.Max.Y);
         WriteSingle(stream, bounds.Max.Z);
-        WriteInt32(stream, 0);
-        WriteInt32(stream, 0);
-        WriteInt32(stream, 0);
+        WriteInt32(stream, checked((int)jointCount));
+        WriteInt32(stream, checked((int)skinDataOffset));
+        WriteInt32(stream, checked((int)skinDataSize));
 
-        Span<byte> vertexBytes = stackalloc byte[(int)StaticMeshVertexStride];
+        Span<byte> vertexBytes = stackalloc byte[(int)SkinnedMeshVertexStride];
+        vertexBytes.Clear();
         foreach (var vertex in source.Vertices)
         {
             WriteSingle(vertexBytes, 0, vertex.PositionX);
@@ -284,7 +321,19 @@ public static class MeshAssetCooker
             WriteSingle(vertexBytes, 48, vertex.ColorR);
             WriteSingle(vertexBytes, 52, vertex.ColorG);
             WriteSingle(vertexBytes, 56, vertex.ColorB);
-            stream.Write(vertexBytes);
+            if (skinned)
+            {
+                vertexBytes[60] = checked((byte)vertex.JointX);
+                vertexBytes[61] = checked((byte)vertex.JointY);
+                vertexBytes[62] = checked((byte)vertex.JointZ);
+                vertexBytes[63] = checked((byte)vertex.JointW);
+                WriteSingle(vertexBytes, 64, vertex.WeightX);
+                WriteSingle(vertexBytes, 68, vertex.WeightY);
+                WriteSingle(vertexBytes, 72, vertex.WeightZ);
+                WriteSingle(vertexBytes, 76, vertex.WeightW);
+            }
+
+            stream.Write(vertexBytes.Slice(0, checked((int)vertexStride)));
         }
 
         Span<byte> indexBytes = stackalloc byte[sizeof(uint)];
@@ -304,8 +353,114 @@ public static class MeshAssetCooker
             stream.Write(submeshBytes);
         }
 
+        if (skinned)
+        {
+            Span<byte> jointBytes = stackalloc byte[(int)SkinJointStride];
+            foreach (MeshSkinJoint joint in source.Skin!.Joints)
+            {
+                jointBytes.Clear();
+                BinaryPrimitives.WriteInt32LittleEndian(jointBytes.Slice(0, sizeof(int)), joint.ParentIndex);
+                WriteSingle(jointBytes, 4, joint.LocalTranslation.X);
+                WriteSingle(jointBytes, 8, joint.LocalTranslation.Y);
+                WriteSingle(jointBytes, 12, joint.LocalTranslation.Z);
+                WriteSingle(jointBytes, 16, joint.LocalRotation.X);
+                WriteSingle(jointBytes, 20, joint.LocalRotation.Y);
+                WriteSingle(jointBytes, 24, joint.LocalRotation.Z);
+                WriteSingle(jointBytes, 28, joint.LocalRotation.W);
+                WriteMatrix(jointBytes, 32, joint.InverseBind);
+                stream.Write(jointBytes);
+            }
+        }
+
         Logger.Log(
-            $"[MeshAssetCooker] Cooked mesh asset {mesh.Guid} | Vertices: {source.Vertices.Length} | Indices: {source.Indices.Length} | Submeshes: {submeshes.Length} | Bounds: {bounds.Min}->{bounds.Max} | Variant: {variant} | Output: {outputPath}");
+            $"[MeshAssetCooker] Cooked mesh asset {mesh.Guid} | Vertices: {source.Vertices.Length} | Indices: {source.Indices.Length} | Submeshes: {submeshes.Length} | Joints: {jointCount} | Bounds: {bounds.Min}->{bounds.Max} | Variant: {variant} | Output: {outputPath}");
+    }
+
+    private static void ValidateSkin(SourceVertex[] vertices, MeshSkin? skin)
+    {
+        bool anySkinnedVertex = false;
+        bool allSkinnedVertices = true;
+        foreach (SourceVertex vertex in vertices)
+        {
+            bool skinned = vertex.WeightX > 0.0f || vertex.WeightY > 0.0f ||
+                           vertex.WeightZ > 0.0f || vertex.WeightW > 0.0f;
+            anySkinnedVertex |= skinned;
+            allSkinnedVertices &= skinned;
+        }
+
+        if (skin == null)
+        {
+            if (anySkinnedVertex)
+            {
+                throw new InvalidOperationException(
+                    "[MeshAssetCooker] Mesh vertices carry skin weights, but the source declares no skeleton.");
+            }
+
+            return;
+        }
+
+        if (skin.Joints.Count == 0 || skin.Joints.Count > 255)
+        {
+            throw new InvalidOperationException(
+                $"[MeshAssetCooker] Skeleton joint count '{skin.Joints.Count}' is outside 1..255.");
+        }
+
+        if (!allSkinnedVertices)
+        {
+            throw new InvalidOperationException(
+                "[MeshAssetCooker] A skinned mesh requires joint indices and weights on every vertex.");
+        }
+
+        for (int index = 0; index < skin.Joints.Count; index++)
+        {
+            MeshSkinJoint joint = skin.Joints[index];
+            if (joint.ParentIndex < -1 || joint.ParentIndex >= index)
+            {
+                throw new InvalidOperationException(
+                    $"[MeshAssetCooker] Skeleton joint {index} declares parent '{joint.ParentIndex}'; " +
+                    "joints must be ordered parents-first and only reference earlier joints.");
+            }
+        }
+
+        foreach (SourceVertex vertex in vertices)
+        {
+            float weightSum = vertex.WeightX + vertex.WeightY + vertex.WeightZ + vertex.WeightW;
+            if (!float.IsFinite(weightSum) || MathF.Abs(weightSum - 1.0f) > SkinWeightTolerance)
+            {
+                throw new InvalidOperationException(
+                    $"[MeshAssetCooker] Skinned mesh weights must sum to 1, but a vertex weights sum to '{weightSum}'.");
+            }
+
+            foreach (int jointIndex in new[] { vertex.JointX, vertex.JointY, vertex.JointZ, vertex.JointW })
+            {
+                if (jointIndex >= skin.Joints.Count)
+                {
+                    throw new InvalidOperationException(
+                        $"[MeshAssetCooker] A vertex references joint {jointIndex}, but the skeleton " +
+                        $"has {skin.Joints.Count} joints.");
+                }
+            }
+        }
+    }
+
+    private static void WriteMatrix(Span<byte> destination, int offset, Matrix4x4 matrix)
+    {
+        WriteSingle(destination, offset, matrix.M11);
+        WriteSingle(destination, offset + 4, matrix.M12);
+        WriteSingle(destination, offset + 8, matrix.M13);
+        WriteSingle(destination, offset + 12, matrix.M14);
+        WriteSingle(destination, offset + 16, matrix.M21);
+        WriteSingle(destination, offset + 20, matrix.M22);
+        WriteSingle(destination, offset + 24, matrix.M23);
+        WriteSingle(destination, offset + 28, matrix.M24);
+        WriteSingle(destination, offset + 32, matrix.M31);
+        WriteSingle(destination, offset + 36, matrix.M32);
+        WriteSingle(destination, offset + 40, matrix.M33);
+        WriteSingle(destination, offset + 44, matrix.M34);
+        WriteSingle(destination, offset + 48, matrix.M41);
+        WriteSingle(destination, offset + 52, matrix.M42);
+        WriteSingle(destination, offset + 56, matrix.M43);
+        WriteSingle(destination, offset + 60, matrix.M44);
     }
 
     private static CookedMeshHeader ReadHeader(ReadOnlySpan<byte> bytes)
@@ -329,6 +484,9 @@ public static class MeshAssetCooker
         var indexDataSize = ReadInt32(bytes, 32);
         var submeshCount = ReadInt32(bytes, 36);
         var submeshDataSize = ReadInt32(bytes, 40);
+        var jointCount = ReadInt32(bytes, 68);
+        var skinDataOffset = ReadInt32(bytes, 72);
+        var skinDataSize = ReadInt32(bytes, 76);
         var bounds = new MeshBounds(
             new Vector3(
                 ReadSingle(bytes, 44),
@@ -350,9 +508,31 @@ public static class MeshAssetCooker
             throw new InvalidOperationException("[MeshAssetCooker] Cooked mesh header contains invalid counts or payload sizes.");
         }
 
-        if (vertexStride != StaticMeshVertexStride)
+        if (vertexStride != StaticMeshVertexStride && vertexStride != SkinnedMeshVertexStride)
         {
             throw new InvalidOperationException($"[MeshAssetCooker] Cooked mesh vertex stride '{vertexStride}' is not supported.");
+        }
+
+        if (jointCount < 0 || jointCount > 255 || skinDataOffset < 0 || skinDataSize < 0)
+        {
+            throw new InvalidOperationException("[MeshAssetCooker] Cooked mesh skin header contains invalid values.");
+        }
+
+        if (jointCount == 0)
+        {
+            if (vertexStride != StaticMeshVertexStride || skinDataOffset != 0 || skinDataSize != 0)
+            {
+                throw new InvalidOperationException("[MeshAssetCooker] Cooked mesh declares skin payload fields without joints.");
+            }
+        }
+        else
+        {
+            if (vertexStride != SkinnedMeshVertexStride ||
+                skinDataSize != checked(jointCount * (int)SkinJointStride) ||
+                skinDataOffset != HeaderSize + vertexDataSize + indexDataSize + submeshDataSize)
+            {
+                throw new InvalidOperationException("[MeshAssetCooker] Cooked mesh skin payload layout is inconsistent with its header.");
+            }
         }
 
         if (indexFormat != MeshIndexFormat.UInt32)
@@ -365,7 +545,7 @@ public static class MeshAssetCooker
             throw new InvalidOperationException("[MeshAssetCooker] Cooked mesh submesh payload size does not match submesh count.");
         }
 
-        if (HeaderSize + vertexDataSize + indexDataSize + submeshDataSize > bytes.Length)
+        if (HeaderSize + vertexDataSize + indexDataSize + submeshDataSize + skinDataSize > bytes.Length)
         {
             throw new InvalidOperationException("[MeshAssetCooker] Cooked mesh payload is truncated.");
         }
@@ -383,7 +563,10 @@ public static class MeshAssetCooker
             checked((uint)indexDataSize),
             bounds,
             checked((uint)submeshCount),
-            checked((uint)submeshDataSize));
+            checked((uint)submeshDataSize),
+            checked((uint)jointCount),
+            checked((uint)skinDataOffset),
+            checked((uint)skinDataSize));
     }
 
     public static void ReadSubmeshes(ReadOnlySpan<byte> bytes, CookedMesh mesh, Span<MeshSubmesh> destination)
@@ -484,6 +667,15 @@ public static class MeshAssetCooker
         var vertices = new List<SourceVertex>();
         var indices = new List<uint>();
         var submeshes = new List<SourceSubmesh>();
+        var joints = new List<MeshSkinJoint>();
+        var currentJoint0 = 0;
+        var currentJoint1 = 0;
+        var currentJoint2 = 0;
+        var currentJoint3 = 0;
+        var currentWeight0 = 0.0f;
+        var currentWeight1 = 0.0f;
+        var currentWeight2 = 0.0f;
+        var currentWeight3 = 0.0f;
 
         foreach (var rawLine in File.ReadLines(sourcePath))
         {
@@ -506,76 +698,78 @@ public static class MeshAssetCooker
                     throw new InvalidOperationException($"[MeshAssetCooker] Mesh vertex line in '{sourcePath}' must contain 8 values (position, uv0, color0), 11 values (position, normal, uv0, color0), or 15 values (position, normal, tangent, uv0, color0).");
                 }
 
+                Vector3 vertexNormal;
+                Vector4 vertexTangent;
+                float u;
+                float v;
+                float colorR;
+                float colorG;
+                float colorB;
                 if (parts.Length == 9)
                 {
-                    vertices.Add(new SourceVertex(
-                        ReadFloat(parts[1]),
-                        ReadFloat(parts[2]),
-                        ReadFloat(parts[3]),
-                        s_DefaultNormal.X,
-                        s_DefaultNormal.Y,
-                        s_DefaultNormal.Z,
-                        s_DefaultTangent.X,
-                        s_DefaultTangent.Y,
-                        s_DefaultTangent.Z,
-                        s_DefaultTangent.W,
-                        ReadFloat(parts[4]),
-                        ReadFloat(parts[5]),
-                        ReadFloat(parts[6]),
-                        ReadFloat(parts[7]),
-                        ReadFloat(parts[8])));
+                    vertexNormal = s_DefaultNormal;
+                    vertexTangent = s_DefaultTangent;
+                    u = ReadFloat(parts[4]);
+                    v = ReadFloat(parts[5]);
+                    colorR = ReadFloat(parts[6]);
+                    colorG = ReadFloat(parts[7]);
+                    colorB = ReadFloat(parts[8]);
                 }
                 else if (parts.Length == 12)
                 {
-                    var normal = NormalizeOrDefault(new Vector3(
+                    vertexNormal = NormalizeOrDefault(new Vector3(
                         ReadFloat(parts[4]),
                         ReadFloat(parts[5]),
                         ReadFloat(parts[6])));
-                    vertices.Add(new SourceVertex(
-                        ReadFloat(parts[1]),
-                        ReadFloat(parts[2]),
-                        ReadFloat(parts[3]),
-                        normal.X,
-                        normal.Y,
-                        normal.Z,
-                        s_DefaultTangent.X,
-                        s_DefaultTangent.Y,
-                        s_DefaultTangent.Z,
-                        s_DefaultTangent.W,
-                        ReadFloat(parts[7]),
-                        ReadFloat(parts[8]),
-                        ReadFloat(parts[9]),
-                        ReadFloat(parts[10]),
-                        ReadFloat(parts[11])));
+                    vertexTangent = s_DefaultTangent;
+                    u = ReadFloat(parts[7]);
+                    v = ReadFloat(parts[8]);
+                    colorR = ReadFloat(parts[9]);
+                    colorG = ReadFloat(parts[10]);
+                    colorB = ReadFloat(parts[11]);
                 }
                 else
                 {
-                    var normal = NormalizeOrDefault(new Vector3(
+                    vertexNormal = NormalizeOrDefault(new Vector3(
                         ReadFloat(parts[4]),
                         ReadFloat(parts[5]),
                         ReadFloat(parts[6])));
-                    var tangent = NormalizeTangentOrDefault(new Vector4(
+                    vertexTangent = NormalizeTangentOrDefault(new Vector4(
                         ReadFloat(parts[7]),
                         ReadFloat(parts[8]),
                         ReadFloat(parts[9]),
                         ReadFloat(parts[10])));
-                    vertices.Add(new SourceVertex(
-                        ReadFloat(parts[1]),
-                        ReadFloat(parts[2]),
-                        ReadFloat(parts[3]),
-                        normal.X,
-                        normal.Y,
-                        normal.Z,
-                        tangent.X,
-                        tangent.Y,
-                        tangent.Z,
-                        tangent.W,
-                        ReadFloat(parts[11]),
-                        ReadFloat(parts[12]),
-                        ReadFloat(parts[13]),
-                        ReadFloat(parts[14]),
-                        ReadFloat(parts[15])));
+                    u = ReadFloat(parts[11]);
+                    v = ReadFloat(parts[12]);
+                    colorR = ReadFloat(parts[13]);
+                    colorG = ReadFloat(parts[14]);
+                    colorB = ReadFloat(parts[15]);
                 }
+
+                vertices.Add(new SourceVertex(
+                    ReadFloat(parts[1]),
+                    ReadFloat(parts[2]),
+                    ReadFloat(parts[3]),
+                    vertexNormal.X,
+                    vertexNormal.Y,
+                    vertexNormal.Z,
+                    vertexTangent.X,
+                    vertexTangent.Y,
+                    vertexTangent.Z,
+                    vertexTangent.W,
+                    u,
+                    v,
+                    colorR,
+                    colorG,
+                    colorB,
+                    currentJoint0,
+                    currentJoint1,
+                    currentJoint2,
+                    currentJoint3,
+                    currentWeight0,
+                    currentWeight1,
+                    currentWeight2,
+                    currentWeight3));
                 continue;
             }
 
@@ -614,6 +808,70 @@ public static class MeshAssetCooker
                 continue;
             }
 
+            if (string.Equals(parts[0], "joint", StringComparison.OrdinalIgnoreCase))
+            {
+                if (parts.Length != 9)
+                {
+                    throw new InvalidOperationException($"[MeshAssetCooker] Mesh joint line in '{sourcePath}' must contain parentIndex, translation xyz, and rotation xyzw.");
+                }
+
+                if (!int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var parentIndex))
+                {
+                    throw new InvalidOperationException($"[MeshAssetCooker] Invalid mesh joint parent token '{parts[1]}' in '{sourcePath}'.");
+                }
+
+                joints.Add(new MeshSkinJoint(
+                    parentIndex,
+                    new Vector3(ReadFloat(parts[2]), ReadFloat(parts[3]), ReadFloat(parts[4])),
+                    ReadUnitQuaternion(sourcePath, parts, 5),
+                    Matrix4x4.Identity));
+                continue;
+            }
+
+            if (string.Equals(parts[0], "ibm", StringComparison.OrdinalIgnoreCase))
+            {
+                if (parts.Length != 17)
+                {
+                    throw new InvalidOperationException($"[MeshAssetCooker] Mesh ibm line in '{sourcePath}' must contain 16 matrix values.");
+                }
+
+                if (joints.Count == 0)
+                {
+                    throw new InvalidOperationException($"[MeshAssetCooker] Mesh ibm line in '{sourcePath}' must follow a joint line.");
+                }
+
+                joints[^1] = joints[^1] with { InverseBind = ReadMatrix4x4(parts, 1) };
+                continue;
+            }
+
+            if (string.Equals(parts[0], "joints", StringComparison.OrdinalIgnoreCase))
+            {
+                if (parts.Length != 5)
+                {
+                    throw new InvalidOperationException($"[MeshAssetCooker] Mesh joints line in '{sourcePath}' must contain 4 joint indices.");
+                }
+
+                currentJoint0 = ReadJointIndex(sourcePath, parts[1]);
+                currentJoint1 = ReadJointIndex(sourcePath, parts[2]);
+                currentJoint2 = ReadJointIndex(sourcePath, parts[3]);
+                currentJoint3 = ReadJointIndex(sourcePath, parts[4]);
+                continue;
+            }
+
+            if (string.Equals(parts[0], "weights", StringComparison.OrdinalIgnoreCase))
+            {
+                if (parts.Length != 5)
+                {
+                    throw new InvalidOperationException($"[MeshAssetCooker] Mesh weights line in '{sourcePath}' must contain 4 weight values.");
+                }
+
+                currentWeight0 = ReadFloat(parts[1]);
+                currentWeight1 = ReadFloat(parts[2]);
+                currentWeight2 = ReadFloat(parts[3]);
+                currentWeight3 = ReadFloat(parts[4]);
+                continue;
+            }
+
             throw new InvalidOperationException($"[MeshAssetCooker] Unknown mesh source token '{parts[0]}' in '{sourcePath}'.");
         }
 
@@ -634,7 +892,8 @@ public static class MeshAssetCooker
             ? submeshes.ToArray()
             : new[] { new SourceSubmesh(0, checked((uint)indices.Count), 0, 0) };
         ValidateSourceSubmeshes(sourcePath, sourceSubmeshes, checked((uint)indices.Count));
-        return new SourceMesh(vertices.ToArray(), indices.ToArray(), sourceSubmeshes);
+        var skin = joints.Count > 0 ? new MeshSkin(joints.ToArray()) : null;
+        return new SourceMesh(vertices.ToArray(), indices.ToArray(), sourceSubmeshes, skin);
     }
 
     private static SourceMesh ReadWavefrontObj(string sourcePath)
@@ -881,18 +1140,32 @@ public static class MeshAssetCooker
             throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' contains no mesh array.");
         }
 
-        if (!TryImportGltfSceneNodes(
-                sourcePath,
-                root,
-                meshes,
-                buffers,
-                bufferViews,
-                accessors,
-                vertices,
-                indices,
-                submeshes,
-                materialSlots,
-                ref hasMissingNormals))
+        var skinState = new GltfSkinState(sourcePath, root);
+        if (TryReadGltfSceneGraph(sourcePath, root, out var nodes, out var sceneRootNodes))
+        {
+            skinState.EnableSceneGraph(nodes, sceneRootNodes);
+            var stack = new HashSet<int>();
+            foreach (var rootNodeIndex in sceneRootNodes)
+            {
+                ImportGltfNode(
+                    sourcePath,
+                    nodes,
+                    meshes,
+                    buffers,
+                    bufferViews,
+                    accessors,
+                    rootNodeIndex,
+                    Matrix4x4.Identity,
+                    stack,
+                    skinState,
+                    vertices,
+                    indices,
+                    submeshes,
+                    materialSlots,
+                    ref hasMissingNormals);
+            }
+        }
+        else
         {
             foreach (var mesh in meshes.EnumerateArray())
             {
@@ -903,6 +1176,8 @@ public static class MeshAssetCooker
                     bufferViews,
                     accessors,
                     Matrix4x4.Identity,
+                    nodeSkinned: false,
+                    skinState: null,
                     vertices,
                     indices,
                     submeshes,
@@ -921,23 +1196,19 @@ public static class MeshAssetCooker
             : vertices.ToArray();
         var sourceSubmeshes = submeshes.ToArray();
         ValidateSourceSubmeshes(sourcePath, sourceSubmeshes, checked((uint)indices.Count));
-        return new SourceMesh(sourceVertices, indices.ToArray(), sourceSubmeshes);
+        var skin = skinState.HasSkin ? new MeshSkin(skinState.Joints.ToArray()) : null;
+        return new SourceMesh(sourceVertices, indices.ToArray(), sourceSubmeshes, skin);
     }
 
-    private static bool TryImportGltfSceneNodes(
+    private static bool TryReadGltfSceneGraph(
         string sourcePath,
         JsonElement root,
-        JsonElement meshes,
-        byte[][] buffers,
-        GltfBufferView[] bufferViews,
-        GltfAccessor[] accessors,
-        List<SourceVertex> vertices,
-        List<uint> indices,
-        List<SourceSubmesh> submeshes,
-        Dictionary<int, uint> materialSlots,
-        ref bool hasMissingNormals)
+        out JsonElement nodes,
+        out int[] sceneRootNodes)
     {
-        if (!root.TryGetProperty("nodes", out var nodes) ||
+        nodes = default;
+        sceneRootNodes = Array.Empty<int>();
+        if (!root.TryGetProperty("nodes", out nodes) ||
             nodes.ValueKind != JsonValueKind.Array ||
             !root.TryGetProperty("scenes", out var scenes) ||
             scenes.ValueKind != JsonValueKind.Array ||
@@ -960,26 +1231,13 @@ public static class MeshAssetCooker
             return true;
         }
 
-        var stack = new HashSet<int>();
+        var roots = new List<int>(rootNodes.GetArrayLength());
         foreach (var rootNode in rootNodes.EnumerateArray())
         {
-            ImportGltfNode(
-                sourcePath,
-                nodes,
-                meshes,
-                buffers,
-                bufferViews,
-                accessors,
-                rootNode.GetInt32(),
-                Matrix4x4.Identity,
-                stack,
-                vertices,
-                indices,
-                submeshes,
-                materialSlots,
-                ref hasMissingNormals);
+            roots.Add(rootNode.GetInt32());
         }
 
+        sceneRootNodes = roots.ToArray();
         return true;
     }
 
@@ -993,6 +1251,7 @@ public static class MeshAssetCooker
         int nodeIndex,
         Matrix4x4 parentTransform,
         HashSet<int> stack,
+        GltfSkinState skinState,
         List<SourceVertex> vertices,
         List<uint> indices,
         List<SourceSubmesh> submeshes,
@@ -1013,12 +1272,23 @@ public static class MeshAssetCooker
         {
             var node = nodes[nodeIndex];
             var nodeTransform = ReadGltfNodeTransform(sourcePath, node, $"nodes[{nodeIndex}]") * parentTransform;
+            bool nodeSkinned = node.TryGetProperty("skin", out var skinElement);
+            if (nodeSkinned && node.TryGetProperty("mesh", out _))
+            {
+                skinState.Activate(nodeIndex, skinElement.GetInt32(), buffers, bufferViews, accessors);
+            }
+
             if (node.TryGetProperty("mesh", out var meshElement))
             {
                 var meshIndex = meshElement.GetInt32();
                 if (meshIndex < 0 || meshIndex >= meshes.GetArrayLength())
                 {
                     throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' nodes[{nodeIndex}].mesh index '{meshIndex}' is outside mesh count '{meshes.GetArrayLength()}'.");
+                }
+
+                if (!nodeSkinned)
+                {
+                    skinState.DeclareStaticMeshNode(nodeIndex);
                 }
 
                 ImportGltfMeshPrimitives(
@@ -1028,6 +1298,8 @@ public static class MeshAssetCooker
                     bufferViews,
                     accessors,
                     nodeTransform,
+                    nodeSkinned,
+                    skinState,
                     vertices,
                     indices,
                     submeshes,
@@ -1054,6 +1326,7 @@ public static class MeshAssetCooker
                         child.GetInt32(),
                         nodeTransform,
                         stack,
+                        skinState,
                         vertices,
                         indices,
                         submeshes,
@@ -1075,6 +1348,8 @@ public static class MeshAssetCooker
         GltfBufferView[] bufferViews,
         GltfAccessor[] accessors,
         Matrix4x4 transform,
+        bool nodeSkinned,
+        GltfSkinState? skinState,
         List<SourceVertex> vertices,
         List<uint> indices,
         List<SourceSubmesh> submeshes,
@@ -1114,6 +1389,52 @@ public static class MeshAssetCooker
             var tangentAccessorIndex = TryGetGltfAttributeAccessor(attributes, "TANGENT");
             var texCoordAccessorIndex = TryGetGltfAttributeAccessor(attributes, "TEXCOORD_0");
             var colorAccessorIndex = TryGetGltfAttributeAccessor(attributes, "COLOR_0");
+            var jointsAccessorIndex = TryGetGltfAttributeAccessor(attributes, "JOINTS_0");
+            var weightsAccessorIndex = TryGetGltfAttributeAccessor(attributes, "WEIGHTS_0");
+            bool primitiveSkinned = jointsAccessorIndex >= 0;
+            if (primitiveSkinned != (weightsAccessorIndex >= 0))
+            {
+                throw new InvalidOperationException($"[MeshAssetCooker] glTF primitive in '{sourcePath}' must declare JOINTS_0 and WEIGHTS_0 together.");
+            }
+
+            if (primitiveSkinned && (!nodeSkinned || skinState is null))
+            {
+                throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' primitive carries JOINTS_0/WEIGHTS_0 but its instancing node declares no skin.");
+            }
+
+            if (!primitiveSkinned && nodeSkinned)
+            {
+                throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' node declares a skin but its mesh primitive lacks JOINTS_0/WEIGHTS_0.");
+            }
+
+            GltfAccessor jointsAccessor = default;
+            GltfAccessor weightsAccessor = default;
+            if (primitiveSkinned)
+            {
+                jointsAccessor = GetGltfAccessor(sourcePath, accessors, jointsAccessorIndex);
+                if (jointsAccessor.Type != "VEC4" ||
+                    jointsAccessor.ComponentType is not (GltfComponentType.UnsignedByte or GltfComponentType.UnsignedShort))
+                {
+                    throw new NotSupportedException($"[MeshAssetCooker] glTF JOINTS_0 in '{sourcePath}' must be UNSIGNED_BYTE or UNSIGNED_SHORT VEC4.");
+                }
+
+                weightsAccessor = GetGltfAccessor(sourcePath, accessors, weightsAccessorIndex);
+                if (weightsAccessor.Type != "VEC4" ||
+                    weightsAccessor.ComponentType is not (GltfComponentType.Float or GltfComponentType.UnsignedByte or GltfComponentType.UnsignedShort))
+                {
+                    throw new NotSupportedException($"[MeshAssetCooker] glTF WEIGHTS_0 in '{sourcePath}' must be FLOAT, UNSIGNED_BYTE, or UNSIGNED_SHORT VEC4.");
+                }
+
+                if (weightsAccessor.ComponentType != GltfComponentType.Float && !weightsAccessor.Normalized)
+                {
+                    throw new NotSupportedException($"[MeshAssetCooker] glTF WEIGHTS_0 in '{sourcePath}' must be normalized when it uses integer components.");
+                }
+
+                if (jointsAccessor.Count != positionAccessor.Count || weightsAccessor.Count != positionAccessor.Count)
+                {
+                    throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' JOINTS_0/WEIGHTS_0 counts must match the POSITION count '{positionAccessor.Count}'.");
+                }
+            }
             if (normalAccessorIndex >= 0)
             {
                 var normalAccessor = GetGltfAccessor(sourcePath, accessors, normalAccessorIndex);
@@ -1166,6 +1487,37 @@ public static class MeshAssetCooker
                     ? ReadGltfColor(sourcePath, buffers, bufferViews, accessors[colorAccessorIndex], i)
                     : new Vector3(1.0f, 1.0f, 1.0f);
 
+                int joint0 = 0;
+                int joint1 = 0;
+                int joint2 = 0;
+                int joint3 = 0;
+                float weight0 = 0.0f;
+                float weight1 = 0.0f;
+                float weight2 = 0.0f;
+                float weight3 = 0.0f;
+                if (primitiveSkinned)
+                {
+                    var weights = ReadGltfWeights(sourcePath, buffers, bufferViews, weightsAccessor, i);
+                    float weightSum = weights.X + weights.Y + weights.Z + weights.W;
+                    if (weights.X < 0.0f || weights.Y < 0.0f || weights.Z < 0.0f || weights.W < 0.0f ||
+                        !float.IsFinite(weightSum) ||
+                        MathF.Abs(weightSum - 1.0f) > SkinWeightTolerance)
+                    {
+                        throw new InvalidOperationException(
+                            $"[MeshAssetCooker] glTF source '{sourcePath}' skinned vertex '{i}' has invalid weights " +
+                            $"({weights.X}, {weights.Y}, {weights.Z}, {weights.W}).");
+                    }
+
+                    joint0 = ResolveGltfJointIndex(sourcePath, skinState!, jointsAccessor, buffers, bufferViews, i, 0);
+                    joint1 = ResolveGltfJointIndex(sourcePath, skinState!, jointsAccessor, buffers, bufferViews, i, 1);
+                    joint2 = ResolveGltfJointIndex(sourcePath, skinState!, jointsAccessor, buffers, bufferViews, i, 2);
+                    joint3 = ResolveGltfJointIndex(sourcePath, skinState!, jointsAccessor, buffers, bufferViews, i, 3);
+                    weight0 = weights.X / weightSum;
+                    weight1 = weights.Y / weightSum;
+                    weight2 = weights.Z / weightSum;
+                    weight3 = weights.W / weightSum;
+                }
+
                 vertices.Add(new SourceVertex(
                     position.X,
                     position.Y,
@@ -1181,7 +1533,15 @@ public static class MeshAssetCooker
                     texCoord.Y,
                     color.X,
                     color.Y,
-                    color.Z));
+                    color.Z,
+                    joint0,
+                    joint1,
+                    joint2,
+                    joint3,
+                    weight0,
+                    weight1,
+                    weight2,
+                    weight3));
             }
 
             var firstIndex = checked((uint)indices.Count);
@@ -1223,6 +1583,439 @@ public static class MeshAssetCooker
 
             submeshes.Add(new SourceSubmesh(firstIndex, indexCount, 0, materialSlot));
         }
+    }
+
+    /// <summary>
+    /// Accumulates the single skin the first skinning slice imports. The cooked skeleton is ordered
+    /// parents-first and vertex joint slots are remapped into that same order, so a palette can be
+    /// resolved in one pass.
+    /// </summary>
+    private sealed class GltfSkinState
+    {
+        public GltfSkinState(string sourcePath, JsonElement root)
+        {
+            SourcePath = sourcePath;
+            Root = root;
+        }
+
+        public string SourcePath { get; }
+
+        public JsonElement Root { get; }
+
+        public JsonElement Nodes { get; private set; }
+
+        public int[] SceneRootNodes { get; private set; } = Array.Empty<int>();
+
+        public int NodeIndex { get; private set; } = -1;
+
+        public int SkinIndex { get; private set; } = -1;
+
+        public int StaticMeshNodeIndex { get; private set; } = -1;
+
+        public bool HasSkin => SkinIndex >= 0;
+
+        public List<MeshSkinJoint> Joints { get; } = new();
+
+        public int[] VertexJointRemap { get; private set; } = Array.Empty<int>();
+
+        public void EnableSceneGraph(JsonElement nodes, int[] sceneRootNodes)
+        {
+            Nodes = nodes;
+            SceneRootNodes = sceneRootNodes;
+        }
+
+        public void DeclareStaticMeshNode(int nodeIndex)
+        {
+            if (HasSkin)
+            {
+                throw MixesStaticAndSkinned(nodeIndex, NodeIndex);
+            }
+
+            StaticMeshNodeIndex = nodeIndex;
+        }
+
+        public void Activate(
+            int nodeIndex,
+            int skinIndex,
+            byte[][] buffers,
+            GltfBufferView[] bufferViews,
+            GltfAccessor[] accessors)
+        {
+            if (StaticMeshNodeIndex >= 0)
+            {
+                throw MixesStaticAndSkinned(StaticMeshNodeIndex, nodeIndex);
+            }
+
+            if (HasSkin)
+            {
+                if (SkinIndex != skinIndex)
+                {
+                    throw new NotSupportedException(
+                        $"[MeshAssetCooker] glTF source '{SourcePath}' uses skins '{SkinIndex}' and '{skinIndex}'; " +
+                        "the first skinning slice imports a single skin per source.");
+                }
+
+                if (NodeIndex != nodeIndex)
+                {
+                    throw new NotSupportedException(
+                        $"[MeshAssetCooker] glTF source '{SourcePath}' instances skin '{skinIndex}' on nodes " +
+                        $"'{NodeIndex}' and '{nodeIndex}'; the first skinning slice imports a single skinned node per source.");
+                }
+
+                return;
+            }
+
+            ImportGltfSkin(SourcePath, this, nodeIndex, skinIndex, buffers, bufferViews, accessors);
+            NodeIndex = nodeIndex;
+            SkinIndex = skinIndex;
+        }
+
+        public void SetSkin(List<MeshSkinJoint> joints, int[] vertexJointRemap)
+        {
+            Joints.Clear();
+            Joints.AddRange(joints);
+            VertexJointRemap = vertexJointRemap;
+        }
+
+        private NotSupportedException MixesStaticAndSkinned(int staticNodeIndex, int skinnedNodeIndex)
+        {
+            return new NotSupportedException(
+                $"[MeshAssetCooker] glTF source '{SourcePath}' mixes static mesh node '{staticNodeIndex}' with " +
+                $"skinned node '{skinnedNodeIndex}'; the first skinning slice imports either a fully static or a fully skinned source.");
+        }
+    }
+
+    private static void ImportGltfSkin(
+        string sourcePath,
+        GltfSkinState state,
+        int nodeIndex,
+        int skinIndex,
+        byte[][] buffers,
+        GltfBufferView[] bufferViews,
+        GltfAccessor[] accessors)
+    {
+        JsonElement root = state.Root;
+        JsonElement nodes = state.Nodes;
+        if (!root.TryGetProperty("skins", out var skins) || skins.ValueKind != JsonValueKind.Array)
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' nodes[{nodeIndex}].skin references skin '{skinIndex}', but the document declares no skins array.");
+        }
+
+        if (skinIndex < 0 || skinIndex >= skins.GetArrayLength())
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' nodes[{nodeIndex}].skin index '{skinIndex}' is outside skin count '{skins.GetArrayLength()}'.");
+        }
+
+        var skin = skins[skinIndex];
+        if (!skin.TryGetProperty("joints", out var jointElements) || jointElements.ValueKind != JsonValueKind.Array)
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' skins[{skinIndex}].joints must be an array.");
+        }
+
+        int jointCount = jointElements.GetArrayLength();
+        if (jointCount == 0 || jointCount > 255)
+        {
+            throw new NotSupportedException($"[MeshAssetCooker] glTF source '{sourcePath}' skins[{skinIndex}] declares '{jointCount}' joints; the first skinning slice supports 1..255.");
+        }
+
+        var jointNodes = new int[jointCount];
+        var jointSlots = new Dictionary<int, int>(jointCount);
+        for (int slot = 0; slot < jointCount; slot++)
+        {
+            int jointNode = jointElements[slot].GetInt32();
+            if (jointNode < 0 || jointNode >= nodes.GetArrayLength())
+            {
+                throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' skins[{skinIndex}].joints[{slot}] index '{jointNode}' is outside node count '{nodes.GetArrayLength()}'.");
+            }
+
+            if (!jointSlots.TryAdd(jointNode, slot))
+            {
+                throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' skins[{skinIndex}] references node '{jointNode}' more than once.");
+            }
+
+            jointNodes[slot] = jointNode;
+        }
+
+        var parents = BuildGltfNodeParentMap(sourcePath, nodes);
+        var sceneRoots = new HashSet<int>(state.SceneRootNodes);
+        var globals = new Matrix4x4[jointCount];
+        var depths = new int[jointCount];
+        var buckets = new List<int>[jointCount];
+        for (int slot = 0; slot < jointCount; slot++)
+        {
+            globals[slot] = GetGltfJointGlobalTransform(sourcePath, nodes, parents, sceneRoots, jointNodes[slot]);
+            depths[slot] = CountGltfJointAncestors(sourcePath, parents, jointSlots, jointNodes[slot], nodes.GetArrayLength());
+            (buckets[depths[slot]] ??= new List<int>()).Add(slot);
+        }
+
+        var orderedSlots = new List<int>(jointCount);
+        foreach (var bucket in buckets)
+        {
+            if (bucket != null)
+            {
+                orderedSlots.AddRange(bucket);
+            }
+        }
+
+        var cookedOfSlot = new int[jointCount];
+        for (int cookedIndex = 0; cookedIndex < orderedSlots.Count; cookedIndex++)
+        {
+            cookedOfSlot[orderedSlots[cookedIndex]] = cookedIndex;
+        }
+
+        GltfAccessor? inverseBindAccessor = null;
+        if (skin.TryGetProperty("inverseBindMatrices", out var inverseBindElement))
+        {
+            inverseBindAccessor = GetGltfAccessor(sourcePath, accessors, inverseBindElement.GetInt32());
+            if (inverseBindAccessor.Value.Type != "MAT4" || inverseBindAccessor.Value.ComponentType != GltfComponentType.Float)
+            {
+                throw new NotSupportedException($"[MeshAssetCooker] glTF source '{sourcePath}' skins[{skinIndex}].inverseBindMatrices must be FLOAT MAT4.");
+            }
+
+            if (inverseBindAccessor.Value.Count < jointCount)
+            {
+                throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' skins[{skinIndex}].inverseBindMatrices has '{inverseBindAccessor.Value.Count}' entries for '{jointCount}' joints.");
+            }
+        }
+
+        var joints = new List<MeshSkinJoint>(jointCount);
+        foreach (int slot in orderedSlots)
+        {
+            int parentSlot = FindGltfNearestJointAncestor(sourcePath, parents, jointSlots, jointNodes[slot], nodes.GetArrayLength());
+            Matrix4x4 localRest = parentSlot >= 0
+                ? globals[slot] * InvertGltfMatrix(sourcePath, globals[parentSlot], $"skins[{skinIndex}] joint '{jointNodes[slot]}'")
+                : globals[slot];
+            if (!Matrix4x4.Decompose(localRest, out var scale, out var rotation, out var translation) ||
+                MathF.Abs(scale.X - 1.0f) > JointScaleTolerance ||
+                MathF.Abs(scale.Y - 1.0f) > JointScaleTolerance ||
+                MathF.Abs(scale.Z - 1.0f) > JointScaleTolerance)
+            {
+                throw new NotSupportedException(
+                    $"[MeshAssetCooker] glTF source '{sourcePath}' skins[{skinIndex}] joint node '{jointNodes[slot]}' does not reduce to " +
+                    "translation, rotation, and unit scale; the first skinning slice stores unit-scale joints only.");
+            }
+
+            Matrix4x4 inverseBind = inverseBindAccessor.HasValue
+                ? ReadGltfMatrix4(sourcePath, buffers, bufferViews, inverseBindAccessor.Value, slot, $"skins[{skinIndex}].inverseBindMatrices[{slot}]")
+                : Matrix4x4.Identity;
+
+            joints.Add(new MeshSkinJoint(
+                parentSlot >= 0 ? cookedOfSlot[parentSlot] : -1,
+                translation,
+                rotation,
+                inverseBind));
+        }
+
+        state.SetSkin(joints, cookedOfSlot);
+    }
+
+    private static int[] BuildGltfNodeParentMap(string sourcePath, JsonElement nodes)
+    {
+        var parents = new int[nodes.GetArrayLength()];
+        Array.Fill(parents, -1);
+        for (int nodeIndex = 0; nodeIndex < parents.Length; nodeIndex++)
+        {
+            if (!nodes[nodeIndex].TryGetProperty("children", out var children))
+            {
+                continue;
+            }
+
+            if (children.ValueKind != JsonValueKind.Array)
+            {
+                throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' nodes[{nodeIndex}].children must be an array.");
+            }
+
+            foreach (var child in children.EnumerateArray())
+            {
+                int childIndex = child.GetInt32();
+                if (childIndex < 0 || childIndex >= parents.Length)
+                {
+                    throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' nodes[{nodeIndex}].children index '{childIndex}' is outside node count '{parents.Length}'.");
+                }
+
+                if (parents[childIndex] != -1)
+                {
+                    throw new NotSupportedException($"[MeshAssetCooker] glTF source '{sourcePath}' node '{childIndex}' is a child of multiple parents; the skinning importer requires a node tree.");
+                }
+
+                parents[childIndex] = nodeIndex;
+            }
+        }
+
+        return parents;
+    }
+
+    private static Matrix4x4 GetGltfJointGlobalTransform(
+        string sourcePath,
+        JsonElement nodes,
+        int[] parents,
+        HashSet<int> sceneRoots,
+        int nodeIndex)
+    {
+        var chain = new List<int>();
+        int current = nodeIndex;
+        while (current >= 0)
+        {
+            chain.Add(current);
+            if (chain.Count > parents.Length)
+            {
+                throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' contains a node hierarchy cycle above node '{nodeIndex}'.");
+            }
+
+            current = parents[current];
+        }
+
+        int top = chain[^1];
+        if (!sceneRoots.Contains(top))
+        {
+            throw new NotSupportedException(
+                $"[MeshAssetCooker] glTF source '{sourcePath}' joint node '{nodeIndex}' is rooted at node '{top}', which is not a scene root; " +
+                "the skinning importer requires the skeleton to live under the imported scene.");
+        }
+
+        var global = Matrix4x4.Identity;
+        for (int i = chain.Count - 1; i >= 0; i--)
+        {
+            global = ReadGltfNodeTransform(sourcePath, nodes[chain[i]], $"nodes[{chain[i]}]") * global;
+        }
+
+        return global;
+    }
+
+    private static int CountGltfJointAncestors(
+        string sourcePath,
+        int[] parents,
+        Dictionary<int, int> jointSlots,
+        int nodeIndex,
+        int nodeCount)
+    {
+        int depth = 0;
+        int current = parents[nodeIndex];
+        int guard = 0;
+        while (current >= 0)
+        {
+            if (jointSlots.ContainsKey(current))
+            {
+                depth++;
+            }
+
+            current = parents[current];
+            if (++guard > nodeCount)
+            {
+                throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' contains a node hierarchy cycle above node '{nodeIndex}'.");
+            }
+        }
+
+        return depth;
+    }
+
+    private static int FindGltfNearestJointAncestor(
+        string sourcePath,
+        int[] parents,
+        Dictionary<int, int> jointSlots,
+        int nodeIndex,
+        int nodeCount)
+    {
+        int current = parents[nodeIndex];
+        int guard = 0;
+        while (current >= 0)
+        {
+            if (jointSlots.TryGetValue(current, out int slot))
+            {
+                return slot;
+            }
+
+            current = parents[current];
+            if (++guard > nodeCount)
+            {
+                throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' contains a node hierarchy cycle above node '{nodeIndex}'.");
+            }
+        }
+
+        return -1;
+    }
+
+    private static Matrix4x4 InvertGltfMatrix(string sourcePath, Matrix4x4 matrix, string context)
+    {
+        if (!Matrix4x4.Invert(matrix, out var inverse))
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' {context} has a non-invertible transform.");
+        }
+
+        return inverse;
+    }
+
+    private static Matrix4x4 ReadGltfMatrix4(
+        string sourcePath,
+        byte[][] buffers,
+        GltfBufferView[] bufferViews,
+        GltfAccessor accessor,
+        int elementIndex,
+        string context)
+    {
+        if (accessor.ComponentType != GltfComponentType.Float || accessor.Type != "MAT4")
+        {
+            throw new NotSupportedException($"[MeshAssetCooker] glTF {context} in '{sourcePath}' must be FLOAT MAT4.");
+        }
+
+        var span = GetGltfElementSpan(sourcePath, buffers, bufferViews, accessor, elementIndex, 16);
+        return new Matrix4x4(
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(0, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(4, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(8, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(12, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(16, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(20, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(24, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(28, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(32, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(36, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(40, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(44, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(48, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(52, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(56, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(60, sizeof(float))));
+    }
+
+    private static int ResolveGltfJointIndex(
+        string sourcePath,
+        GltfSkinState skinState,
+        GltfAccessor accessor,
+        byte[][] buffers,
+        GltfBufferView[] bufferViews,
+        int elementIndex,
+        int componentIndex)
+    {
+        var span = GetGltfElementSpan(sourcePath, buffers, bufferViews, accessor, elementIndex, 4);
+        int slot = accessor.ComponentType switch
+        {
+            GltfComponentType.UnsignedByte => span[componentIndex],
+            GltfComponentType.UnsignedShort => BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(componentIndex * sizeof(ushort), sizeof(ushort))),
+            _ => throw new NotSupportedException($"[MeshAssetCooker] glTF JOINTS_0 in '{sourcePath}' must be UNSIGNED_BYTE or UNSIGNED_SHORT.")
+        };
+
+        if (slot >= skinState.VertexJointRemap.Length)
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] glTF source '{sourcePath}' JOINTS_0 value '{slot}' is outside skin joint count '{skinState.VertexJointRemap.Length}'.");
+        }
+
+        return skinState.VertexJointRemap[slot];
+    }
+
+    private static Vector4 ReadGltfWeights(
+        string sourcePath,
+        byte[][] buffers,
+        GltfBufferView[] bufferViews,
+        GltfAccessor accessor,
+        int elementIndex)
+    {
+        var span = GetGltfElementSpan(sourcePath, buffers, bufferViews, accessor, elementIndex, 4);
+        return new Vector4(
+            ReadGltfNumericComponent(span, accessor.ComponentType, accessor.Normalized, 0),
+            ReadGltfNumericComponent(span, accessor.ComponentType, accessor.Normalized, 1),
+            ReadGltfNumericComponent(span, accessor.ComponentType, accessor.Normalized, 2),
+            ReadGltfNumericComponent(span, accessor.ComponentType, accessor.Normalized, 3));
     }
 
     private static Matrix4x4 ReadGltfNodeTransform(string sourcePath, JsonElement node, string context)
@@ -1505,9 +2298,21 @@ public static class MeshAssetCooker
                 string.Equals(name, "NORMAL", StringComparison.Ordinal) ||
                 string.Equals(name, "TANGENT", StringComparison.Ordinal) ||
                 string.Equals(name, "TEXCOORD_0", StringComparison.Ordinal) ||
-                string.Equals(name, "COLOR_0", StringComparison.Ordinal))
+                string.Equals(name, "COLOR_0", StringComparison.Ordinal) ||
+                string.Equals(name, "JOINTS_0", StringComparison.Ordinal) ||
+                string.Equals(name, "WEIGHTS_0", StringComparison.Ordinal))
             {
                 continue;
+            }
+
+            if (name.StartsWith("JOINTS_", StringComparison.Ordinal))
+            {
+                throw new NotSupportedException($"[MeshAssetCooker] glTF source '{sourcePath}' attribute '{name}' is not supported. The skinning importer accepts only JOINTS_0.");
+            }
+
+            if (name.StartsWith("WEIGHTS_", StringComparison.Ordinal))
+            {
+                throw new NotSupportedException($"[MeshAssetCooker] glTF source '{sourcePath}' attribute '{name}' is not supported. The skinning importer accepts only WEIGHTS_0.");
             }
 
             if (name.StartsWith("TEXCOORD_", StringComparison.Ordinal))
@@ -1710,7 +2515,8 @@ public static class MeshAssetCooker
             "VEC2" => 2,
             "VEC3" => 3,
             "VEC4" => 4,
-            _ => throw new NotSupportedException($"[MeshAssetCooker] glTF accessor type '{type}' in '{sourcePath}' is not supported by the static mesh importer.")
+            "MAT4" => 16,
+            _ => throw new NotSupportedException($"[MeshAssetCooker] glTF accessor type '{type}' in '{sourcePath}' is not supported by the mesh importer.")
         };
     }
 
@@ -1914,6 +2720,53 @@ public static class MeshAssetCooker
         }
     }
 
+    private static int ReadJointIndex(string sourcePath, string value)
+    {
+        if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var index) || index > 255)
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] Invalid mesh joint index token '{value}' in '{sourcePath}'.");
+        }
+
+        return index;
+    }
+
+    private static Quaternion ReadUnitQuaternion(string sourcePath, string[] parts, int offset)
+    {
+        var rotation = new Quaternion(
+            ReadFloat(parts[offset]),
+            ReadFloat(parts[offset + 1]),
+            ReadFloat(parts[offset + 2]),
+            ReadFloat(parts[offset + 3]));
+        var lengthSquared = rotation.LengthSquared();
+        if (!float.IsFinite(lengthSquared) || lengthSquared < 1.0e-8f)
+        {
+            throw new InvalidOperationException($"[MeshAssetCooker] Mesh joint rotation in '{sourcePath}' must be a non-zero quaternion.");
+        }
+
+        return Quaternion.Normalize(rotation);
+    }
+
+    private static Matrix4x4 ReadMatrix4x4(string[] parts, int offset)
+    {
+        return new Matrix4x4(
+            ReadFloat(parts[offset]),
+            ReadFloat(parts[offset + 1]),
+            ReadFloat(parts[offset + 2]),
+            ReadFloat(parts[offset + 3]),
+            ReadFloat(parts[offset + 4]),
+            ReadFloat(parts[offset + 5]),
+            ReadFloat(parts[offset + 6]),
+            ReadFloat(parts[offset + 7]),
+            ReadFloat(parts[offset + 8]),
+            ReadFloat(parts[offset + 9]),
+            ReadFloat(parts[offset + 10]),
+            ReadFloat(parts[offset + 11]),
+            ReadFloat(parts[offset + 12]),
+            ReadFloat(parts[offset + 13]),
+            ReadFloat(parts[offset + 14]),
+            ReadFloat(parts[offset + 15]));
+    }
+
     private static string StripComment(string line)
     {
         var commentIndex = line.IndexOf('#');
@@ -2025,7 +2878,8 @@ public static class MeshAssetCooker
     private readonly record struct SourceMesh(
         SourceVertex[] Vertices,
         uint[] Indices,
-        SourceSubmesh[] Submeshes);
+        SourceSubmesh[] Submeshes,
+        MeshSkin? Skin = null);
 
     private readonly record struct SourceSubmesh(
         uint FirstIndex,
@@ -2048,7 +2902,15 @@ public static class MeshAssetCooker
         float V,
         float ColorR,
         float ColorG,
-        float ColorB)
+        float ColorB,
+        int JointX = 0,
+        int JointY = 0,
+        int JointZ = 0,
+        int JointW = 0,
+        float WeightX = 0.0f,
+        float WeightY = 0.0f,
+        float WeightZ = 0.0f,
+        float WeightW = 0.0f)
     {
         public Vector3 Position => new(PositionX, PositionY, PositionZ);
 
@@ -2069,7 +2931,15 @@ public static class MeshAssetCooker
                 V,
                 ColorR,
                 ColorG,
-                ColorB);
+                ColorB,
+                JointX,
+                JointY,
+                JointZ,
+                JointW,
+                WeightX,
+                WeightY,
+                WeightZ,
+                WeightW);
         }
     }
 
@@ -2116,5 +2986,8 @@ public static class MeshAssetCooker
         uint IndexDataSize,
         MeshBounds Bounds,
         uint SubmeshCount,
-        uint SubmeshDataSize);
+        uint SubmeshDataSize,
+        uint JointCount,
+        uint SkinDataOffset,
+        uint SkinDataSize);
 }

@@ -659,7 +659,7 @@ public static class GltfModelImportPlanner
     {
         if (root.TryGetProperty("skins", out var skins) && skins.ValueKind == JsonValueKind.Array && skins.GetArrayLength() > 0)
         {
-            warnings.Add("skins are not imported by the first model slice.");
+            warnings.Add("skinning data is imported as a rest-pose skeleton, but the render path does not apply skinning or animation yet.");
         }
 
         if (root.TryGetProperty("animations", out var animations) &&
