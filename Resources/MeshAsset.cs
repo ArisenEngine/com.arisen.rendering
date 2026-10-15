@@ -2275,22 +2275,26 @@ public static class MeshAssetCooker
         }
 
         var span = GetGltfElementSpan(sourcePath, buffers, bufferViews, accessor, elementIndex, 16);
+        // glTF stores matrices column-major, while System.Numerics' rows are the first four
+        // arguments: reading the file's order straight in transposes every matrix, which turns an
+        // inverse bind matrix into its transpose - harmless-looking for a pure translation, wrong
+        // for every rotation, and wrong for the whole skeleton either way.
         return new Matrix4x4(
             BinaryPrimitives.ReadSingleLittleEndian(span.Slice(0, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(4, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(8, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(12, sizeof(float))),
             BinaryPrimitives.ReadSingleLittleEndian(span.Slice(16, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(20, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(24, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(28, sizeof(float))),
             BinaryPrimitives.ReadSingleLittleEndian(span.Slice(32, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(36, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(40, sizeof(float))),
-            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(44, sizeof(float))),
             BinaryPrimitives.ReadSingleLittleEndian(span.Slice(48, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(4, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(20, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(36, sizeof(float))),
             BinaryPrimitives.ReadSingleLittleEndian(span.Slice(52, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(8, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(24, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(40, sizeof(float))),
             BinaryPrimitives.ReadSingleLittleEndian(span.Slice(56, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(12, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(28, sizeof(float))),
+            BinaryPrimitives.ReadSingleLittleEndian(span.Slice(44, sizeof(float))),
             BinaryPrimitives.ReadSingleLittleEndian(span.Slice(60, sizeof(float))));
     }
 
