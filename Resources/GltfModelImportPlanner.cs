@@ -659,16 +659,17 @@ public static class GltfModelImportPlanner
     {
         if (root.TryGetProperty("skins", out var skins) && skins.ValueKind == JsonValueKind.Array && skins.GetArrayLength() > 0)
         {
-            // Skinning itself is part of the runtime now - an entity poses the cooked skeleton through
-            // SkeletonPoseComponent - so the warning names what is still missing: the clip side.
-            warnings.Add("skinning data is imported as a rest-pose skeleton; no clip, sampling, or animation playback drives it yet.");
+            // Skinning and its clips are part of the runtime now - the cook bakes the skeleton and the
+            // joint rotation tracks, and an entity samples them through SkeletonPoseComponent - so the
+            // warning only names the channels the cook still drops.
+            warnings.Add("skinning data is imported as a cooked skeleton with rotation clips; translation and scale channels are dropped.");
         }
 
         if (root.TryGetProperty("animations", out var animations) &&
             animations.ValueKind == JsonValueKind.Array &&
             animations.GetArrayLength() > 0)
         {
-            warnings.Add("animations are not imported by the first model slice.");
+            warnings.Add("animations are cooked as joint rotation tracks; translation and scale channels are dropped.");
         }
 
         if (root.TryGetProperty("meshes", out var meshes) && meshes.ValueKind == JsonValueKind.Array)
