@@ -43,6 +43,8 @@ public struct RenderContext
     public readonly ReadOnlySpan<StaticMeshRenderItem> StaticMeshItems => Snapshot.StaticMeshItems;
     public readonly ReadOnlySpan<System.Numerics.Quaternion> SkinJointRotations => Snapshot.SkinJointRotations;
 
+    public readonly ReadOnlySpan<System.Numerics.Vector3> SkinJointTranslations => Snapshot.SkinJointTranslations;
+
     internal RenderContext(FrameArena arena, RenderFrameSnapshot snapshot, RenderFrameSubmission submission)
     {
         Arena = arena;

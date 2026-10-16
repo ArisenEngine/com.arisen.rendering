@@ -2,17 +2,39 @@ using System.Numerics;
 
 namespace ArisenEngine.Rendering.Resources;
 
+/// <summary>
+/// How a joint's baked track carries its local translation beside its rotation keys. A joint whose
+/// clip never moves it keeps the cooked rest translation and stores nothing.
+/// </summary>
+public enum MeshAnimationTranslationMode
+{
+    /// <summary>The joint keeps the cooked rest local translation.</summary>
+    Rest = 0,
+
+    /// <summary>Every key resolves to the same local translation, stored once on the track.</summary>
+    Constant = 1,
+
+    /// <summary>Each key carries its own local translation beside its rotation.</summary>
+    PerKey = 2,
+}
+
 /// <summary>One joint's baked rotation keys, in the cooked skeleton's joint order.</summary>
 public readonly record struct MeshAnimationJointTrack(
     int JointIndex,
     float[] Times,
-    Quaternion[] Rotations)
+    Quaternion[] Rotations,
+    MeshAnimationTranslationMode TranslationMode = MeshAnimationTranslationMode.Rest,
+    Vector3 ConstantTranslation = default,
+    Vector3[]? KeyTranslations = null)
 {
     public bool IsValid =>
         JointIndex >= 0 &&
         Times is { Length: > 0 } &&
         Rotations is { Length: > 0 } &&
-        Times.Length == Rotations.Length;
+        Times.Length == Rotations.Length &&
+        (TranslationMode != MeshAnimationTranslationMode.PerKey ||
+         KeyTranslations is { Length: > 0 } &&
+         KeyTranslations.Length == Times.Length);
 }
 
 /// <summary>
@@ -157,19 +179,42 @@ public sealed class MeshAnimationTable
                     block.Slice(entry + 4, sizeof(int)));
                 uint keyOffset = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(
                     block.Slice(entry + 8, sizeof(uint)));
+                int translationModeValue = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(
+                    block.Slice(entry + 12, sizeof(int)));
                 if (jointIndex < 0 || jointIndex >= jointCount || keyCount <= 0)
                 {
                     throw new InvalidOperationException(
                         $"[MeshAnimationTable] Clip '{name}' track {trackIndex} is outside its skeleton.");
                 }
 
+                if (translationModeValue is < (int)MeshAnimationTranslationMode.Rest or > (int)MeshAnimationTranslationMode.PerKey)
+                {
+                    throw new InvalidOperationException(
+                        $"[MeshAnimationTable] Clip '{name}' track {trackIndex} carries an unknown " +
+                        $"translation mode '{translationModeValue}'.");
+                }
+
+                var translationMode = (MeshAnimationTranslationMode)translationModeValue;
+                var constantTranslation = new Vector3(
+                    BitConverter.Int32BitsToSingle(
+                        System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(block.Slice(entry + 16, 4))),
+                    BitConverter.Int32BitsToSingle(
+                        System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(block.Slice(entry + 20, 4))),
+                    BitConverter.Int32BitsToSingle(
+                        System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(block.Slice(entry + 24, 4))));
+                uint keyStride = translationMode == MeshAnimationTranslationMode.PerKey
+                    ? MeshAssetCooker.AnimationTranslatedKeyStride
+                    : MeshAssetCooker.AnimationKeyStride;
                 var times = new float[keyCount];
                 var rotations = new Quaternion[keyCount];
+                Vector3[]? keyTranslations = translationMode == MeshAnimationTranslationMode.PerKey
+                    ? new Vector3[keyCount]
+                    : null;
                 for (int key = 0; key < keyCount; key++)
                 {
                     int keyPosition = clipOffset + checked((int)keyOffset) +
-                        key * checked((int)MeshAssetCooker.AnimationKeyStride);
-                    if (keyPosition + MeshAssetCooker.AnimationKeyStride > block.Length)
+                        key * checked((int)keyStride);
+                    if (keyPosition + keyStride > block.Length)
                     {
                         throw new InvalidOperationException(
                             $"[MeshAnimationTable] Clip '{name}' keys are outside the payload.");
@@ -186,9 +231,25 @@ public sealed class MeshAnimationTable
                             System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(block.Slice(keyPosition + 12, 4))),
                         BitConverter.Int32BitsToSingle(
                             System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(block.Slice(keyPosition + 16, 4))));
+                    if (keyTranslations != null)
+                    {
+                        keyTranslations[key] = new Vector3(
+                            BitConverter.Int32BitsToSingle(
+                                System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(block.Slice(keyPosition + 20, 4))),
+                            BitConverter.Int32BitsToSingle(
+                                System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(block.Slice(keyPosition + 24, 4))),
+                            BitConverter.Int32BitsToSingle(
+                                System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(block.Slice(keyPosition + 28, 4))));
+                    }
                 }
 
-                tracks[trackIndex] = new MeshAnimationJointTrack(jointIndex, times, rotations);
+                tracks[trackIndex] = new MeshAnimationJointTrack(
+                    jointIndex,
+                    times,
+                    rotations,
+                    translationMode,
+                    constantTranslation,
+                    keyTranslations);
             }
 
             clips.Add(new MeshAnimationClip(name, duration, tracks, jointCount));
@@ -196,7 +257,10 @@ public sealed class MeshAnimationTable
                 checked((uint)trackCount * MeshAssetCooker.AnimationTrackStride);
             foreach (MeshAnimationJointTrack track in tracks)
             {
-                clipSize += checked((uint)track.Times.Length * MeshAssetCooker.AnimationKeyStride);
+                uint keyStride = track.TranslationMode == MeshAnimationTranslationMode.PerKey
+                    ? MeshAssetCooker.AnimationTranslatedKeyStride
+                    : MeshAssetCooker.AnimationKeyStride;
+                clipSize += checked((uint)track.Times.Length * keyStride);
             }
 
             clipOffset += checked((int)clipSize);
@@ -218,9 +282,10 @@ public sealed class MeshAnimationTable
 }
 
 /// <summary>
-/// Samples a cooked clip onto a skeleton's joints: a joint with a track takes the track's rotation at
-/// the sampled time (LINEAR keys blend with a spherical interpolation), and every other joint keeps
-/// the cooked rest rotation, so one call fills a complete pose for the pose path that consumes it.
+/// Samples a cooked clip onto a skeleton's joints: a joint with a track takes the track's rotation
+/// (and translation) at the sampled time - LINEAR keys blend with a spherical interpolation, and
+/// translations with a linear one - while every other joint keeps its cooked rest transform, so one
+/// call fills a complete pose for the pose path that consumes it.
 /// </summary>
 public static class MeshAnimationSampler
 {
@@ -231,14 +296,33 @@ public static class MeshAnimationSampler
         float time,
         Span<Quaternion> destination)
     {
+        SamplePose(skin, table, clipIndex, time, destination, Span<Vector3>.Empty);
+    }
+
+    public static void SamplePose(
+        MeshSkin skin,
+        MeshAnimationTable table,
+        int clipIndex,
+        float time,
+        Span<Quaternion> rotations,
+        Span<Vector3> translations)
+    {
         ArgumentNullException.ThrowIfNull(skin);
         ArgumentNullException.ThrowIfNull(table);
-        if (destination.Length < skin.Joints.Count)
+        if (rotations.Length < skin.Joints.Count)
         {
             throw new ArgumentException(
-                $"[MeshAnimationSampler] Destination holds {destination.Length} rotations for " +
+                $"[MeshAnimationSampler] Destination holds {rotations.Length} rotations for " +
                 $"{skin.Joints.Count} joints.",
-                nameof(destination));
+                nameof(rotations));
+        }
+
+        if (!translations.IsEmpty && translations.Length < skin.Joints.Count)
+        {
+            throw new ArgumentException(
+                $"[MeshAnimationSampler] Destination holds {translations.Length} translations for " +
+                $"{skin.Joints.Count} joints.",
+                nameof(translations));
         }
 
         MeshAnimationClip clip = table.GetClip(clipIndex);
@@ -251,9 +335,26 @@ public static class MeshAnimationSampler
         for (int jointIndex = 0; jointIndex < skin.Joints.Count; jointIndex++)
         {
             int trackIndex = clip.TrackIndexOfJoint(jointIndex);
-            destination[jointIndex] = trackIndex < 0
-                ? skin.Joints[jointIndex].LocalRotation
-                : SampleTrack(clip.GetTrack(trackIndex), localTime);
+            if (trackIndex < 0)
+            {
+                rotations[jointIndex] = skin.Joints[jointIndex].LocalRotation;
+                if (!translations.IsEmpty)
+                {
+                    translations[jointIndex] = skin.Joints[jointIndex].LocalTranslation;
+                }
+
+                continue;
+            }
+
+            MeshAnimationJointTrack track = clip.GetTrack(trackIndex);
+            rotations[jointIndex] = SampleTrack(track, localTime);
+            if (!translations.IsEmpty)
+            {
+                translations[jointIndex] = SampleTrackTranslation(
+                    track,
+                    localTime,
+                    skin.Joints[jointIndex].LocalTranslation);
+            }
         }
     }
 
@@ -270,8 +371,52 @@ public static class MeshAnimationSampler
             return track.Rotations[^1];
         }
 
-        int low = 0;
-        int high = times.Length - 1;
+        FindKeyWindow(times, time, out int low, out int high, out float blend);
+        return Quaternion.Slerp(track.Rotations[low], track.Rotations[high], blend);
+    }
+
+    private static Vector3 SampleTrackTranslation(in MeshAnimationJointTrack track, float time, Vector3 rest)
+    {
+        switch (track.TranslationMode)
+        {
+            case MeshAnimationTranslationMode.Constant:
+                return track.ConstantTranslation;
+            case MeshAnimationTranslationMode.PerKey:
+                if (track.KeyTranslations is not { } translations ||
+                    translations.Length != track.Times.Length)
+                {
+                    throw new InvalidOperationException(
+                        $"[MeshAnimationSampler] Joint {track.JointIndex} declares per-key translations " +
+                        "without keys.");
+                }
+
+                ReadOnlySpan<float> times = track.Times;
+                if (time <= times[0])
+                {
+                    return translations[0];
+                }
+
+                if (time >= times[^1])
+                {
+                    return translations[^1];
+                }
+
+                FindKeyWindow(times, time, out int low, out int high, out float blend);
+                return Vector3.Lerp(translations[low], translations[high], blend);
+            default:
+                return rest;
+        }
+    }
+
+    private static void FindKeyWindow(
+        ReadOnlySpan<float> times,
+        float time,
+        out int low,
+        out int high,
+        out float blend)
+    {
+        low = 0;
+        high = times.Length - 1;
         while (high - low > 1)
         {
             int middle = (low + high) / 2;
@@ -286,7 +431,6 @@ public static class MeshAnimationSampler
         }
 
         float span = times[high] - times[low];
-        float blend = span > 0.0f ? (time - times[low]) / span : 0.0f;
-        return Quaternion.Slerp(track.Rotations[low], track.Rotations[high], blend);
+        blend = span > 0.0f ? (time - times[low]) / span : 0.0f;
     }
 }

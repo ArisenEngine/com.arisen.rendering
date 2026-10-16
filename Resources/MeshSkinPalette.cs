@@ -54,6 +54,21 @@ public static class MeshSkinPalette
         Span<Matrix4x4> jointGlobalsScratch,
         Span<Matrix4x4> destination)
     {
+        ComputePalette(skin, poseLocalRotations, ReadOnlySpan<Vector3>.Empty, jointGlobalsScratch, destination);
+    }
+
+    /// <summary>
+    /// Builds the palette a skinned draw uploads. A joint takes the pose's local rotation and
+    /// translation when they are supplied - an empty span keeps the cooked rest value per channel -
+    /// so an empty pose reproduces the bind pose and a clip that only moves a root moves it alone.
+    /// </summary>
+    public static void ComputePalette(
+        MeshSkin skin,
+        ReadOnlySpan<Quaternion> poseLocalRotations,
+        ReadOnlySpan<Vector3> poseLocalTranslations,
+        Span<Matrix4x4> jointGlobalsScratch,
+        Span<Matrix4x4> destination)
+    {
         if (destination.Length < skin.Joints.Count || jointGlobalsScratch.Length < skin.Joints.Count)
         {
             throw new ArgumentException("[MeshSkinPalette] Buffers are smaller than the joint count.");
@@ -65,11 +80,18 @@ public static class MeshSkinPalette
                 $"[MeshSkinPalette] Pose supplies {poseLocalRotations.Length} rotations for {skin.Joints.Count} joints.");
         }
 
+        if (!poseLocalTranslations.IsEmpty && poseLocalTranslations.Length != skin.Joints.Count)
+        {
+            throw new ArgumentException(
+                $"[MeshSkinPalette] Pose supplies {poseLocalTranslations.Length} translations for {skin.Joints.Count} joints.");
+        }
+
         for (int jointIndex = 0; jointIndex < skin.Joints.Count; jointIndex++)
         {
             MeshSkinJoint joint = skin.Joints[jointIndex];
             var rotation = poseLocalRotations.IsEmpty ? joint.LocalRotation : poseLocalRotations[jointIndex];
-            var local = Matrix4x4.CreateFromQuaternion(rotation) * Matrix4x4.CreateTranslation(joint.LocalTranslation);
+            var translation = poseLocalTranslations.IsEmpty ? joint.LocalTranslation : poseLocalTranslations[jointIndex];
+            var local = Matrix4x4.CreateFromQuaternion(rotation) * Matrix4x4.CreateTranslation(translation);
             if (joint.ParentIndex < 0)
             {
                 jointGlobalsScratch[jointIndex] = local;

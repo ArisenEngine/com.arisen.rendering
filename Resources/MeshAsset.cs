@@ -1,4 +1,4 @@
-using System.Buffers.Binary;
+﻿using System.Buffers.Binary;
 using System.Globalization;
 using System.Numerics;
 using System.Text;
@@ -104,13 +104,14 @@ public static class MeshAssetCooker
     // order. Translation and scale channels are not part of it - the pose this payload feeds stores
     // unit-scale joints and, in this slice, rotations only - so a source that animates them is
     // reported and those tracks are left out.
-    public const int CookedFormatVersion = 6;
+    public const int CookedFormatVersion = 7;
 
     /// <summary>Per-clip header: a fixed-width name, the clip's duration, and its track table.</summary>
     internal const int AnimationNameBytes = 64;
     internal const uint AnimationClipHeaderStride = AnimationNameBytes + 12;
-    internal const uint AnimationTrackStride = 12;
+    internal const uint AnimationTrackStride = 28;
     internal const uint AnimationKeyStride = 20;
+    internal const uint AnimationTranslatedKeyStride = 32;
 
     private const string MeshAssetType = "Mesh";
     private const uint GltfBinaryMagic = 0x46546C67;
@@ -313,7 +314,10 @@ public static class MeshAssetCooker
             uint clipSize = AnimationClipHeaderStride;
             foreach (SourceAnimationTrack track in animation.Tracks)
             {
-                clipSize += AnimationTrackStride + checked((uint)track.Times.Length * AnimationKeyStride);
+                uint keyStride = track.TranslationMode == MeshAnimationTranslationMode.PerKey
+                    ? AnimationTranslatedKeyStride
+                    : AnimationKeyStride;
+                clipSize += AnimationTrackStride + checked((uint)track.Times.Length * keyStride);
             }
 
             animationDataSize += clipSize;
@@ -421,7 +425,7 @@ public static class MeshAssetCooker
         {
             var nameBytesBuffer = new byte[AnimationNameBytes];
             Span<byte> trackBytes = stackalloc byte[(int)AnimationTrackStride];
-            Span<byte> keyBytes = stackalloc byte[(int)AnimationKeyStride];
+            Span<byte> keyBytes = stackalloc byte[(int)AnimationTranslatedKeyStride];
             foreach (SourceAnimation animation in animations)
             {
                 Array.Clear(nameBytesBuffer);
@@ -437,18 +441,36 @@ public static class MeshAssetCooker
                 uint keyOffset = 0u;
                 foreach (SourceAnimationTrack track in animation.Tracks)
                 {
+                    if (track.TranslationMode == MeshAnimationTranslationMode.PerKey &&
+                        (track.Translations is null || track.Translations.Length != track.Times.Length))
+                    {
+                        throw new InvalidOperationException(
+                            $"[MeshAssetCooker] Clip '{animation.Name}' track for joint " +
+                            $"{track.JointIndex} declares per-key translations without keys.");
+                    }
+
                     trackBytes.Clear();
                     BinaryPrimitives.WriteInt32LittleEndian(trackBytes.Slice(0, sizeof(int)), track.JointIndex);
                     BinaryPrimitives.WriteInt32LittleEndian(trackBytes.Slice(4, sizeof(int)), track.Times.Length);
                     BinaryPrimitives.WriteUInt32LittleEndian(
                         trackBytes.Slice(8, sizeof(uint)),
                         firstKeyOffset + keyOffset);
+                    BinaryPrimitives.WriteInt32LittleEndian(
+                        trackBytes.Slice(12, sizeof(int)),
+                        (int)track.TranslationMode);
+                    WriteSingle(trackBytes, 16, track.ConstantTranslation.X);
+                    WriteSingle(trackBytes, 20, track.ConstantTranslation.Y);
+                    WriteSingle(trackBytes, 24, track.ConstantTranslation.Z);
                     stream.Write(trackBytes);
-                    keyOffset += checked((uint)track.Times.Length * AnimationKeyStride);
+                    uint keyStride = track.TranslationMode == MeshAnimationTranslationMode.PerKey
+                        ? AnimationTranslatedKeyStride
+                        : AnimationKeyStride;
+                    keyOffset += checked((uint)track.Times.Length * keyStride);
                 }
 
                 foreach (SourceAnimationTrack track in animation.Tracks)
                 {
+                    bool perKeyTranslations = track.TranslationMode == MeshAnimationTranslationMode.PerKey;
                     for (int key = 0; key < track.Times.Length; key++)
                     {
                         keyBytes.Clear();
@@ -457,7 +479,18 @@ public static class MeshAssetCooker
                         WriteSingle(keyBytes, 8, track.Rotations[key].Y);
                         WriteSingle(keyBytes, 12, track.Rotations[key].Z);
                         WriteSingle(keyBytes, 16, track.Rotations[key].W);
-                        stream.Write(keyBytes);
+                        if (perKeyTranslations)
+                        {
+                            Vector3 translation = track.Translations![key];
+                            WriteSingle(keyBytes, 20, translation.X);
+                            WriteSingle(keyBytes, 24, translation.Y);
+                            WriteSingle(keyBytes, 28, translation.Z);
+                            stream.Write(keyBytes.Slice(0, (int)AnimationTranslatedKeyStride));
+                        }
+                        else
+                        {
+                            stream.Write(keyBytes.Slice(0, (int)AnimationKeyStride));
+                        }
                     }
                 }
             }
@@ -1324,10 +1357,11 @@ public static class MeshAssetCooker
 
     /// <summary>
     /// Bakes the source's clips for the cooked skeleton: a channel's target node maps to a cooked
-    /// joint through the skin's slot map, LINEAR rotation channels become key tracks, and channels
-    /// this pose slice cannot carry - translations and scales - are counted and reported instead of
-    /// being silently lost. A non-LINEAR sampler is rejected because the cook would have to resample
-    /// it into keys nobody authored.
+    /// joint through the skin's slot map, LINEAR rotation and translation channels become key tracks
+    /// (a joint animated on both carries one merged timeline plus an explicit translation mode), and
+    /// scale channels - which the unit-scale pose slice cannot carry - are counted and reported
+    /// instead of being silently lost. A non-LINEAR sampler is rejected because the cook would have
+    /// to resample it into keys nobody authored.
     /// </summary>
     private static SourceAnimation[] ReadGltfAnimations(
         string sourcePath,
@@ -1344,7 +1378,6 @@ public static class MeshAssetCooker
         }
 
         var result = new List<SourceAnimation>(animations.GetArrayLength());
-        int droppedTranslationChannels = 0;
         int droppedScaleChannels = 0;
         int droppedForeignChannels = 0;
 
@@ -1409,7 +1442,8 @@ public static class MeshAssetCooker
                 continue;
             }
 
-            var channelByNode = new Dictionary<int, SourceAnimationTrack>(channels.GetArrayLength());
+            var rotationByNode = new Dictionary<int, (float[] Times, Quaternion[] Rotations)>(channels.GetArrayLength());
+            var translationByNode = new Dictionary<int, (float[] Times, Vector3[] Values)>(channels.GetArrayLength());
             float duration = 0.0f;
             foreach (var channel in channels.EnumerateArray())
             {
@@ -1421,19 +1455,15 @@ public static class MeshAssetCooker
                 }
 
                 string path = pathElement.GetString() ?? string.Empty;
-                if (string.Equals(path, "translation", StringComparison.Ordinal))
-                {
-                    droppedTranslationChannels++;
-                    continue;
-                }
-
                 if (string.Equals(path, "scale", StringComparison.Ordinal))
                 {
                     droppedScaleChannels++;
                     continue;
                 }
 
-                if (!string.Equals(path, "rotation", StringComparison.Ordinal))
+                bool isRotation = string.Equals(path, "rotation", StringComparison.Ordinal);
+                bool isTranslation = string.Equals(path, "translation", StringComparison.Ordinal);
+                if (!isRotation && !isTranslation)
                 {
                     droppedForeignChannels++;
                     continue;
@@ -1471,59 +1501,134 @@ public static class MeshAssetCooker
                 {
                     throw new NotSupportedException(
                         $"[MeshAssetCooker] glTF source '{sourcePath}' animation sampler interpolates " +
-                        $"'{interpolation}'; the clip cook bakes LINEAR rotation channels only.");
+                        $"'{interpolation}'; the clip cook bakes LINEAR rotation and translation channels only.");
                 }
 
                 GltfAccessor times = GetGltfAccessor(sourcePath, accessors, sampler.GetProperty("input").GetInt32());
                 GltfAccessor values = GetGltfAccessor(sourcePath, accessors, sampler.GetProperty("output").GetInt32());
+                string expectedValueType = isRotation ? "VEC4" : "VEC3";
                 if (times.Type != "SCALAR" || times.ComponentType != GltfComponentType.Float ||
-                    values.Type != "VEC4" || values.ComponentType != GltfComponentType.Float ||
+                    values.Type != expectedValueType || values.ComponentType != GltfComponentType.Float ||
                     times.Count != values.Count)
                 {
                     throw new InvalidOperationException(
                         $"[MeshAssetCooker] glTF source '{sourcePath}' animation sampler must pair FLOAT " +
-                        "SCALAR times with FLOAT VEC4 rotations of the same count.");
+                        $"SCALAR times with FLOAT {expectedValueType} {path} values of the same count.");
                 }
 
                 var keyTimes = new float[times.Count];
-                var keyRotations = new Quaternion[values.Count];
-                for (int key = 0; key < times.Count; key++)
+                if (isRotation)
                 {
-                    var timeSpan = GetGltfElementSpan(sourcePath, buffers, bufferViews, times, key, 1);
-                    keyTimes[key] = BinaryPrimitives.ReadSingleLittleEndian(timeSpan.Slice(0, sizeof(float)));
-                    Vector4 rotation = ReadGltfVector4(sourcePath, buffers, bufferViews, values, key);
-                    var keyed = new Quaternion(rotation.X, rotation.Y, rotation.Z, rotation.W);
-                    float lengthSquared = keyed.LengthSquared();
-                    if (!float.IsFinite(lengthSquared) || lengthSquared < 1.0e-8f)
+                    var keyRotations = new Quaternion[values.Count];
+                    for (int key = 0; key < times.Count; key++)
                     {
-                        throw new InvalidOperationException(
-                            $"[MeshAssetCooker] glTF source '{sourcePath}' animation rotation key {key} " +
-                            "is not a non-zero quaternion.");
+                        var timeSpan = GetGltfElementSpan(sourcePath, buffers, bufferViews, times, key, 1);
+                        keyTimes[key] = BinaryPrimitives.ReadSingleLittleEndian(timeSpan.Slice(0, sizeof(float)));
+                        Vector4 rotation = ReadGltfVector4(sourcePath, buffers, bufferViews, values, key);
+                        var keyed = new Quaternion(rotation.X, rotation.Y, rotation.Z, rotation.W);
+                        float lengthSquared = keyed.LengthSquared();
+                        if (!float.IsFinite(lengthSquared) || lengthSquared < 1.0e-8f)
+                        {
+                            throw new InvalidOperationException(
+                                $"[MeshAssetCooker] glTF source '{sourcePath}' animation rotation key {key} " +
+                                "is not a non-zero quaternion.");
+                        }
+
+                        keyRotations[key] = Quaternion.Normalize(keyed);
+                        duration = MathF.Max(duration, keyTimes[key]);
+                        if (key > 0 && keyTimes[key] < keyTimes[key - 1])
+                        {
+                            throw new InvalidOperationException(
+                                $"[MeshAssetCooker] glTF source '{sourcePath}' animation key times must " +
+                                "increase; the sampler searches them.");
+                        }
                     }
 
-                    keyRotations[key] = Quaternion.Normalize(keyed);
-                    duration = MathF.Max(duration, keyTimes[key]);
-                    if (key > 0 && keyTimes[key] < keyTimes[key - 1])
-                    {
-                        throw new InvalidOperationException(
-                            $"[MeshAssetCooker] glTF source '{sourcePath}' animation key times must " +
-                            "increase; the sampler searches them.");
-                    }
+                    rotationByNode[nodeIndex] = (keyTimes, keyRotations);
                 }
+                else
+                {
+                    var keyValues = new Vector3[values.Count];
+                    for (int key = 0; key < times.Count; key++)
+                    {
+                        var timeSpan = GetGltfElementSpan(sourcePath, buffers, bufferViews, times, key, 1);
+                        keyTimes[key] = BinaryPrimitives.ReadSingleLittleEndian(timeSpan.Slice(0, sizeof(float)));
+                        Vector3 value = ReadGltfVector3(sourcePath, buffers, bufferViews, values, key);
+                        if (!float.IsFinite(value.X) || !float.IsFinite(value.Y) || !float.IsFinite(value.Z))
+                        {
+                            throw new InvalidOperationException(
+                                $"[MeshAssetCooker] glTF source '{sourcePath}' animation translation key " +
+                                $"{key} is not finite.");
+                        }
 
-                channelByNode[nodeIndex] = new SourceAnimationTrack(jointIndex, keyTimes, keyRotations);
+                        keyValues[key] = value;
+                        duration = MathF.Max(duration, keyTimes[key]);
+                        if (key > 0 && keyTimes[key] < keyTimes[key - 1])
+                        {
+                            throw new InvalidOperationException(
+                                $"[MeshAssetCooker] glTF source '{sourcePath}' animation key times must " +
+                                "increase; the sampler searches them.");
+                        }
+                    }
+
+                    translationByNode[nodeIndex] = (keyTimes, keyValues);
+                }
             }
 
-            var tracks = new List<SourceAnimationTrack>(channelByNode.Count);
-            var chain = new List<int>(8);
-            foreach (KeyValuePair<int, SourceAnimationTrack> entry in channelByNode)
+            // One track per animated joint, ordered by the cooked joint index so the payload is
+            // deterministic across channel orderings. A joint animated on both channels carries one
+            // merged key timeline: LINEAR keys interleave exactly, and resampling either channel onto
+            // the merged times reproduces the authored curve.
+            var animatedJoints = new List<(int JointIndex, int NodeIndex)>(rotationByNode.Count + translationByNode.Count);
+            foreach (int node in rotationByNode.Keys)
             {
-                int jointNode = entry.Key;
-                SourceAnimationTrack channel = entry.Value;
-                var foldedRotations = new Quaternion[channel.Times.Length];
-                for (int key = 0; key < foldedRotations.Length; key++)
+                animatedJoints.Add((skinState.CookedSlotOfNode[node], node));
+            }
+
+            foreach (int node in translationByNode.Keys)
+            {
+                if (!rotationByNode.ContainsKey(node))
                 {
-                    float time = channel.Times[key];
+                    animatedJoints.Add((skinState.CookedSlotOfNode[node], node));
+                }
+            }
+
+            animatedJoints.Sort(static (left, right) => left.JointIndex.CompareTo(right.JointIndex));
+            var tracks = new List<SourceAnimationTrack>(animatedJoints.Count);
+            var chain = new List<int>(8);
+            foreach ((int jointIndex, int jointNode) in animatedJoints)
+            {
+                float[] times;
+                Quaternion[] rotations;
+                Vector3[]? translations;
+                if (rotationByNode.TryGetValue(jointNode, out var rotationChannel))
+                {
+                    if (translationByNode.TryGetValue(jointNode, out var translationChannel))
+                    {
+                        times = MergeKeyTimes(rotationChannel.Times, translationChannel.Times);
+                        rotations = ResampleRotationChannel(rotationByNode, jointNode, times, restRotations[jointNode]);
+                        translations = ResampleTranslationChannel(translationByNode, jointNode, times, restTranslations[jointNode]);
+                    }
+                    else
+                    {
+                        times = rotationChannel.Times;
+                        rotations = rotationChannel.Rotations;
+                        translations = null;
+                    }
+                }
+                else
+                {
+                    (float[] Times, Vector3[] Values) translationChannel = translationByNode[jointNode];
+                    times = translationChannel.Times;
+                    rotations = FillRestRotations(restRotations[jointNode], times.Length);
+                    translations = translationChannel.Values;
+                }
+
+                var foldedRotations = new Quaternion[times.Length];
+                var foldedTranslations = new Vector3[times.Length];
+                for (int key = 0; key < times.Length; key++)
+                {
+                    float time = times[key];
                     chain.Clear();
                     int current = jointNode;
                     while (true)
@@ -1545,16 +1650,25 @@ public static class MeshAssetCooker
                     {
                         int node = chain[index];
                         Quaternion rotation = SampleChannelRotation(
-                            channelByNode,
+                            rotationByNode,
                             node,
                             time,
                             restRotations[node]);
+                        Vector3 translation = SampleChannelTranslation(
+                            translationByNode,
+                            node,
+                            time,
+                            restTranslations[node]);
                         folded = Matrix4x4.CreateFromQuaternion(rotation) *
-                            Matrix4x4.CreateTranslation(restTranslations[node]) *
+                            Matrix4x4.CreateTranslation(translation) *
                             folded;
                     }
 
-                    if (!Matrix4x4.Decompose(folded, out Vector3 foldedScale, out Quaternion foldedRotation, out _) ||
+                    if (!Matrix4x4.Decompose(
+                            folded,
+                            out Vector3 foldedScale,
+                            out Quaternion foldedRotation,
+                            out Vector3 foldedTranslation) ||
                         MathF.Abs(foldedScale.X - 1.0f) > 1.0e-3f ||
                         MathF.Abs(foldedScale.Y - 1.0f) > 1.0e-3f ||
                         MathF.Abs(foldedScale.Z - 1.0f) > 1.0e-3f)
@@ -1565,10 +1679,48 @@ public static class MeshAssetCooker
                     }
 
                     foldedRotations[key] = foldedRotation;
+                    foldedTranslations[key] = foldedTranslation;
                 }
 
-                tracks.Add(channel with { Rotations = foldedRotations });
+                // Translation keys are stored only when the joint actually moves: a track that repeats
+                // its rest translation - every joint but the roots, for the shipped rigs - costs
+                // nothing, and one constant value covers a joint that rests somewhere else.
+                Vector3 restLocal = skinState.Joints[jointIndex].LocalTranslation;
+                bool allRest = true;
+                bool allEqual = true;
+                for (int key = 0; key < foldedTranslations.Length; key++)
+                {
+                    allEqual &= Vector3.DistanceSquared(foldedTranslations[key], foldedTranslations[0]) <= 1.0e-8f;
+                    allRest &= Vector3.DistanceSquared(foldedTranslations[key], restLocal) <= 1.0e-8f;
+                }
+
+                MeshAnimationTranslationMode translationMode;
+                Vector3 constantTranslation = default;
+                Vector3[]? keyTranslations = null;
+                if (allRest)
+                {
+                    translationMode = MeshAnimationTranslationMode.Rest;
+                }
+                else if (allEqual)
+                {
+                    translationMode = MeshAnimationTranslationMode.Constant;
+                    constantTranslation = foldedTranslations[0];
+                }
+                else
+                {
+                    translationMode = MeshAnimationTranslationMode.PerKey;
+                    keyTranslations = foldedTranslations;
+                }
+
+                tracks.Add(new SourceAnimationTrack(
+                    jointIndex,
+                    times,
+                    foldedRotations,
+                    translationMode,
+                    constantTranslation,
+                    keyTranslations));
             }
+
 
             if (tracks.Count == 0)
             {
@@ -1588,13 +1740,12 @@ public static class MeshAssetCooker
             result.Add(new SourceAnimation(name, duration, tracks.ToArray()));
         }
 
-        if (droppedTranslationChannels > 0 || droppedScaleChannels > 0 || droppedForeignChannels > 0)
+        if (droppedScaleChannels > 0 || droppedForeignChannels > 0)
         {
             Logger.Warning(
                 $"[MeshAssetCooker] Source '{sourcePath}' bakes {result.Count} clip(s); dropped " +
-                $"{droppedTranslationChannels} translation channel(s), {droppedScaleChannels} scale " +
-                $"channel(s), and {droppedForeignChannels} channel(s) outside the cooked skeleton. The " +
-                "pose this payload feeds stores unit-scale joints and, in this slice, rotations only.");
+                $"{droppedScaleChannels} scale channel(s) and {droppedForeignChannels} channel(s) " +
+                "outside the cooked skeleton. The pose this payload feeds stores unit-scale joints.");
         }
 
         return result.ToArray();
@@ -1606,12 +1757,12 @@ public static class MeshAssetCooker
     /// its parent joint.
     /// </summary>
     private static Quaternion SampleChannelRotation(
-        Dictionary<int, SourceAnimationTrack> channels,
+        Dictionary<int, (float[] Times, Quaternion[] Rotations)> channels,
         int node,
         float time,
         Quaternion rest)
     {
-        if (!channels.TryGetValue(node, out SourceAnimationTrack? channel) || channel.Times.Length == 0)
+        if (!channels.TryGetValue(node, out var channel) || channel.Times.Length == 0)
         {
             return rest;
         }
@@ -1646,6 +1797,140 @@ public static class MeshAssetCooker
         return span > 0.0f
             ? Quaternion.Slerp(channel.Rotations[low], channel.Rotations[high], (time - times[low]) / span)
             : channel.Rotations[low];
+    }
+
+    /// <summary>
+    /// A chain node's local translation at a clip time: the node's own translation keys when it has
+    /// them, otherwise its rest translation. The folded key's translation is what lets a root joint's
+    /// motion - a walk's hip bob, a jump's arc - survive the cook.
+    /// </summary>
+    private static Vector3 SampleChannelTranslation(
+        Dictionary<int, (float[] Times, Vector3[] Values)> channels,
+        int node,
+        float time,
+        Vector3 rest)
+    {
+        if (!channels.TryGetValue(node, out var channel) || channel.Times.Length == 0)
+        {
+            return rest;
+        }
+
+        ReadOnlySpan<float> times = channel.Times;
+        if (time <= times[0])
+        {
+            return channel.Values[0];
+        }
+
+        if (time >= times[^1])
+        {
+            return channel.Values[^1];
+        }
+
+        int low = 0;
+        int high = times.Length - 1;
+        while (high - low > 1)
+        {
+            int middle = (low + high) / 2;
+            if (times[middle] <= time)
+            {
+                low = middle;
+            }
+            else
+            {
+                high = middle;
+            }
+        }
+
+        float span = times[high] - times[low];
+        return span > 0.0f
+            ? Vector3.Lerp(channel.Values[low], channel.Values[high], (time - times[low]) / span)
+            : channel.Values[low];
+    }
+
+    /// <summary>
+    /// The merged key timeline of two LINEAR channels: both timelines are ascending, equal times
+    /// collapse, and every source key survives, so resampling either channel onto the merged times
+    /// reproduces the authored curve exactly.
+    /// </summary>
+    private static float[] MergeKeyTimes(float[] first, float[] second)
+    {
+        const float Epsilon = 1.0e-5f;
+        var merged = new List<float>(first.Length + second.Length);
+        int firstIndex = 0;
+        int secondIndex = 0;
+        while (firstIndex < first.Length || secondIndex < second.Length)
+        {
+            float next;
+            if (firstIndex < first.Length && secondIndex < second.Length)
+            {
+                if (MathF.Abs(first[firstIndex] - second[secondIndex]) <= Epsilon)
+                {
+                    next = first[firstIndex];
+                    firstIndex++;
+                    secondIndex++;
+                }
+                else if (first[firstIndex] < second[secondIndex])
+                {
+                    next = first[firstIndex++];
+                }
+                else
+                {
+                    next = second[secondIndex++];
+                }
+            }
+            else if (firstIndex < first.Length)
+            {
+                next = first[firstIndex++];
+            }
+            else
+            {
+                next = second[secondIndex++];
+            }
+
+            if (merged.Count == 0 || next - merged[^1] > Epsilon)
+            {
+                merged.Add(next);
+            }
+        }
+
+        return merged.ToArray();
+    }
+
+    private static Quaternion[] ResampleRotationChannel(
+        Dictionary<int, (float[] Times, Quaternion[] Rotations)> channels,
+        int node,
+        float[] times,
+        Quaternion rest)
+    {
+        var sampled = new Quaternion[times.Length];
+        for (int key = 0; key < times.Length; key++)
+        {
+            sampled[key] = SampleChannelRotation(channels, node, times[key], rest);
+        }
+
+        return sampled;
+    }
+
+    private static Vector3[] ResampleTranslationChannel(
+        Dictionary<int, (float[] Times, Vector3[] Values)> channels,
+        int node,
+        float[] times,
+        Vector3 rest)
+    {
+        var sampled = new Vector3[times.Length];
+        for (int key = 0; key < times.Length; key++)
+        {
+            sampled[key] = SampleChannelTranslation(channels, node, times[key], rest);
+        }
+
+        return sampled;
+    }
+
+    private static Quaternion[] FillRestRotations(Quaternion rest, int count)
+    {
+        var rotations = new Quaternion[count];
+        Array.Fill(rotations, rest);
+        return rotations;
     }
 
     private static bool TryReadGltfSceneGraph(
@@ -3371,7 +3656,8 @@ public static class MeshAssetCooker
 
     /// <summary>
     /// One baked clip: its name, its duration, and one rotation track per animated joint in the
-    /// cooked skeleton's order. A joint without a track keeps the cooked rest rotation.
+    /// cooked skeleton's order, each optionally carrying the joint's local translation. A joint
+    /// without a track keeps the cooked rest transform.
     /// </summary>
     private sealed record SourceAnimation(
         string Name,
@@ -3381,7 +3667,10 @@ public static class MeshAssetCooker
     private sealed record SourceAnimationTrack(
         int JointIndex,
         float[] Times,
-        Quaternion[] Rotations);
+        Quaternion[] Rotations,
+        MeshAnimationTranslationMode TranslationMode = MeshAnimationTranslationMode.Rest,
+        Vector3 ConstantTranslation = default,
+        Vector3[]? Translations = null);
 
     private readonly record struct SourceSubmesh(
         uint FirstIndex,

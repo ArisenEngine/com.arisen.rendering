@@ -292,6 +292,7 @@ public class RenderSubsystem : ITickableSubsystem
             Span<MeshDrawCommand> frameDrawList = Span<MeshDrawCommand>.Empty;
             Span<StaticMeshRenderItem> frameStaticMeshItems = Span<StaticMeshRenderItem>.Empty;
             Span<Quaternion> frameSkinJointRotations = Span<Quaternion>.Empty;
+            Span<Vector3> frameSkinJointTranslations = Span<Vector3>.Empty;
 
             if (sceneSubsystem != null)
             {
@@ -314,6 +315,13 @@ public class RenderSubsystem : ITickableSubsystem
                 {
                     frameSkinJointRotations = arena.Alloc<Quaternion>(skinJointRotations.Length);
                     skinJointRotations.CopyTo(frameSkinJointRotations);
+                }
+
+                var skinJointTranslations = sceneSubsystem.GetCurrentSkinJointTranslations();
+                if (skinJointTranslations.Length > 0)
+                {
+                    frameSkinJointTranslations = arena.Alloc<Vector3>(skinJointTranslations.Length);
+                    skinJointTranslations.CopyTo(frameSkinJointTranslations);
                 }
             }
 
@@ -463,6 +471,7 @@ public class RenderSubsystem : ITickableSubsystem
                 fixed (MeshDrawCommand* pDrawList = frameDrawList)
                 fixed (StaticMeshRenderItem* pStaticMeshItems = frameStaticMeshItems)
                 fixed (Quaternion* pSkinJointRotations = frameSkinJointRotations)
+                fixed (Vector3* pSkinJointTranslations = frameSkinJointTranslations)
                 {
                     var snapshot = new RenderFrameSnapshot(
                         device,
@@ -493,7 +502,9 @@ public class RenderSubsystem : ITickableSubsystem
                         pStaticMeshItems,
                         frameStaticMeshItems.Length,
                         pSkinJointRotations,
-                        frameSkinJointRotations.Length);
+                        frameSkinJointRotations.Length,
+                        pSkinJointTranslations,
+                        frameSkinJointTranslations.Length);
 
                     var context = new RenderContext(arena, snapshot, submission);
                     Profiler.PlotValue("Render.DrawCount", snapshot.DrawListCount);

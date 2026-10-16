@@ -40,7 +40,9 @@ public readonly unsafe struct RenderFrameSnapshot
         StaticMeshRenderItem* staticMeshItemPtr,
         int staticMeshItemCount,
         Quaternion* skinJointRotationPtr,
-        int skinJointRotationCount)
+        int skinJointRotationCount,
+        Vector3* skinJointTranslationPtr,
+        int skinJointTranslationCount)
     {
         Device = device;
         DeviceGeneration = deviceGeneration;
@@ -71,6 +73,8 @@ public readonly unsafe struct RenderFrameSnapshot
         StaticMeshItemCount = staticMeshItemCount;
         SkinJointRotationPtr = skinJointRotationPtr;
         SkinJointRotationCount = skinJointRotationCount;
+        SkinJointTranslationPtr = skinJointTranslationPtr;
+        SkinJointTranslationCount = skinJointTranslationCount;
     }
 
     public RHIDevice Device { get; }
@@ -102,6 +106,8 @@ public readonly unsafe struct RenderFrameSnapshot
     public int StaticMeshItemCount { get; }
     public Quaternion* SkinJointRotationPtr { get; }
     public int SkinJointRotationCount { get; }
+    public Vector3* SkinJointTranslationPtr { get; }
+    public int SkinJointTranslationCount { get; }
 
     public ReadOnlySpan<Camera> Cameras => new(CameraPtr, CameraCount);
     public ReadOnlySpan<DirectionalLight> DirectionalLights => new(DirectionalLightPtr, DirectionalLightCount);
@@ -110,4 +116,5 @@ public readonly unsafe struct RenderFrameSnapshot
     public ReadOnlySpan<MeshDrawCommand> DrawList => new(DrawListPtr, DrawListCount);
     public ReadOnlySpan<StaticMeshRenderItem> StaticMeshItems => new(StaticMeshItemPtr, StaticMeshItemCount);
     public ReadOnlySpan<Quaternion> SkinJointRotations => new(SkinJointRotationPtr, SkinJointRotationCount);
+    public ReadOnlySpan<Vector3> SkinJointTranslations => new(SkinJointTranslationPtr, SkinJointTranslationCount);
 }
