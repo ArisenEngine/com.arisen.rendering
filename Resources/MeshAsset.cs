@@ -1347,6 +1347,58 @@ public static class MeshAssetCooker
         int droppedTranslationChannels = 0;
         int droppedScaleChannels = 0;
         int droppedForeignChannels = 0;
+
+        // Folding needs each node's rest transform and the nearest joint above it: a channel's keys are
+        // local to the node they drive, and the cooked skeleton composes joint-relative locals.
+        JsonElement animationNodes = skinState.Nodes;
+        int nodeCount = animationNodes.GetArrayLength();
+        int[] nodeParents = BuildGltfNodeParentMap(sourcePath, animationNodes);
+        var animationJointSlots = new Dictionary<int, int>();
+        if (root.TryGetProperty("skins", out var animationSkins) &&
+            skinState.SkinIndex >= 0 &&
+            skinState.SkinIndex < animationSkins.GetArrayLength() &&
+            animationSkins[skinState.SkinIndex].TryGetProperty("joints", out var animationJoints))
+        {
+            foreach (JsonElement jointElement in animationJoints.EnumerateArray())
+            {
+                animationJointSlots.TryAdd(jointElement.GetInt32(), animationJointSlots.Count);
+            }
+        }
+
+        var parentJointOf = new int[nodeCount];
+        Array.Fill(parentJointOf, -1);
+        var restTranslations = new Vector3[nodeCount];
+        var restRotations = new Quaternion[nodeCount];
+        for (int nodeIndex = 0; nodeIndex < nodeCount; nodeIndex++)
+        {
+            Matrix4x4 nodeTransform = ReadGltfNodeTransform(
+                sourcePath,
+                animationNodes[nodeIndex],
+                $"nodes[{nodeIndex}]");
+            if (!Matrix4x4.Decompose(nodeTransform, out Vector3 scale, out Quaternion rotation, out Vector3 translation) ||
+                MathF.Abs(scale.X - 1.0f) > 1.0e-3f ||
+                MathF.Abs(scale.Y - 1.0f) > 1.0e-3f ||
+                MathF.Abs(scale.Z - 1.0f) > 1.0e-3f)
+            {
+                throw new NotSupportedException(
+                    $"[MeshAssetCooker] glTF source '{sourcePath}' nodes[{nodeIndex}] does not reduce to " +
+                    "translation and unit-scale rotation; a clip cannot fold it into the joint chain.");
+            }
+
+            restTranslations[nodeIndex] = translation;
+            restRotations[nodeIndex] = rotation;
+            int ancestor = nodeParents[nodeIndex];
+            while (ancestor >= 0)
+            {
+                if (animationJointSlots.ContainsKey(ancestor))
+                {
+                    parentJointOf[nodeIndex] = ancestor;
+                    break;
+                }
+
+                ancestor = nodeParents[ancestor];
+            }
+        }
         foreach (var animation in animations.EnumerateArray())
         {
             if (!animation.TryGetProperty("channels", out var channels) ||
@@ -1357,8 +1409,7 @@ public static class MeshAssetCooker
                 continue;
             }
 
-            var tracks = new List<SourceAnimationTrack>(channels.GetArrayLength());
-            var trackByJoint = new Dictionary<int, int>(channels.GetArrayLength());
+            var channelByNode = new Dictionary<int, SourceAnimationTrack>(channels.GetArrayLength());
             float duration = 0.0f;
             foreach (var channel in channels.EnumerateArray())
             {
@@ -1460,16 +1511,63 @@ public static class MeshAssetCooker
                     }
                 }
 
-                var track = new SourceAnimationTrack(jointIndex, keyTimes, keyRotations);
-                if (trackByJoint.TryGetValue(jointIndex, out int existing))
+                channelByNode[nodeIndex] = new SourceAnimationTrack(jointIndex, keyTimes, keyRotations);
+            }
+
+            var tracks = new List<SourceAnimationTrack>(channelByNode.Count);
+            var chain = new List<int>(8);
+            foreach (KeyValuePair<int, SourceAnimationTrack> entry in channelByNode)
+            {
+                int jointNode = entry.Key;
+                SourceAnimationTrack channel = entry.Value;
+                var foldedRotations = new Quaternion[channel.Times.Length];
+                for (int key = 0; key < foldedRotations.Length; key++)
                 {
-                    tracks[existing] = track;
+                    float time = channel.Times[key];
+                    chain.Clear();
+                    int current = jointNode;
+                    while (true)
+                    {
+                        chain.Add(current);
+                        int parent = nodeParents[current];
+                        if (parent < 0 ||
+                            parent == parentJointOf[jointNode] ||
+                            parentJointOf[jointNode] < 0)
+                        {
+                            break;
+                        }
+
+                        current = parent;
+                    }
+
+                    Matrix4x4 folded = Matrix4x4.Identity;
+                    for (int index = chain.Count - 1; index >= 0; index--)
+                    {
+                        int node = chain[index];
+                        Quaternion rotation = SampleChannelRotation(
+                            channelByNode,
+                            node,
+                            time,
+                            restRotations[node]);
+                        folded = Matrix4x4.CreateFromQuaternion(rotation) *
+                            Matrix4x4.CreateTranslation(restTranslations[node]) *
+                            folded;
+                    }
+
+                    if (!Matrix4x4.Decompose(folded, out Vector3 foldedScale, out Quaternion foldedRotation, out _) ||
+                        MathF.Abs(foldedScale.X - 1.0f) > 1.0e-3f ||
+                        MathF.Abs(foldedScale.Y - 1.0f) > 1.0e-3f ||
+                        MathF.Abs(foldedScale.Z - 1.0f) > 1.0e-3f)
+                    {
+                        throw new NotSupportedException(
+                            $"[MeshAssetCooker] glTF source '{sourcePath}' joint node '{jointNode}' does not " +
+                            "reduce to rotation and translation once its key track is folded into the joint chain.");
+                    }
+
+                    foldedRotations[key] = foldedRotation;
                 }
-                else
-                {
-                    trackByJoint.Add(jointIndex, tracks.Count);
-                    tracks.Add(track);
-                }
+
+                tracks.Add(channel with { Rotations = foldedRotations });
             }
 
             if (tracks.Count == 0)
@@ -1500,6 +1598,54 @@ public static class MeshAssetCooker
         }
 
         return result.ToArray();
+    }
+
+    /// <summary>
+    /// A chain node's rotation at a clip time: the node's own key track when it has one, otherwise its
+    /// rest rotation. Folding uses this for the joint being baked and for every helper between it and
+    /// its parent joint.
+    /// </summary>
+    private static Quaternion SampleChannelRotation(
+        Dictionary<int, SourceAnimationTrack> channels,
+        int node,
+        float time,
+        Quaternion rest)
+    {
+        if (!channels.TryGetValue(node, out SourceAnimationTrack? channel) || channel.Times.Length == 0)
+        {
+            return rest;
+        }
+
+        ReadOnlySpan<float> times = channel.Times;
+        if (time <= times[0])
+        {
+            return channel.Rotations[0];
+        }
+
+        if (time >= times[^1])
+        {
+            return channel.Rotations[^1];
+        }
+
+        int low = 0;
+        int high = times.Length - 1;
+        while (high - low > 1)
+        {
+            int middle = (low + high) / 2;
+            if (times[middle] <= time)
+            {
+                low = middle;
+            }
+            else
+            {
+                high = middle;
+            }
+        }
+
+        float span = times[high] - times[low];
+        return span > 0.0f
+            ? Quaternion.Slerp(channel.Rotations[low], channel.Rotations[high], (time - times[low]) / span)
+            : channel.Rotations[low];
     }
 
     private static bool TryReadGltfSceneGraph(
