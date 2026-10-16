@@ -332,6 +332,14 @@ public static class MeshAnimationSampler
             localTime += clip.Duration;
         }
 
+        if (localTime == 0.0f && time > 0.0f)
+        {
+            // A time that lands exactly on a whole number of durations is the end of the cycle, not
+            // the start of the next: a completed one-shot clip holds its last frame instead of
+            // snapping back, and a looping clip renders the authored end pose before wrapping.
+            localTime = clip.Duration;
+        }
+
         for (int jointIndex = 0; jointIndex < skin.Joints.Count; jointIndex++)
         {
             int trackIndex = clip.TrackIndexOfJoint(jointIndex);
@@ -354,6 +362,75 @@ public static class MeshAnimationSampler
                     track,
                     localTime,
                     skin.Joints[jointIndex].LocalTranslation);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Samples a cross-fade of two clips onto a skeleton's joints: a joint's rotation is the
+    /// spherical interpolation and its translation the linear one between the two clips' samples,
+    /// weighted by <paramref name="blend"/> (0 keeps the outgoing clip, 1 lands exactly on the
+    /// incoming one). A negative outgoing index samples the incoming clip alone, so a caller with no
+    /// transition in flight shares this path.
+    /// </summary>
+    public static void SampleBlendedPose(
+        MeshSkin skin,
+        MeshAnimationTable table,
+        int fromClipIndex,
+        float fromTime,
+        int toClipIndex,
+        float toTime,
+        float blend,
+        Span<Quaternion> rotations,
+        Span<Vector3> translations)
+    {
+        ArgumentNullException.ThrowIfNull(skin);
+        ArgumentNullException.ThrowIfNull(table);
+        if (rotations.Length < skin.Joints.Count)
+        {
+            throw new ArgumentException(
+                $"[MeshAnimationSampler] Destination holds {rotations.Length} rotations for " +
+                $"{skin.Joints.Count} joints.",
+                nameof(rotations));
+        }
+
+        if (!translations.IsEmpty && translations.Length < skin.Joints.Count)
+        {
+            throw new ArgumentException(
+                $"[MeshAnimationSampler] Destination holds {translations.Length} translations for " +
+                $"{skin.Joints.Count} joints.",
+                nameof(translations));
+        }
+
+        float factor = Math.Clamp(blend, 0.0f, 1.0f);
+        if (fromClipIndex < 0 || factor >= 1.0f)
+        {
+            SamplePose(skin, table, toClipIndex, toTime, rotations, translations);
+            return;
+        }
+
+        if (factor <= 0.0f)
+        {
+            SamplePose(skin, table, fromClipIndex, fromTime, rotations, translations);
+            return;
+        }
+
+        // The joint bound is the cook's own 255-joint ceiling, so the outgoing pose lives on the
+        // stack: a cross-fade must not allocate inside a frame.
+        int jointCount = skin.Joints.Count;
+        Span<Quaternion> fromRotations = stackalloc Quaternion[jointCount];
+        Span<Vector3> fromTranslations = stackalloc Vector3[jointCount];
+        SamplePose(skin, table, fromClipIndex, fromTime, fromRotations, fromTranslations);
+        SamplePose(skin, table, toClipIndex, toTime, rotations, translations);
+        for (int jointIndex = 0; jointIndex < jointCount; jointIndex++)
+        {
+            rotations[jointIndex] = Quaternion.Slerp(fromRotations[jointIndex], rotations[jointIndex], factor);
+            if (!translations.IsEmpty)
+            {
+                translations[jointIndex] = Vector3.Lerp(
+                    fromTranslations[jointIndex],
+                    translations[jointIndex],
+                    factor);
             }
         }
     }
